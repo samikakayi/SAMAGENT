@@ -703,13 +703,20 @@ class ToolRegistry:
 
     def _git_root(self, arguments: dict[str, Any], approved: bool) -> Path:
         root = self._resolve(str(arguments.get("path", ".")), approved=approved, must_exist=True)
-        if not (root / ".git").exists():
-            # Walk up: the agent is often pointed at a subdirectory of a repo.
-            for parent in root.parents:
-                if (parent / ".git").exists():
-                    return parent
-            raise FileNotFoundError(f"{root} is not inside a git repository")
-        return root
+        if (root / ".git").exists():
+            return root
+        # Walk up, because the agent is often pointed at a subdirectory of a
+        # repo -- but never past the workspace boundary. A workspace nested
+        # inside a larger repository must not expose that repository's status
+        # or diff, which the caller never granted access to.
+        for parent in root.parents:
+            if not approved and not parent.is_relative_to(self.workspace):
+                break
+            if (parent / ".git").exists():
+                return parent
+        raise FileNotFoundError(
+            f"{root} is not inside a git repository within the workspace"
+        )
 
     def _git_status(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
         root = self._git_root(arguments, approved)
