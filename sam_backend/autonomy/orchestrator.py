@@ -41,6 +41,10 @@ from ..ui_review import review_screenshot
 from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
 from .checkpoints import MODIFYING_TOOLS, WorkspaceCheckpoints
 
+# How much of a file's text an observation may carry back to the model. Large
+# enough to act on, small enough that one read cannot swamp the next prompt.
+OBSERVATION_CONTENT_LIMIT = 4000
+
 EXECUTOR_SYSTEM_PROMPT = """You are SAM, an autonomous software engineering agent executing one step of an approved plan.
 
 You act by calling exactly one tool per turn. You do not ask the user questions; you inspect the project and act.
@@ -539,7 +543,13 @@ class AutonomousOrchestrator:
         # The step stays open so the next turn can react to the error. Its
         # own retry budget is what stops this from looping forever.
         step.detail = error[:500]
-        task.retries += 1
+        # A check that ran and reported failing tests is information, not a
+        # broken tool. Counting it against the tool-failure budget would kill
+        # the ordinary debugging loop -- run, see the failure, fix, run again
+        # -- which is the whole point of the self-healing stage. Verification
+        # still has to pass before a run may call itself verified.
+        if call.name != "run_tests":
+            task.retries += 1
         self.store.save(task)
         if task.retries > self.max_retries:
             step.status = "failed"
@@ -774,6 +784,12 @@ class AutonomousOrchestrator:
                 return str(output.get("summary") or "checks finished")[:400]
             if name == "project_map":
                 return f"{output.get('file_count', '?')} files, commands {output.get('commands', {})}"
+            if "content" in output:
+                # The point of reading a file is the text inside it. Summarising
+                # to a path told the model nothing and left it re-reading the
+                # same file instead of acting on what it had asked for.
+                content = str(output.get("content") or "")
+                return f"{output.get('path')}:\n{content[:OBSERVATION_CONTENT_LIMIT]}"
             if "path" in output:
                 return f"{output.get('path')} ({output.get('bytes', '?')} bytes)"
             if "exit_code" in output:
