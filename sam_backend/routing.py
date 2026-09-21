@@ -7,7 +7,7 @@ from typing import Any
 
 from .config import Settings
 from .db import Database
-from .models import AdapterRegistry, AssistantTurn, ModelError
+from .models import AdapterRegistry, AssistantTurn, ErrorCategory, ModelError
 
 
 @dataclass(slots=True)
@@ -216,11 +216,29 @@ class ModelRouter:
                     cost_usd=cost_value,
                     task_id=task_id,
                     conversation_id=conversation_id,
-                    metadata={"reason": choice.reason, "fallbacks_before_success": failures, "usage_cost_reported": cost is not None},
+                    metadata={"outcome": "succeeded", "reason": choice.reason, "fallbacks_before_success": failures, "usage_cost_reported": cost is not None},
                 )
                 turn.raw = {**raw, "route": {"provider": choice.provider, "model": choice.model, "reason": choice.reason}, "fallbacks": failures}
                 return turn, choice, failures
             except ModelError as exc:
                 self.failures[choice.provider] = self.failures.get(choice.provider, 0) + 1
-                failures.append({"provider": choice.provider, "model": choice.model, "error": str(exc)})
-        raise ModelError("All model routes failed: " + " | ".join(f"{item['provider']}: {item['error']}" for item in failures))
+                category = getattr(exc, "category", ErrorCategory.UNKNOWN)
+                failures.append({
+                    "provider": choice.provider, "model": choice.model,
+                    "error": str(exc), "category": str(category),
+                })
+                # A failed attempt is still a fact worth recording: without it
+                # an operator sees only the final error and cannot tell an
+                # expired key from an unreachable host.
+                self.database.add_model_usage(
+                    provider=choice.provider, model=choice.model, route_mode=self.settings.model_mode,
+                    input_tokens=None, output_tokens=None, cost_usd=None,
+                    task_id=task_id, conversation_id=conversation_id,
+                    metadata={"outcome": "failed", "error_category": str(category), "reason": choice.reason},
+                )
+        # Every real route failed. Raising keeps production honest: there is no
+        # scripted provider in this chain to quietly fall back to.
+        raise ModelError(
+            "All model routes failed: " + " | ".join(f"{item['provider']}: {item['error']}" for item in failures),
+            ErrorCategory(failures[-1]["category"]) if failures else ErrorCategory.UNKNOWN,
+        )

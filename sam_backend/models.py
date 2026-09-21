@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import uuid
+import re
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol
 
 import httpx
@@ -10,8 +12,68 @@ import httpx
 from .config import Settings
 
 
+# One tool-loop turn is a short instruction plus a tool call, never a book.
+MAX_COMPLETION_TOKENS = 2048
+
+
+class ErrorCategory(StrEnum):
+    """Normalised reason a model request failed.
+
+    The orchestrator and the observability record branch on the category, not
+    on provider-specific prose, so "rate limited" means the same thing whether
+    it came from Ollama, OpenRouter or OpenAI.
+    """
+
+    AUTH = "auth"
+    RATE_LIMIT = "rate_limit"
+    QUOTA = "quota"
+    TIMEOUT = "timeout"
+    NETWORK = "network"
+    MALFORMED = "malformed"
+    NOT_CONFIGURED = "not_configured"
+    UNKNOWN = "unknown"
+
+
 class ModelError(RuntimeError):
-    pass
+    """A model request failed. Carries a category so callers need not parse text."""
+
+    def __init__(self, message: str, category: "ErrorCategory" = None) -> None:  # type: ignore[assignment]
+        super().__init__(message)
+        self.category = category or ErrorCategory.UNKNOWN
+
+
+def classify_exception(exc: Exception) -> ErrorCategory:
+    """Map a transport-level failure onto a normalised category."""
+    if isinstance(exc, httpx.TimeoutException):
+        return ErrorCategory.TIMEOUT
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (401, 403):
+            return ErrorCategory.AUTH
+        if status == 429:
+            return ErrorCategory.RATE_LIMIT
+        if status == 402:
+            return ErrorCategory.QUOTA
+        if status >= 500:
+            return ErrorCategory.NETWORK
+        return ErrorCategory.UNKNOWN
+    if isinstance(exc, httpx.HTTPError):
+        return ErrorCategory.NETWORK
+    if isinstance(exc, ValueError):
+        return ErrorCategory.MALFORMED
+    return ErrorCategory.UNKNOWN
+
+
+_CREDENTIAL_NOISE = re.compile(r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9._\-]{8,}|api[_-]?key\s*[:=]\s*\S+)")
+
+
+def sanitize_provider_message(message: str, limit: int = 300) -> str:
+    """Strip anything credential-shaped out of a provider's own error text.
+
+    A provider is free to echo the request back in its error body; that body
+    reaches logs and the UI, so it is scrubbed before it travels.
+    """
+    return _CREDENTIAL_NOISE.sub("[REDACTED]", message)[:limit]
 
 
 @dataclass(slots=True)
@@ -67,7 +129,10 @@ class OllamaAdapter:
                 response.raise_for_status()
                 data = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise ModelError(f"Could not reach Ollama at {self.base_url}: {exc}") from exc
+            raise ModelError(
+                f"Could not reach Ollama at {self.base_url}: {sanitize_provider_message(str(exc))}",
+                classify_exception(exc),
+            ) from exc
         message = data.get("message") or {}
         calls: list[ToolCall] = []
         for item in message.get("tool_calls") or []:
@@ -232,7 +297,7 @@ class ChatCompletionsAdapter:
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str) -> AssistantTurn:
         if self.key_required and not self.api_key:
-            raise ModelError(f"{self.provider.upper()} credential is not configured")
+            raise ModelError(f"{self.provider.upper()} credential is not configured", ErrorCategory.NOT_CONFIGURED)
         payload = {
             "model": model,
             "messages": self._messages(messages),
@@ -240,6 +305,10 @@ class ChatCompletionsAdapter:
             "tool_choice": "auto",
             "temperature": 0.2,
             "stream": False,
+            # Without this a gateway reserves the model's entire context window
+            # against the account's credit limit and rejects the request before
+            # running it, even though a tool-loop turn needs a fraction of it.
+            "max_tokens": MAX_COMPLETION_TOKENS,
         }
         try:
             async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
@@ -254,10 +323,13 @@ class ChatCompletionsAdapter:
                     message = str(error.get("message") or message)
                 except ValueError:
                     pass
-            raise ModelError(f"{self.provider} chat request failed: {message}") from exc
+            raise ModelError(
+                f"{self.provider} chat request failed: {sanitize_provider_message(message)}",
+                classify_exception(exc),
+            ) from exc
         choices = data.get("choices") or []
         if not choices:
-            raise ModelError(f"{self.provider} returned no completion choices")
+            raise ModelError(f"{self.provider} returned no completion choices", ErrorCategory.MALFORMED)
         message = choices[0].get("message") or {}
         calls: list[ToolCall] = []
         for item in message.get("tool_calls") or []:

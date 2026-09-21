@@ -148,6 +148,22 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         settings, database, trading=trading, windows=windows, cancellation=cancellation,
         scanner=scanner, verifier=verifier, capabilities=capability_registry,
     )
+    # Credentials must be resolved BEFORE the adapters are built: an adapter
+    # captures the key at construction, so building first leaves a stored
+    # credential unused until something happens to rebuild the registry.
+    secret_store = SecretStore(settings.data_dir)
+
+    def apply_stored_credentials() -> None:
+        """Environment wins; the local store fills in what it does not set."""
+        for name, attribute in (
+            ("openrouter_api_key", "openrouter_api_key"),
+            ("openai_api_key", "openai_api_key"),
+            ("litellm_api_key", "litellm_api_key"),
+        ):
+            value, _ = resolve_credential(name, secret_store)
+            setattr(settings, attribute, value)
+
+    apply_stored_credentials()
     adapters = adapters or AdapterRegistry(settings)
     router = ModelRouter(settings, adapters, database)
     agent = AgentService(settings, database, tools, policy, adapters, router, trading, cancellation)
@@ -162,21 +178,10 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         verifier=verifier, capabilities=capability_registry, cancellation=cancellation,
         adapters=lambda: application.state.adapters,
     )
-    secret_store = SecretStore(settings.data_dir)
     # The Sorani providers are configured by key, so the voice service resolves
     # them from the store on use rather than at construction.
     voice = VoiceService(settings, secret_store)
     replay = BarReplayResearch(trading.market_data, trading.tradingview)
-
-    def apply_stored_credentials() -> None:
-        """Environment wins; the local store fills in what it does not set."""
-        for name, attribute in (
-            ("openrouter_api_key", "openrouter_api_key"),
-            ("openai_api_key", "openai_api_key"),
-            ("litellm_api_key", "litellm_api_key"),
-        ):
-            value, _ = resolve_credential(name, secret_store)
-            setattr(settings, attribute, value)
 
     def rebuild_adapters() -> None:
         """Pick up a new credential without restarting the process."""
@@ -186,8 +191,6 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         agent.adapters = refreshed
         router._health_cache.clear()
         router.failures.clear()
-
-    apply_stored_credentials()
 
     monitor_stop = asyncio.Event()
 
