@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="ckb" dir="rtl">
+  <head>
+    <!-- No external font CDN: SAM runs offline-first and its CSP forbids third-party styles. -->
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="SAM — Local desktop AI agent with multi-framework market analysis, TradingView automation, MetaTrader integration, and secure tool execution." />
+    <title>SAM Agent — Institutional Desktop Intelligence</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <style>
+      /* === SAM ENHANCED LAYER === */
+      :root { font-family: Inter, ui-sans-serif, -apple-system, sans-serif; }
+      .sr-only { position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0; }
+
+      /* Nav labels */
+      .nav-section-label { font-size:10px;font-weight:600;letter-spacing:.1em;color:var(--faint);text-transform:uppercase;padding:16px 16px 4px;margin:0; }
+
+      /* Nav items */
+      .nav-item { display:flex;align-items:center;gap:10px;padding:8px 14px;border-radius:var(--radius-sm);margin:1px 8px;font-size:13px;font-weight:500;color:var(--text-soft);background:transparent;border:none;width:calc(100% - 16px);text-align:left;cursor:pointer;transition:background .15s,color .15s; }
+      .nav-item:hover { background:var(--panel-hover);color:var(--text); }
+      .nav-item.active { background:var(--accent-soft);color:var(--accent-strong); }
+      .nav-icon { width:16px;height:16px;flex-shrink:0;opacity:.75; }
+      .nav-item.active .nav-icon { opacity:1;color:var(--accent); }
+      .nav-badge { margin-left:auto;background:var(--danger);color:#fff;font-size:10px;font-weight:700;border-radius:9px;min-width:18px;height:18px;display:flex;align-items:center;justify-content:center;padding:0 5px; }
+      .nav-badge:empty { display:none; }
+
+      /* Top tab bar */
+      .main-nav { display:flex;gap:2px;padding:0 8px;border-bottom:1px solid var(--line);background:var(--panel);overflow-x:auto;scrollbar-width:none;flex-shrink:0; }
+      .main-nav::-webkit-scrollbar { display:none; }
+      .main-nav-tab { display:flex;align-items:center;gap:6px;padding:10px 14px;font-size:13px;font-weight:500;color:var(--muted);background:transparent;border:none;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap;transition:color .15s,border-color .15s;margin-bottom:-1px; }
+      .main-nav-tab:hover { color:var(--text-soft); }
+      .main-nav-tab.active { color:var(--accent);border-bottom-color:var(--accent); }
+      .main-nav-tab svg { width:14px;height:14px; }
+
+      /* Content panels */
+      .content-panel { display:none;flex:1;overflow:hidden;flex-direction:column; }
+      .content-panel.active { display:flex; }
+      .main-column-inner { display:flex;flex-direction:column;flex:1;overflow:hidden; }
+
+      /* Logo */
+      .sidebar-logo-row { display:flex;align-items:center;gap:10px;padding:16px 16px 12px;border-bottom:1px solid var(--line);margin-bottom:4px; }
+      .logo-mark { width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#6d82ff,#5edfd3);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;flex-shrink:0; }
+      .logo-text strong { display:block;font-size:14px;font-weight:700; }
+      .logo-text span { font-size:11px;color:var(--muted); }
+      .sidebar-nav { display:flex;flex-direction:column;flex:1;overflow-y:auto;padding:8px 0; }
+
+      /* Topbar price chip */
+      .topbar-market-chip { display:flex;align-items:center;gap:8px;padding:5px 12px;border-radius:8px;background:var(--panel-raised);border:1px solid var(--line);font-size:12px;font-weight:500; }
+      .topbar-market-chip .sym { font-weight:700; }
+      .topbar-market-chip .px { font-family:'JetBrains Mono',monospace;color:var(--cyan); }
+      #topbar-xauusd { display:none; }
+      #topbar-xauusd.loaded { display:flex; }
+
+      /* Cards */
+      .trade-card { background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-lg);overflow:hidden; }
+      .trade-card-header { display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel-raised); }
+      .trade-card-header h3 { margin:0;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-soft); }
+      .trade-card-body { padding:14px 16px; }
+      .trade-card-body.scroll { overflow-y:auto;max-height:320px; }
+
+      /* Status rows */
+      .status-row { display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px; }
+      .status-row:last-child { border-bottom:none; }
+      .status-row .label { color:var(--muted); }
+      .status-row .value { font-weight:500; }
+      .sdot { width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px; }
+      .sdot.g { background:var(--mint);box-shadow:0 0 6px var(--mint); }
+      .sdot.r { background:var(--danger); }
+      .sdot.a { background:var(--amber); }
+      .sdot.x { background:var(--faint); }
+
+      /* Price display */
+      .price-display { display:flex;align-items:baseline;gap:10px;padding:12px 0 8px; }
+      .price-main { font-size:28px;font-weight:700;font-family:'JetBrains Mono',monospace;letter-spacing:-.02em; }
+      .price-change { font-size:13px;font-weight:600;padding:2px 8px;border-radius:6px; }
+      .price-change.up { background:rgba(98,214,169,.15);color:var(--mint); }
+      .price-change.dn { background:rgba(239,127,136,.15);color:var(--danger); }
+      .price-sub { display:flex;gap:16px;padding:4px 0 12px;font-size:12px;color:var(--muted); }
+      .price-sub b { color:var(--text-soft);font-weight:500; }
+
+      /* Analysis cells */
+      .analysis-grid { display:grid;grid-template-columns:1fr 1fr;gap:10px; }
+      .analysis-cell { background:var(--panel-raised);border-radius:var(--radius-sm);padding:10px 12px;border:1px solid var(--line); }
+      .cell-label { font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin-bottom:4px; }
+      .cell-value { font-size:13px;font-weight:600; }
+      .bullish { color:var(--mint); }
+      .bearish { color:var(--danger); }
+      .neutral { color:var(--amber); }
+      .muted { color:var(--muted);font-weight:400; }
+
+      /* Confluence */
+      .conf-row { display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px; }
+      .conf-row:last-child { border-bottom:none; }
+      .conf-label { color:var(--text-soft);font-weight:500; }
+      .cbadge { font-size:10px;font-weight:700;padding:2px 8px;border-radius:5px;text-transform:uppercase;letter-spacing:.05em; }
+      .cbadge.bull { background:rgba(98,214,169,.15);color:var(--mint); }
+      .cbadge.bear { background:rgba(239,127,136,.15);color:var(--danger); }
+      .cbadge.neut { background:rgba(244,184,90,.15);color:var(--amber); }
+      .cbadge.na { background:var(--panel-raised);color:var(--faint); }
+
+      /* Setup badge */
+      .setup-badge { display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:4px 12px;border-radius:6px;margin-bottom:12px; }
+      .setup-badge.forming { background:rgba(109,130,255,.15);color:var(--accent); }
+      .setup-badge.confirmed { background:rgba(98,214,169,.15);color:var(--mint); }
+      .setup-badge.watch { background:rgba(244,184,90,.15);color:var(--amber); }
+      .setup-badge.no-trade { background:rgba(94,94,94,.2);color:var(--muted); }
+
+      /* Level rows */
+      .level-row { display:flex;align-items:center;justify-content:space-between;padding:5px 0;font-size:12.5px;border-bottom:1px solid var(--line); }
+      .level-row:last-child { border-bottom:none; }
+      .level-label { color:var(--muted); }
+      .level-value { font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:500; }
+      .lv-entry { color:var(--accent); }
+      .lv-sl { color:var(--danger); }
+      .lv-tp { color:var(--mint); }
+      .rr-badge { font-size:12px;font-weight:600;color:var(--cyan); }
+
+      /* Framework rank */
+      .fw-item { display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px; }
+      .fw-item:last-child { border-bottom:none; }
+      .fw-rank { width:20px;height:20px;border-radius:50%;background:var(--panel-raised);border:1px solid var(--line-strong);font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--muted); }
+      .fw-name { flex:1;font-weight:500; }
+      .fw-rel { font-size:10px;color:var(--muted); }
+
+      /* Confidence bar */
+      .conf-bar-wrap { padding:10px 0 4px; }
+      .conf-bar { height:6px;background:var(--panel-raised);border-radius:3px;overflow:hidden;margin:6px 0; }
+      .conf-fill { height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width .6s var(--ease); }
+      .conf-meta { display:flex;justify-content:space-between;font-size:11px;color:var(--muted); }
+
+      /* MT5 quote grid */
+      .mt5-qgrid { display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border-radius:var(--radius-sm);overflow:hidden;margin-bottom:12px; }
+      .mt5-qcell { background:var(--panel-raised);padding:12px 14px;text-align:center; }
+      .qt-label { font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em; }
+      .qt-value { font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;margin-top:2px; }
+      .qt-value.bid { color:var(--danger); }
+      .qt-value.ask { color:var(--mint); }
+
+      /* Desktop panel */
+      .desktop-layout { display:grid;grid-template-columns:1fr 300px;gap:16px;padding:16px;height:100%;overflow:auto; }
+      .desktop-screen { background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-lg);overflow:hidden;display:flex;flex-direction:column; }
+      .desktop-screen-hdr { display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel-raised);font-size:12px;color:var(--muted); }
+      .desktop-screen-body { flex:1;display:flex;align-items:center;justify-content:center;background:#05080c;min-height:300px; }
+      .d-placeholder { text-align:center;color:var(--faint); }
+      .d-placeholder p { font-size:13px;margin:4px 0; }
+
+      /* Control buttons */
+      .ctrl-btn { display:flex;align-items:center;gap:8px;width:100%;padding:9px 12px;border-radius:var(--radius-sm);background:var(--panel-raised);border:1px solid var(--line);color:var(--text-soft);font-size:13px;font-weight:500;cursor:pointer;transition:background .15s,color .15s,border-color .15s;margin-bottom:6px;text-align:left; }
+      .ctrl-btn:hover { background:var(--panel-hover);color:var(--text);border-color:var(--line-strong); }
+      .ctrl-btn:disabled { opacity:.45;cursor:not-allowed; }
+      .ctrl-btn svg { width:14px;height:14px;flex-shrink:0; }
+      .ctrl-lbl { flex:1; }
+      .ctrl-status { font-size:11px;color:var(--muted); }
+
+      /* Emergency stop */
+      .e-stop { display:flex;align-items:center;gap:10px;width:100%;padding:11px 16px;border-radius:var(--radius-md);background:rgba(239,127,136,.08);border:1.5px solid rgba(239,127,136,.4);color:var(--danger);font-size:13px;font-weight:700;cursor:pointer;transition:background .15s,border-color .15s;text-align:left;letter-spacing:.01em; }
+      .e-stop:hover { background:rgba(239,127,136,.16);border-color:var(--danger); }
+      .e-stop svg { width:16px;height:16px; }
+
+      /* Tool tiles */
+      .tool-grid { display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:14px 16px; }
+      .tool-tile { background:var(--panel-raised);border:1px solid var(--line);border-radius:var(--radius-md);padding:12px;display:flex;flex-direction:column;gap:6px; }
+      .tool-tile-head { display:flex;align-items:center;gap:8px; }
+      .tool-icon { width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0; }
+      .tool-icon svg { width:14px;height:14px; }
+      .tool-name { font-size:12.5px;font-weight:600; }
+      .tool-desc { font-size:11px;color:var(--muted); }
+      .tool-avail { display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em; }
+      .tool-avail.ok { color:var(--mint); }
+      .tool-avail.warn { color:var(--amber); }
+      .tool-avail.err { color:var(--danger); }
+
+      /* Verified trading controls */
+      .sam-market-toolbar { display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel); }
+      .sam-market-toolbar > div { display:flex;align-items:center;gap:8px;margin-right:auto; }
+      .sam-market-toolbar label { display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted); }
+      .compact-field { width:auto;min-width:96px;padding:6px 9px;font-size:12px; }
+      .sam-timeframe-strip { display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:8px 16px;border-bottom:1px solid var(--line);font-size:11px;color:var(--muted); }
+      .sam-timeframe-strip label { display:inline-flex;align-items:center;gap:4px; }
+      .sam-timeframe-strip #trading-action-status { margin-left:auto;max-width:48%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+      .sam-action-row { display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px; }
+      .sam-action-row span { font-size:11px;color:var(--muted); }
+      .sam-inline-form { display:flex;align-items:stretch;gap:6px;margin-bottom:6px; }
+      .sam-inline-form .compact-field { flex:1; }
+      .sam-inline-form .ctrl-btn { width:auto;margin:0;white-space:nowrap; }
+      .badge { display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.05em; }
+      .badge-subtle { background:var(--panel-raised);color:var(--muted);border:1px solid var(--line); }
+      .badge-success { color:var(--mint);border-color:rgba(98,214,169,.35);background:rgba(98,214,169,.08); }
+      .badge-warning { color:var(--amber);border-color:rgba(244,184,90,.35);background:rgba(244,184,90,.08); }
+      .badge-danger { color:var(--danger);border-color:rgba(239,127,136,.35);background:rgba(239,127,136,.08); }
+
+      /* Workspace tree */
+      .workspace-layout { display:grid;grid-template-columns:280px 1fr;gap:0;height:100%;overflow:hidden; }
+      .file-tree { border-right:1px solid var(--line);overflow-y:auto;padding:8px; }
+      .file-entry { display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:6px;font-size:12.5px;cursor:pointer;color:var(--text-soft);transition:background .12s; }
+      .file-entry:hover { background:var(--panel-hover);color:var(--text); }
+      .file-entry svg { width:13px;height:13px;flex-shrink:0;color:var(--muted); }
+      .file-preview { flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted);font-size:13px;text-align:center; }
+
+      /* Permissions */
+      .perm-section-title { font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);padding:0 16px 6px; }
+      .perm-row { display:flex;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);gap:10px;font-size:13px; }
+      .perm-row:last-child { border-bottom:none; }
+      .perm-icon { width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0; }
+      .perm-icon svg { width:13px;height:13px; }
+      .perm-icon.low { background:rgba(98,214,169,.15);color:var(--mint); }
+      .perm-icon.med { background:rgba(244,184,90,.15);color:var(--amber); }
+      .perm-icon.high { background:rgba(239,127,136,.15);color:var(--danger); }
+      .perm-info { flex:1; }
+      .perm-info strong { display:block;font-weight:500; }
+      .perm-info small { color:var(--muted);font-size:11.5px; }
+
+      /* Mi layout */
+      .mi-layout { display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:16px;overflow:auto;height:100%; }
+      .mi-col { display:flex;flex-direction:column;gap:12px; }
+
+      /* Process row */
+      .proc-row { display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px; }
+      .proc-row:last-child { border-bottom:none; }
+      .proc-name { flex:1;font-weight:500;font-family:'JetBrains Mono',monospace;font-size:11px; }
+      .proc-pid { color:var(--muted);font-size:11px; }
+
+      /* Panel empty state */
+      .p-empty { display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px;text-align:center;color:var(--faint); }
+      .p-empty svg { width:36px;height:36px;opacity:.3;margin-bottom:10px; }
+      .p-empty p { font-size:13px;margin:0; }
+
+      /* Callout */
+      .info-callout { background:rgba(244,184,90,.06);border:1px solid rgba(244,184,90,.25);border-radius:10px;padding:14px 16px;margin-top:10px; }
+      .info-callout p { margin:0;font-size:12.5px;color:var(--amber);line-height:1.6; }
+      .danger-callout { background:rgba(239,127,136,.06);border:1px solid rgba(239,127,136,.25);border-radius:10px;padding:14px 16px;margin-top:10px; }
+      .danger-callout p { margin:0;font-size:12.5px;color:var(--danger);line-height:1.6; }
+
+      /* code mono */
+      code { font-family:'JetBrains Mono',monospace; }
+
+      /* responsive */
+      @media (max-width:1100px) {
+        .mi-layout, .desktop-layout, .workspace-layout { grid-template-columns:1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app app-shell" id="app">
+      <div class="mobile-scrim" id="mobile-scrim" hidden aria-hidden="true"></div>
+
+      <!-- ======== SIDEBAR ======== -->
+      <aside class="sidebar" id="sidebar" aria-label="Navigation">
+        <div class="sidebar-logo-row">
+          <div class="logo-mark" aria-hidden="true">S</div>
+          <div class="logo-text">
+            <strong data-i18n="brand.name">ئەجێنتی سام</strong>
+            <span data-i18n="brand.tagline">یاریزانی ناوخۆیی زیرەکی دەستکرد</span>
+          </div>
+          <button class="icon-button mobile-menu" style="margin-left:auto" type="button" data-action="close-sidebar" aria-label="Close navigation">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M12 4L4 12M4 4l8 8"/></svg>
+          </button>
+        </div>
+        <div style="padding:8px 8px 4px">
+          <button class="nav-item" style="background:var(--accent-soft);color:var(--accent-strong);justify-content:center;gap:8px;font-weight:600" type="button" data-action="new-chat" aria-label="New conversation" data-i18n="nav.newChat" data-i18n-aria="nav.newChat">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 5v6M5 8h6"/></svg>
+            گفتوگۆی نوێ
+          </button>
+        </div>
+        <nav class="sidebar-nav" aria-label="Primary navigation">
+          <p class="nav-section-label" data-i18n="nav.section.agent">ئەجێنت</p>
+          <button class="nav-item active" type="button" data-nav="agent" data-i18n="nav.agent">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="5.5" r="2.5"/><path d="M2.5 13c0-2.76 2.46-5 5.5-5s5.5 2.24 5.5 5"/></svg>
+            گفتوگۆ
+          </button>
+          <button class="nav-item" type="button" data-nav="desktop" data-i18n="nav.desktop">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="1.5" y="2" width="13" height="9" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg>
+            کۆنترۆڵی دێسکتۆپ
+          </button>
+          <button class="nav-item" type="button" data-nav="tasks" data-i18n="nav.tasks">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M2 8h3l2 4 3-8 2 4h2"/></svg>
+            ئەرک و پلان
+          </button>
+          <p class="nav-section-label" data-i18n="nav.section.trading">ترەیدینگ</p>
+          <button class="nav-item" type="button" data-nav="market" data-i18n="nav.market">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M1.5 12L5 7l3 3 3-5 3 2"/><path d="M14.5 11h-13"/></svg>
+            زانیاری بازاڕ
+          </button>
+          <button class="nav-item" type="button" data-nav="tradingview">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M4 10l2.5-3 2 2 3-4"/></svg>
+            TradingView
+          </button>
+          <button class="nav-item" type="button" data-nav="metatrader">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 4v4l2.5 2.5"/></svg>
+            میتاترەیدەر ٥
+          </button>
+          <p class="nav-section-label" data-i18n="nav.section.workspace">وۆرکسپەیس</p>
+          <button class="nav-item" type="button" data-nav="files" data-i18n="nav.files">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M3 13V4a1 1 0 011-1h4l1.5 2H12a1 1 0 011 1v7a1 1 0 01-1 1H4a1 1 0 01-1-1z"/></svg>
+            فایلەکان
+          </button>
+          <button class="nav-item" type="button" data-nav="tools" data-i18n="nav.tools">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M6.5 9.5l-4 4M12 2l2 2-6.5 6.5-2-2L12 2z"/><path d="M9 5l2 2"/></svg>
+            ئامرازەکان
+          </button>
+          <p class="nav-section-label" data-i18n="nav.section.memory">بیرگە و چاودێری</p>
+          <button class="nav-item" type="button" data-nav="approvals" data-i18n="nav.approvals">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M8 1.5l1.5 4H14l-3.5 2.5L11.8 13 8 10.5 4.2 13l1.3-5L2 5.5h4.5L8 1.5z"/></svg>
+            پەسەندکردن
+            <span class="nav-badge" id="sidebar-approval-badge"></span>
+          </button>
+          <button class="nav-item" type="button" data-nav="memory" data-i18n="nav.memory">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><ellipse cx="8" cy="5" rx="5.5" ry="2.5"/><path d="M2.5 5v6c0 1.38 2.46 2.5 5.5 2.5s5.5-1.12 5.5-2.5V5"/><path d="M2.5 8c0 1.38 2.46 2.5 5.5 2.5S13.5 9.38 13.5 8"/></svg>
+            بیرگە
+          </button>
+          <button class="nav-item" type="button" data-nav="audit" data-i18n="nav.audit">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M4 2h8a1 1 0 011 1v10a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3"/></svg>
+            تۆماری چاودێری
+          </button>
+          <button class="nav-item" type="button" data-nav="permissions" data-i18n="nav.permissions">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5 7V5a3 3 0 016 0v2"/></svg>
+            مۆڵەتەکان
+          </button>
+          <button class="nav-item" type="button" data-action="open-settings" data-i18n="nav.settings">
+            <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="8" r="2"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M3.2 12.8l1.1-1.1M11.7 4.3l1.1-1.1"/></svg>
+            ڕێکخستنەکان
+          </button>
+        </nav>
+        <!-- Sidebar status bottom -->
+        <div style="padding:8px;border-top:1px solid var(--line);margin-top:auto">
+          <section class="system-card" aria-label="System status">
+            <div class="system-card-heading">
+              <span class="status-indicator" id="sidebar-status-dot" aria-hidden="true"></span>
+              <div>
+                <strong id="sidebar-status-label">پەیوەندی دەکرێت…</strong>
+                <span id="sidebar-provider-label">خزمەتگوزاری ناوخۆیی دەپشکنرێت</span>
+              </div>
+              <button class="micro-button" type="button" data-action="refresh-all" aria-label="Refresh status">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+              </button>
+            </div>
+            <div class="system-meter" aria-hidden="true"><span id="system-meter-fill"></span></div>
+            <div class="system-card-foot">
+              <span id="sidebar-model-label">مۆدێل نییە</span>
+              <span id="sidebar-latency-label">&#8212;</span>
+            </div>
+          </section>
+          <button class="mode-button" style="width:100%;margin-top:6px;justify-content:flex-start" type="button" data-action="cycle-mode" title="Change permission mode">
+            <svg class="shield-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true" style="width:14px;height:14px"><path d="M8 1.5l5 2v4c0 3-2.5 5.5-5 6.5C6 13 3 11 3 7.5v-4l5-2z"/></svg>
+            <span id="permission-mode-label" data-sam-role="permission-mode-label">دۆخی پارێزراو</span>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:10px;height:10px;margin-left:auto" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+          </button>
+        </div>
+        <!-- retained for app.js -->
+        <div id="session-list" hidden aria-hidden="true" role="list" aria-label="Conversations"></div>
+        <p id="sessions-empty" hidden></p>
+      </aside>
+
+      <!-- ======== MAIN COLUMN ======== -->
+      <main class="main-column" id="main-column">
+        <header class="topbar" id="topbar">
+          <div class="topbar-left">
+            <button class="icon-button mobile-menu" type="button" data-action="open-sidebar" aria-label="Open navigation">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+            </button>
+            <div class="conversation-heading">
+              <div class="title-row">
+                <h1 id="conversation-title">گفتوگۆی نوێ</h1>
+                <button class="icon-button" type="button" data-action="rename-session" aria-label="Rename" title="Rename" style="opacity:.5">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M11 2.5l2.5 2.5-7.5 7.5H3.5V10L11 2.5z"/></svg>
+                </button>
+              </div>
+              <button class="workspace-breadcrumb" type="button" data-action="open-workspace">
+                <span class="workspace-dot" aria-hidden="true"></span>
+                <span id="workspace-name">وۆرکسپەیس بار دەکرێت…</span>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" style="width:9px;height:9px"><path d="M6 4l4 4-4 4"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <div class="topbar-market-chip" id="topbar-xauusd" title="XAUUSD live price from MT5">
+              <span class="sym">XAU/USD</span>
+              <span class="px" id="topbar-xauusd-price">&#8212;</span>
+            </div>
+            <button class="connection-pill" id="connection-pill" type="button" data-action="refresh-all" aria-label="Refresh connection status">
+              <span class="connection-dot" aria-hidden="true"></span>
+              <span class="connection-text">پەیوەندی</span>
+            </button>
+            <button class="icon-button context-toggle" type="button" data-action="toggle-context" aria-label="Toggle context panel" aria-expanded="true">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M10 2h4v12h-4zM2 2h5v12H2z"/></svg>
+            </button>
+            <button class="icon-button" type="button" data-action="open-settings" aria-label="Open settings">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="8" r="2"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- Tab bar -->
+        <nav class="main-nav" id="main-nav" aria-label="Content areas">
+          <button class="main-nav-tab active" data-nav="agent" data-i18n="nav.agent">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="5.5" r="2.5"/><path d="M2.5 13c0-2.76 2.46-5 5.5-5s5.5 2.24 5.5 5"/></svg>
+            گفتوگۆ
+          </button>
+          <button class="main-nav-tab" data-nav="market" data-i18n="nav.market">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M1.5 12L5 7l3 3 3-5 3 2"/></svg>
+            زانیاری بازاڕ
+          </button>
+          <button class="main-nav-tab" data-nav="tradingview" data-i18n="nav.tradingview">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M4 10l2.5-3 2 2 3-4"/></svg>
+            TradingView
+          </button>
+          <button class="main-nav-tab" data-nav="metatrader" data-i18n="nav.mt5">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M8 4v4l2.5 2.5"/></svg>
+            MT5
+          </button>
+          <button class="main-nav-tab" data-nav="desktop" data-i18n="nav.desktop">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="1.5" y="2" width="13" height="9" rx="1.5"/><path d="M8 11v3"/></svg>
+            دێسکتۆپ
+          </button>
+          <button class="main-nav-tab" data-nav="tools" data-i18n="nav.tools">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M6.5 9.5l-4 4M12 2l2 2-6.5 6.5-2-2L12 2z"/></svg>
+            ئامرازەکان
+          </button>
+          <button class="main-nav-tab" data-nav="tasks" data-i18n="nav.tasks">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M2 8h3l2 4 3-8 2 4h2"/></svg>
+            ئەرکەکان
+          </button>
+          <button class="main-nav-tab" data-nav="approvals" data-i18n="nav.approvals">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M8 1.5l1.5 4H14l-3.5 2.5L11.8 13 8 10.5 4.2 13l1.3-5L2 5.5h4.5L8 1.5z"/></svg>
+            پەسەندکردن
+            <span id="approval-count" hidden class="nav-badge" style="margin-left:4px">0</span>
+          </button>
+          <button class="main-nav-tab" data-nav="memory" data-i18n="nav.memory">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><ellipse cx="8" cy="5" rx="5.5" ry="2.5"/><path d="M2.5 5v6c0 1.38 2.46 2.5 5.5 2.5s5.5-1.12 5.5-2.5V5"/></svg>
+            بیرگە
+          </button>
+          <button class="main-nav-tab" data-nav="audit" data-i18n="nav.audit">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M4 2h8a1 1 0 011 1v10a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z"/><path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3"/></svg>
+            چاودێری
+          </button>
+          <button class="main-nav-tab" data-nav="files" data-i18n="nav.files">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M3 13V4a1 1 0 011-1h4l1.5 2H12a1 1 0 011 1v7a1 1 0 01-1 1H4a1 1 0 01-1-1z"/></svg>
+            فایلەکان
+          </button>
+          <button class="main-nav-tab" data-nav="permissions" data-i18n="nav.permissions">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5 7V5a3 3 0 016 0v2"/></svg>
+            مۆڵەتەکان
+          </button>
+        </nav>
+
+        <div class="main-column-inner">
+
+          <!-- PANEL: AGENT CHAT -->
+          <div class="content-panel active" id="panel-agent" role="region" aria-label="Agent chat">
+            <section class="chat-stage" aria-label="Chat with SAM">
+              <div class="chat-scroll" id="chat-scroll">
+                <div class="chat-feed" id="chat-feed" role="log" aria-live="polite" aria-relevant="additions">
+                  <section class="welcome-card" id="welcome-card">
+                    <div class="agent-orb" aria-hidden="true">
+                      <div class="orb-core">S</div>
+                      <div class="orb-ring ring-one"></div>
+                      <div class="orb-ring ring-two"></div>
+                    </div>
+                    <p class="eyebrow" data-i18n="welcome.eyebrow">ئەجێنتی ناوخۆیی  ·  شیکاری بازاڕ</p>
+                    <h2 data-i18n="welcome.title">لەسەر چی کار بکەین؟</h2>
+                    <p class="welcome-copy" data-i18n="welcome.copy">
+                      دەتوانم زێڕ و زیو شیکار بکەم، TradingView بەکاربهێنم، داتای میتاترەیدەر بخوێنمەوە، فایل بگۆڕم، فرمان جێبەجێ بکەم، و پلان دابنێم — پێش هەر کاری مەترسیدار پەسەندت دەوێت.
+                    </p>
+                    <div class="suggestion-grid" aria-label="Suggested prompts">
+                      <button class="suggestion-card" type="button" data-i18n-title="suggest.analyze" data-i18n-prompt="suggest.analyze.prompt" data-prompt="شیکاری تەواوی XAUUSD لە فیدی ناوخۆیی میتاترەیدەر ٥ بکە. تایمفرەیمەکان H1 و M15 و M5 و M1 بەکاربهێنە. پێکهاتە، پشتگیری/بەرگری، لیکویدیتی، و بڕیاری WAIT یان NO_TRADE یان ENTRY ڕوون بکەوە.">
+                        <span class="suggestion-icon blue" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:14px;height:14px"><path d="M1.5 12L5 7l3 3 3-5 3 2"/></svg>
+                        </span>
+                        <span><strong>شیکاری تەواوی زێڕ</strong><small>هەموو تایمفرەیمەکان لە میتاترەیدەری ناوخۆیی</small></span>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" style="width:10px;height:10px"><path d="M6 4l4 4-4 4"/></svg>
+                      </button>
+                      <button class="suggestion-card" type="button" data-i18n-title="suggest.pine" data-i18n-prompt="suggest.pine.prompt" data-prompt="TradingView بکەرەوە و XAUUSD بە SnR شیکاریم بۆ بکە. 1H و 15m ببینە و لە 5m و 1m entry بدۆزەوە.">
+                        <span class="suggestion-icon violet" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:14px;height:14px"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M4 10l2.5-3 2 2 3-4"/></svg>
+                        </span>
+                        <span><strong>TradingView بکەرەوە</strong><small>زێڕ پیشان بدە و شیکاری بکە</small></span>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" style="width:10px;height:10px"><path d="M6 4l4 4-4 4"/></svg>
+                      </button>
+                      <button class="suggestion-card" type="button" data-i18n-title="suggest.workspace" data-i18n-prompt="suggest.workspace.prompt" data-prompt="ئەم وۆرکسپەیسە بپشکنە و کورتەیەکی پڕۆژەکەم پێ بدە: پێکهاتە، API، ئەوەی کار دەکات، و ئەگەر کێشەیەک هەبێت.">
+                        <span class="suggestion-icon mint" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:14px;height:14px"><path d="M3 13V4a1 1 0 011-1h4l1.5 2H12a1 1 0 011 1v7a1 1 0 01-1 1H4a1 1 0 01-1-1z"/></svg>
+                        </span>
+                        <span><strong>وۆرکسپەیس بپشکنە</strong><small>پێکهاتە و ئەوەی گرنگە ڕوون بکەوە</small></span>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" style="width:10px;height:10px"><path d="M6 4l4 4-4 4"/></svg>
+                      </button>
+                      <button class="suggestion-card" type="button" data-i18n-title="suggest.auto" data-i18n-prompt="suggest.auto.prompt" data-prompt="یارمەتیم بدە کارێکی دووبارە ئۆتۆماتیکی بکەم. بپرسە ئامانجەکە چییە، پاشان پلانێکی پارێزراو دابنێ کە پێش هەر هەنگاوێک پەسەندم بدات.">
+                        <span class="suggestion-icon amber" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:14px;height:14px"><rect x="1.5" y="2" width="13" height="9" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg>
+                        </span>
+                        <span><strong>کارێک ئۆتۆماتیکی بکە</strong><small>ئۆتۆماتیکی دێسکتۆپ بە پەسەندکردن</small></span>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" style="width:10px;height:10px"><path d="M6 4l4 4-4 4"/></svg>
+                      </button>
+                    </div>
+                  </section>
+                </div>
+              </div>
+              <div class="composer-region">
+                <div class="voice-wave" id="voice-wave" hidden aria-live="polite">
+                  <span class="voice-live-dot" aria-hidden="true"></span>
+                  <span id="voice-status-text">گوێدەگرێت…</span>
+                  <div class="wave-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+                  <button type="button" data-action="stop-listening" data-i18n="composer.stop">وەستە</button>
+                </div>
+                <div class="attachment-strip" id="attachment-strip" hidden aria-label="Attached files"></div>
+                <form class="composer" id="chat-composer">
+                  <label class="sr-only" for="message-input">Message SAM</label>
+                  <textarea id="message-input" rows="1" maxlength="24000" data-i18n-placeholder="composer.placeholder" placeholder="لە سام بپرسە: شیکاری بازاڕ، فایل، ئۆتۆماتیک، یان ڕوونکردنەوە. Shift+Enter هێڵی نوێ." autocomplete="off"></textarea>
+                  <div class="composer-toolbar">
+                    <div class="composer-tools">
+                      <button class="composer-icon-button" type="button" data-action="attach-file" aria-label="Attach files" title="Attach file">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M13 9.5a5 5 0 01-9.9 1.1L2.5 5A3.5 3.5 0 019.5 4l.6 5.5a2 2 0 01-4 .4L5.5 4"/></svg>
+                      </button>
+                      <input id="file-input" type="file" multiple hidden />
+                      <button class="composer-icon-button" id="voice-input-button" type="button" data-action="toggle-voice-input" aria-label="Start voice input" title="Voice input">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><rect x="5.5" y="1.5" width="5" height="7" rx="2.5"/><path d="M2.5 7.5a5.5 5.5 0 0011 0M8 13v2M6 15h4"/></svg>
+                      </button>
+                      <button class="mode-button" type="button" data-action="cycle-mode" title="Change permission mode">
+                        <svg class="shield-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M8 1.5l5 2v4c0 3-2.5 5.5-5 6.5C6 13 3 11 3 7.5v-4l5-2z"/></svg>
+            <span id="permission-mode-label-composer" data-sam-role="permission-mode-label">دۆخی پارێزراو</span>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:10px;height:10px" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>
+                      </button>
+                    </div>
+                    <div class="composer-actions">
+                      <span class="input-hint"><kbd>Enter</kbd> بنێرە &#x00B7; <kbd>Shift+Enter</kbd> هێڵی نوێ</span>
+                      <button class="send-button" id="send-button" type="submit" aria-label="Send message" disabled>
+                        <span aria-hidden="true">&#8593;</span>
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+            </section>
+          </div>
+
+          <!-- PANEL: MARKET INTELLIGENCE -->
+          <div class="content-panel" id="panel-market" role="region" aria-label="Market Intelligence">
+            <div class="sam-market-toolbar">
+              <div><strong data-i18n="market.brain">مێشکی ترەیدینگ</strong><span class="badge badge-subtle" id="trading-data-state">پشکنینی داتا</span></div>
+              <label>Symbol <input class="text-field compact-field" id="trading-symbol" value="XAUUSD" maxlength="32" /></label>
+              <label>Theory <select class="text-field compact-field" id="trading-theory"><option value="default">SAM Default</option><option value="snr">SnR</option><option value="smc">SMC</option><option value="ict">ICT</option><option value="wyckoff">Wyckoff</option></select></label>
+              <button class="secondary-button" type="button" id="fetch-mt5-btn" data-i18n="market.refresh">نوێکردنەوە</button>
+              <button class="primary-button" type="button" id="run-market-analysis-btn" data-i18n="market.analyze">شیکاری</button>
+              <button class="secondary-button" type="button" id="compare-theories-btn" data-i18n="market.compare">بەراورد</button>
+            </div>
+            <div class="sam-timeframe-strip" aria-label="Analysis timeframes">
+              <label><input type="checkbox" value="H4" /> 4H</label><label><input type="checkbox" value="H1" checked /> 1H</label><label><input type="checkbox" value="M15" checked /> 15m</label><label><input type="checkbox" value="M5" checked /> 5m</label><label><input type="checkbox" value="M3" /> 3m</label><label><input type="checkbox" value="M1" checked /> 1m</label>
+              <span id="trading-action-status" role="status">چاوەڕوان</span>
+            </div>
+            <div class="mi-layout">
+              <div class="mi-col">
+                <div class="trade-card">
+                  <div class="trade-card-header"><h3>Verified Live Quote</h3><span id="trading-feed">No feed yet</span></div>
+                  <div class="trade-card-body">
+                    <div class="price-display"><span class="price-main" id="mi-price">&#8212;</span></div>
+                    <div class="price-sub"><span>Bid <b id="mi-bid">&#8212;</b></span><span>Ask <b id="mi-ask">&#8212;</b></span><span>Spread <b id="mi-spread">&#8212;</b></span></div>
+                    <div class="status-row"><span class="label">Session</span><span class="value" id="mi-session">&#8212;</span></div>
+                    <div class="status-row"><span class="label">Last update</span><span class="value" id="mi-updated">&#8212;</span></div>
+                    <div class="status-row"><span class="label">Provider verification</span><span class="value" id="trading-provider-verification">Not checked</span></div>
+                  </div>
+                </div>
+                <div class="trade-card">
+                  <div class="trade-card-header"><h3>Market Context</h3></div>
+                  <div class="trade-card-body">
+                    <div class="analysis-grid">
+                      <div class="analysis-cell"><div class="cell-label">HTF Bias</div><div class="cell-value neutral" id="analysis-htf-bias">&#8212;</div></div>
+                      <div class="analysis-cell"><div class="cell-label">Decision</div><div class="cell-value neutral" id="analysis-decision">&#8212;</div></div>
+                      <div class="analysis-cell"><div class="cell-label">Setup State</div><div class="cell-value neutral" id="analysis-setup-state">&#8212;</div></div>
+                      <div class="analysis-cell"><div class="cell-label">Confidence</div><div class="cell-value" id="analysis-confidence">&#8212;</div></div>
+                    </div>
+                    <div class="status-row"><span class="label">Missing confirmation</span><span class="value" id="analysis-missing">Run analysis</span></div>
+                    <div class="status-row"><span class="label">Self-check</span><span class="value" id="analysis-self-check">Not run</span></div>
+                  </div>
+                </div>
+                <div class="trade-card">
+                  <div class="trade-card-header"><h3>Entry / Invalidation / Targets</h3><span class="setup-badge" id="analysis-badge">NO ANALYSIS</span></div>
+                  <div class="trade-card-body">
+                    <div class="level-row"><span class="level-label">Entry</span><span class="level-value" id="analysis-entry">&#8212;</span></div>
+                    <div class="level-row"><span class="level-label">Technical invalidation</span><span class="level-value" id="analysis-invalidation">&#8212;</span></div>
+                    <div class="level-row"><span class="level-label">Stop</span><span class="level-value lv-sl" id="analysis-stop">&#8212;</span></div>
+                    <div class="level-row"><span class="level-label">TP1</span><span class="level-value lv-tp" id="analysis-tp1">&#8212;</span></div>
+                    <div class="level-row"><span class="level-label">TP2</span><span class="level-value lv-tp" id="analysis-tp2">&#8212;</span></div>
+                    <div class="level-row"><span class="level-label">TP3</span><span class="level-value lv-tp" id="analysis-tp3">&#8212;</span></div>
+                    <div class="level-row"><span class="level-label">Risk / Reward</span><span class="rr-badge" id="analysis-rr">&#8212;</span></div>
+                    <div class="sam-action-row"><button class="secondary-button" type="button" id="monitor-setup-btn" disabled>Monitor setup</button><button class="secondary-button" type="button" id="draw-analysis-btn" disabled>Draw analysis</button><span id="drawing-capability">Calibration required</span></div>
+                  </div>
+                </div>
+              </div>
+              <div class="mi-col">
+                <div class="trade-card"><div class="trade-card-header"><h3>Support / Resistance</h3></div><div class="trade-card-body" id="analysis-levels"><div class="p-empty"><p>No verified levels yet.</p></div></div></div>
+                <div class="trade-card"><div class="trade-card-header"><h3>Theory Evidence</h3></div><div class="trade-card-body" id="analysis-theories"><div class="p-empty"><p>Select a theory and run analysis.</p></div></div></div>
+                <div class="trade-card"><div class="trade-card-header"><h3>Data Capability Guard</h3></div><div class="trade-card-body scroll" id="market-capabilities"><div class="p-empty"><p>Checking provider capabilities.</p></div></div></div>
+                <div class="trade-card"><div class="trade-card-header"><h3>Skills Health</h3></div><div class="trade-card-body scroll" id="trading-skills-health"><div class="p-empty"><p>Loading skills.</p></div></div></div>
+                <div class="trade-card" style="border-color:rgba(109,130,255,.3)"><div class="trade-card-header"><h3>Verified Conclusion</h3></div><div class="trade-card-body"><p id="analysis-conclusion">No conclusion. SAM will show WAIT or NO TRADE when confirmation is missing.</p></div></div>
+<div class="trade-card" id="card-providers"><div class="trade-card-header"><h3>Model Providers</h3><button class="secondary-button" type="button" id="providers-refresh-btn">Refresh</button></div><div class="trade-card-body">
+<div class="level-row"><span class="level-label">OpenRouter</span><span class="badge badge-subtle" id="provider-openrouter">UNKNOWN</span></div>
+<div class="level-row"><span class="level-label">Ollama</span><span class="badge badge-subtle" id="provider-ollama">UNKNOWN</span></div>
+<div class="level-row"><span class="level-label">LiteLLM</span><span class="badge badge-subtle" id="provider-litellm">UNKNOWN</span></div>
+<p class="p-note" id="provider-detail">Provider health has not been checked yet.</p>
+<div class="sam-action-row"><input type="password" id="openrouter-key-input" placeholder="OpenRouter API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><button class="primary-button" type="button" id="openrouter-save-btn">Configure</button><button class="secondary-button" type="button" id="ollama-start-btn">Start Ollama</button></div>
+<p class="p-note">The key is sent to the local backend only, stored outside the web root, and never returned to this page.</p>
+</div></div>
+<div class="trade-card" id="card-sorani"><div class="trade-card-header"><h3>Sorani Voice &#183; دەنگی سۆرانی</h3><button class="secondary-button" type="button" id="sorani-refresh-btn">Refresh</button></div><div class="trade-card-body">
+<div class="level-row"><span class="level-label">KurdishTTS speech recognition</span><span class="badge badge-subtle" id="sorani-stt-status">UNKNOWN</span></div>
+<div class="level-row"><span class="level-label">KurdishTTS speech output</span><span class="badge badge-subtle" id="sorani-tts-status">UNKNOWN</span></div>
+<div class="level-row"><span class="level-label">Google ckb-IQ fallback</span><span class="badge badge-subtle" id="sorani-google-status">UNCONFIGURED</span></div>
+<div class="level-row"><span class="level-label">Sorani voice</span><span class="level-value" id="sorani-speaker">&#8212;</span></div>
+<p class="p-note" id="sorani-detail">Sorani provider health has not been checked yet.</p>
+<div class="sam-action-row"><input type="password" id="sorani-stt-key-input" placeholder="KurdishTTS STT API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><input type="password" id="sorani-tts-key-input" placeholder="KurdishTTS TTS API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><button class="primary-button" type="button" id="sorani-save-btn">Configure</button></div>
+<div class="sam-action-row"><select class="text-field" id="sorani-speaker-select" style="flex:1;min-width:180px"><option value="">Provider default voice</option></select><button class="secondary-button" type="button" id="sorani-test-btn">Test Sorani speech</button></div>
+<p class="p-note">Kurdish is not one of Whisper&#8217;s languages, so Sorani speech runs through KurdishTTS rather than locally. An English voice is never substituted for Sorani. Keys are stored by the backend and never returned to this page.</p>
+</div></div>
+
+<div class="trade-card" id="card-triggers"><div class="trade-card-header"><h3>Entry Triggers</h3><span class="badge badge-subtle" id="trigger-count">0</span></div><div class="trade-card-body scroll" id="trigger-list" style="max-height:260px"><div class="p-empty"><p>Loading triggers from the backend.</p></div></div></div>
+
+<div class="trade-card" id="card-backtest"><div class="trade-card-header"><h3>Backtest</h3><span class="badge badge-subtle" id="backtest-status">IDLE</span></div><div class="trade-card-body">
+<div class="sam-action-row">
+<input id="bt-symbol" value="XAUUSD" placeholder="Symbol" style="width:110px">
+<select id="bt-timeframe"><option>M5</option><option selected>M15</option><option>M30</option><option>H1</option><option>H4</option></select>
+<select id="bt-trigger"><option value="">All triggers</option></select>
+<select id="bt-direction"><option value="BOTH" selected>Long &amp; Short</option><option value="LONG">Long only</option><option value="SHORT">Short only</option></select>
+</div>
+<div class="sam-action-row">
+<label class="p-note">Bars <input id="bt-count" type="number" value="3000" min="300" max="20000" style="width:88px"></label>
+<label class="p-note">Stop ATR <input id="bt-stop" type="number" value="1.5" step="0.1" min="0.2" max="10" style="width:70px"></label>
+<label class="p-note">Reward <input id="bt-reward" type="number" value="2.0" step="0.1" min="0.2" max="20" style="width:70px"></label>
+<label class="p-note">Max bars <input id="bt-maxbars" type="number" value="60" min="5" max="500" style="width:70px"></label>
+</div>
+<div class="sam-action-row"><button class="primary-button" type="button" id="bt-run-btn">Run Backtest</button><button class="secondary-button" type="button" id="bt-cancel-btn" disabled>Cancel</button></div>
+<div id="backtest-results"><div class="p-empty"><p>Every figure shown here is computed by the backend engine on real candles.</p></div></div>
+</div></div>
+
+<div class="trade-card" id="card-composer"><div class="trade-card-header"><h3>Strategy Composer</h3></div><div class="trade-card-body">
+<div class="sam-action-row"><input id="sc-name" placeholder="Strategy name" style="flex:1;min-width:140px"><select id="sc-direction"><option value="BOTH" selected>Both</option><option value="LONG">Long</option><option value="SHORT">Short</option></select></div>
+<div class="sam-action-row"><input id="sc-context" placeholder="Context (e.g. 1H Demand)" style="flex:1;min-width:160px"><input id="sc-setup" placeholder="Setup (e.g. Liquidity Sweep)" style="flex:1;min-width:160px"></div>
+<div class="sam-action-row"><input id="sc-confirmation" placeholder="Confirmation (e.g. 5m MSS)" style="flex:1;min-width:160px"><select id="sc-trigger"><option value="">Entry trigger</option></select></div>
+<div class="sam-action-row"><input id="sc-invalidation" placeholder="Invalidation" style="flex:1;min-width:150px"><input id="sc-stop" placeholder="Stop logic" style="flex:1;min-width:130px"><input id="sc-targets" placeholder="Targets, comma separated" style="flex:1;min-width:160px"></div>
+<div class="sam-action-row"><input id="sc-timeframes" value="H1,M15,M5" placeholder="Timeframes" style="width:150px"><label class="p-note">Min RR <input id="sc-rr" type="number" value="1.5" step="0.1" min="0.1" max="50" style="width:70px"></label><button class="primary-button" type="button" id="sc-save-btn">Save Strategy</button><button class="secondary-button" type="button" id="sc-reload-btn">Reload</button></div>
+<div id="composer-status" class="p-note">Composed strategies are validated and versioned by the backend.</div>
+<div class="trade-card-body scroll" id="strategy-list" style="max-height:150px;padding:0"><div class="p-empty"><p>No saved strategies yet.</p></div></div>
+</div></div>
+
+<div class="trade-card" id="card-journal"><div class="trade-card-header"><h3>Research &amp; Journal</h3><button class="secondary-button" type="button" id="journal-refresh-btn">Refresh</button></div><div class="trade-card-body">
+<div class="sam-action-row"><input id="journal-query" placeholder="Filter by symbol, theory, or result" style="flex:1;min-width:180px"></div>
+<div class="trade-card-body scroll" id="journal-list" style="max-height:220px;padding:0"><div class="p-empty"><p>No journal entries yet.</p></div></div>
+<div class="trade-card-body scroll" id="setup-list" style="max-height:180px;padding:0"></div>
+</div></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: TRADINGVIEW -->
+          <div class="content-panel" id="panel-tradingview" role="region" aria-label="TradingView Desktop">
+            <div style="padding:16px;display:flex;flex-direction:column;gap:14px;overflow:auto;height:100%">
+              <div class="trade-card">
+                <div class="trade-card-header">
+                  <h3>TradingView Desktop Status</h3>
+                  <span class="badge badge-subtle" id="tradingview-status">CHECKING</span>
+                </div>
+                <div class="trade-card-body">
+                  <div class="status-row"><span class="label">Process / window</span><span class="value" id="tv-process-state">Checking installed desktop app</span></div>
+                  <div class="status-row"><span class="label">Observed symbol</span><span class="value" id="tv-observed-symbol">&#8212;</span></div>
+                  <div class="status-row"><span class="label">Observed quote</span><span class="value" id="tv-observed-price">&#8212;</span></div>
+                  <div class="status-row"><span class="label">Screen capture</span><span class="value" id="tv-capture-state">Checking permission</span></div>
+                  <div class="status-row"><span class="label">Chart drawing</span><span class="value" id="tv-drawing-state">Requires verified calibration</span></div>
+                  <div class="info-callout">
+                    <p id="tv-disclosure"><strong>Verification:</strong> SAM reports only state it can observe. Timeframe changes and drawings stay marked partial until independently verified.</p>
+                  </div>
+                </div>
+              </div>
+              <div class="trade-card">
+                <div class="trade-card-header"><h3>Pine Script Generator</h3></div>
+                <div class="trade-card-body">
+                  <p style="font-size:13px;color:var(--text-soft);margin:0 0 14px;line-height:1.6">Click a button below to generate a complete Pine Script v5 indicator in the Chat panel. Copy the script from the chat and paste it into TradingView&#x2019;s Pine Editor.</p>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="ctrl-btn" style="width:auto;padding:8px 14px" type="button" data-action="send-prompt" data-prompt="Generate a complete, compile-ready Pine Script v5 Omni-Framework indicator for XAUUSD with SMC/ICT (Order Blocks, FVG, BOS, CHOCH, BSL/SSL), ICT Kill Zones, Session Highs/Lows (PDH/PDL/PWH/PWL), Gann Price Divisions (1/8 to 8/8), Fibonacci Retracements, Supply/Demand Zones, and a Dashboard overlay showing Trend Bias, Confidence Score, and Active Setup. All modules must have ON/OFF input controls.">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M4 10l2.5-3 2 2 3-4"/></svg>
+                      <span class="ctrl-lbl">Omni-Framework</span>
+                    </button>
+                    <button class="ctrl-btn" style="width:auto;padding:8px 14px" type="button" data-action="send-prompt" data-prompt="Generate a complete Pine Script v5 W.D. Gann analysis indicator including: Gann Angles (1x1, 2x1, 1x2, 1x3, 3x1), Gann Price Divisions (1/8 to 8/8), Square of Nine price levels, and optional Gann Time Cycle projections. Anchor from the most recent significant swing high or low.">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M2 13L8 2l6 11H2z"/></svg>
+                      <span class="ctrl-lbl">Gann Framework</span>
+                    </button>
+                    <button class="ctrl-btn" style="width:auto;padding:8px 14px" type="button" data-action="send-prompt" data-prompt="Generate a complete Pine Script v5 Wyckoff analysis indicator showing Accumulation/Distribution phases, Spring, UTAD, Sign of Strength, Sign of Weakness, with visual annotations and automatic phase detection based on price-volume action.">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M2 8h3l2 4 3-8 2 4h2"/></svg>
+                      <span class="ctrl-lbl">Wyckoff Framework</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="trade-card">
+                <div class="trade-card-header"><h3>Verified Desktop Actions</h3></div>
+                <div class="trade-card-body">
+                  <button class="ctrl-btn" id="tv-focus-btn" type="button"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="2" width="13" height="9" rx="1.5"/></svg><span class="ctrl-lbl">Focus TradingView Window</span><span class="ctrl-status">Observe result</span></button>
+                  <div class="sam-inline-form"><input class="text-field compact-field" id="tv-symbol-input" value="XAUUSD" maxlength="32" aria-label="TradingView symbol"/><button class="ctrl-btn" id="tv-symbol-btn" type="button"><span class="ctrl-lbl">Set symbol</span></button></div>
+                  <div class="sam-inline-form"><select class="text-field compact-field" id="tv-timeframe-input" aria-label="TradingView timeframe"><option>M1</option><option>M3</option><option>M5</option><option>M15</option><option>H1</option><option>H4</option><option>D1</option></select><button class="ctrl-btn" id="tv-timeframe-btn" type="button"><span class="ctrl-lbl">Set timeframe</span></button></div>
+                  <button class="ctrl-btn" id="tv-capture-btn" type="button"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="8" cy="8" r="6.5"/><path d="M8 4v4l3 1.5"/></svg><span class="ctrl-lbl">Capture chart</span><span class="ctrl-status">Requires Screen Access</span></button>
+                  <p class="compatibility-note" id="tv-action-result" role="status">No action run.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: METATRADER 5 -->
+          <div class="content-panel" id="panel-metatrader" role="region" aria-label="MetaTrader 5">
+            <div style="padding:16px;display:flex;flex-direction:column;gap:14px;overflow:auto;height:100%">
+              <div class="trade-card" id="mt5-connection-card">
+                <div class="trade-card-header">
+                  <h3>MetaTrader 5 Connection</h3>
+                  <span class="badge badge-subtle" id="mt5-connection-status">CHECKING</span>
+                </div>
+                <div class="trade-card-body">
+                  <div class="status-row"><span class="label">Terminal</span><span class="value" id="mt5-terminal">Not checked</span></div>
+                  <div class="status-row"><span class="label">Broker / server</span><span class="value" id="mt5-broker">&#8212;</span></div>
+                  <div class="status-row"><span class="label">Adapter scope</span><span class="value" id="mt5-scope">Read-only market data</span></div>
+                  <div class="status-row"><span class="label">Data verification</span><span class="value" id="mt5-verification">Not checked</span></div>
+                </div>
+              </div>
+              <div class="trade-card">
+                <div class="trade-card-header">
+                  <h3>Live Quotes &#x2014; XAUUSD</h3>
+                  <button class="secondary-button" type="button" id="mt5-refresh-btn" style="font-size:11px;padding:4px 10px">Refresh</button>
+                </div>
+                <div class="trade-card-body">
+                  <div class="mt5-qgrid">
+                    <div class="mt5-qcell"><div class="qt-label">Bid</div><div class="qt-value bid" id="mt5-bid">&#8212;</div></div>
+                    <div class="mt5-qcell"><div class="qt-label">Ask</div><div class="qt-value ask" id="mt5-ask">&#8212;</div></div>
+                  </div>
+                  <div class="status-row"><span class="label">Spread (pts)</span><span class="value" id="mt5-spread">&#8212;</span></div>
+                  <div class="status-row"><span class="label">Resolved symbol</span><span class="value" id="mt5-symbol">&#8212;</span></div>
+                </div>
+              </div>
+              <div class="trade-card">
+                <div class="trade-card-header"><h3>Multi-Timeframe OHLC (Last Candle)</h3></div>
+                <div class="trade-card-body scroll" id="mt5-ohlc-table">
+                  <div class="p-empty" style="padding:20px 0"><p>Click Refresh to load latest OHLC data from MT5.</p></div>
+                </div>
+              </div>
+              <div class="info-callout">
+                <p><strong>Execution Safety:</strong> This build exposes <strong>read-only market data only</strong>. Live order placement is not implemented, so SAM cannot place a broker order from this interface.</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: DESKTOP CONTROL -->
+          <div class="content-panel" id="panel-desktop" role="region" aria-label="Desktop Control">
+            <div class="desktop-layout">
+              <div style="display:flex;flex-direction:column;gap:14px">
+                <div class="desktop-screen">
+                  <div class="desktop-screen-hdr">
+                    <span>Desktop Capture</span>
+                    <span class="badge badge-subtle" id="desktop-capture-status">CHECKING</span>
+                  </div>
+                  <div class="desktop-screen-body">
+                    <div class="d-placeholder">
+                      <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;opacity:.2;margin-bottom:12px"><rect x="4" y="8" width="56" height="36" rx="4"/><path d="M22 56h20M32 44v12"/></svg>
+                      <p id="desktop-screen-message">Screen capture is off until Screen Access is enabled.</p>
+                      <p style="font-size:12px;margin-top:4px;color:var(--faint)">SAM never infers screen contents when capture is disabled.</p>
+                    </div>
+                  </div>
+                </div>
+                <div class="trade-card">
+                  <div class="trade-card-header"><h3>Agent-Relevant Processes</h3></div>
+                  <div class="trade-card-body" id="desktop-process-list">
+                    <div class="p-empty"><p>Loading observed processes.</p></div>
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:14px">
+                <button class="e-stop" type="button" id="emergency-stop-btn">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><rect x="5.5" y="5.5" width="5" height="5" rx="1" fill="currentColor" stroke="none"/></svg>
+                  EMERGENCY STOP
+                </button>
+                <div class="trade-card">
+                  <div class="trade-card-header"><h3>Automation Control</h3></div>
+                  <div class="trade-card-body">
+                    <button class="ctrl-btn" id="desktop-focus-tv-btn" type="button"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="2" width="13" height="9" rx="1.5"/></svg><span class="ctrl-lbl">Focus TradingView</span><span class="ctrl-status">Capability checked at run time</span></button>
+                    <button class="ctrl-btn" id="desktop-capture-btn" type="button"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="8" cy="8" r="6.5"/><path d="M8 4v4l3 1.5"/></svg><span class="ctrl-lbl">Capture Screen</span><span class="ctrl-status">Requires Screen Access</span></button>
+                  </div>
+                </div>
+                <div class="trade-card">
+                  <div class="trade-card-header"><h3>System Info</h3></div>
+                  <div class="trade-card-body">
+                    <div class="status-row"><span class="label">OS</span><span class="value" id="desktop-os">Windows (checking)</span></div>
+                    <div class="status-row"><span class="label">Control permission</span><span class="value" id="desktop-control-permission">Checking</span></div>
+                    <div class="status-row"><span class="label">Screen permission</span><span class="value" id="desktop-screen-permission">Checking</span></div>
+                    <div class="status-row"><span class="label">Backend</span><span class="value" style="font-family:monospace;font-size:11px">127.0.0.1:8765</span></div>
+                    <div class="status-row"><span class="label">Workspace</span><span class="value" style="font-family:monospace;font-size:11px" id="desktop-workspace">&#8212;</span></div>
+                    <div class="status-row"><span class="label">Uptime</span><span class="value" id="desktop-uptime">&#8212;</span></div>
+                    <div class="status-row"><span class="label">Elevated</span><span class="value" id="desktop-elevated">Checking</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: TOOLS -->
+          <div class="content-panel" id="panel-tools" role="region" aria-label="Tool center">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--line);font-size:13px;font-weight:600;flex-shrink:0">Tool Center</div>
+            <div class="tool-grid">
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(98,214,169,.15);color:var(--mint)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M4 2h8a1 1 0 011 1v10a1 1 0 01-1 1H4a1 1 0 01-1-1V3a1 1 0 011-1z"/></svg></div><div><div class="tool-name">File System</div><div class="tool-desc">Read, write, list workspace files</div></div></div>
+                <span class="tool-avail" id="tool-status-files">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(98,214,169,.15);color:var(--mint)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10h3.5"/></svg></div><div><div class="tool-name">Terminal / Shell</div><div class="tool-desc">PowerShell command execution</div></div></div>
+                <span class="tool-avail" id="tool-status-terminal">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(94,223,211,.15);color:var(--cyan)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="8" cy="8" r="6.5"/><path d="M8 4v4l2.5 2.5"/></svg></div><div><div class="tool-name">MetaTrader 5 API</div><div class="tool-desc">Live quotes, OHLC, symbol info</div></div></div>
+                <span class="tool-avail" id="tool-status-mt5">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(109,130,255,.15);color:var(--accent)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="8" cy="8" r="2"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5"/></svg></div><div><div class="tool-name">Browser Automation</div><div class="tool-desc">Web navigation and interaction</div></div></div>
+                <span class="tool-avail" id="tool-status-browser">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(239,127,136,.15);color:var(--danger)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="1.5" width="13" height="13" rx="2"/><path d="M4 10l2.5-3 2 2 3-4"/></svg></div><div><div class="tool-name">TradingView Desktop</div><div class="tool-desc">Window focus, chart automation</div></div></div>
+                <span class="tool-avail" id="tool-status-tradingview">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(109,130,255,.15);color:var(--accent)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="2" width="13" height="9" rx="1.5"/></svg></div><div><div class="tool-name">Desktop Automation</div><div class="tool-desc">Screen capture, keyboard, mouse</div></div></div>
+                <span class="tool-avail" id="tool-status-desktop">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(244,184,90,.15);color:var(--amber)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M8 1l2 4.5h4.5l-3.5 3 1.5 4.5L8 11l-4.5 2 1.5-4.5L1.5 5.5H6L8 1z"/></svg></div><div><div class="tool-name">Market Analysis AI</div><div class="tool-desc">Multi-framework analysis engine</div></div></div>
+                <span class="tool-avail" id="tool-status-market">Checking</span>
+              </div>
+              <div class="tool-tile">
+                <div class="tool-tile-head"><div class="tool-icon" style="background:rgba(94,223,211,.15);color:var(--cyan)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 7h6M5 10h4"/></svg></div><div><div class="tool-name">Python Runner</div><div class="tool-desc">Execute Python scripts locally</div></div></div>
+                <span class="tool-avail" id="tool-status-python">Checking</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: TASKS -->
+          <div class="content-panel" id="panel-tasks" role="region" aria-label="Tasks and plans">
+            <div style="padding:16px;display:flex;flex-direction:column;gap:14px;overflow:auto;height:100%">
+              <div class="trade-card">
+                <div class="trade-card-header">
+                  <h3>Active Plan</h3>
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <span id="plan-progress-label" data-sam-role="plan-progress-label" style="font-size:11px;color:var(--muted)">0%</span>
+                    <div style="width:60px;height:5px;background:var(--panel-raised);border-radius:3px;overflow:hidden">
+                      <div id="plan-progress-ring" data-sam-role="plan-progress-indicator" data-progress-kind="bar" style="height:100%;background:linear-gradient(90deg,var(--accent),var(--cyan));width:0%;transition:width .5s var(--ease)"></div>
+                    </div>
+                    <button class="micro-button" type="button" data-action="refresh-plan">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+                    </button>
+                  </div>
+                </div>
+                <div class="trade-card-body">
+                  <p id="plan-status-title" data-sam-role="plan-status-title" style="font-weight:600;margin:0 0 4px;font-size:14px">No active plan</p>
+                  <p id="plan-status-copy" data-sam-role="plan-status-copy" style="color:var(--muted);font-size:12.5px;margin:0 0 14px">A task plan will appear here when SAM starts multi-step work.</p>
+                  <ol id="plan-list" data-sam-role="plan-list" style="margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:6px"></ol>
+                </div>
+              </div>
+              <div class="trade-card" id="tool-activity" data-sam-role="tool-activity" hidden>
+                <div class="trade-card-header"><h3>Tool Activity</h3></div>
+                <div class="trade-card-body" id="tool-activity-items" data-sam-role="tool-activity-items"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: APPROVALS -->
+          <div class="content-panel" id="panel-approvals" role="region" aria-label="Approvals">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+              <strong>Pending Approvals</strong>
+              <button class="micro-button" type="button" data-action="refresh-approvals">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+              </button>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:12px 16px">
+              <div id="approval-list" data-sam-role="approval-list" aria-label="Approval requests"></div>
+              <p id="approvals-empty" data-sam-role="approvals-empty" style="color:var(--muted);font-size:13px;padding:20px 0;text-align:center">No pending approvals. SAM will request your review before any risky action.</p>
+            </div>
+          </div>
+
+          <!-- PANEL: MEMORY -->
+          <div class="content-panel" id="panel-memory" role="region" aria-label="Memory">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;flex-shrink:0">
+              <label class="sr-only" for="memory-search">Search memories</label>
+              <input class="text-field" id="memory-search" data-sam-role="memory-search" type="search" placeholder="Search memories&#8230;" autocomplete="off" style="flex:1" />
+              <button class="micro-button" type="button" data-action="refresh-memory">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+              </button>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:12px 16px">
+              <div id="memory-list" data-sam-role="memory-list" style="display:flex;flex-direction:column;gap:8px"></div>
+              <p id="memory-empty" data-sam-role="memory-empty" style="color:var(--muted);font-size:13px;padding:20px 0;text-align:center">No stored memories. SAM will remember approved facts and preferences here.</p>
+            </div>
+          </div>
+
+          <!-- PANEL: AUDIT -->
+          <div class="content-panel" id="panel-audit" role="region" aria-label="Audit log">
+            <div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;flex-shrink:0">
+              <label class="sr-only" for="audit-filter">Filter audit events</label>
+              <select class="text-field" id="audit-filter" data-sam-role="audit-filter" style="width:180px;font-size:13px;padding:6px 10px">
+                <option value="all">All events</option>
+                <option value="tool">Tool calls</option>
+                <option value="approval">Approvals</option>
+                <option value="security">Security</option>
+                <option value="error">Errors</option>
+                <option value="conversation">Conversations</option>
+                <option value="memory">Memory</option>
+                <option value="settings">Settings</option>
+              </select>
+              <button class="micro-button" type="button" data-action="refresh-audit">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+              </button>
+              <button class="secondary-button" type="button" data-action="export-audit" style="font-size:12px;padding:6px 12px;margin-left:auto">Export JSON</button>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:0 16px">
+              <div id="audit-list" data-sam-role="audit-list" style="display:flex;flex-direction:column"></div>
+              <p id="audit-empty" data-sam-role="audit-empty" style="color:var(--muted);font-size:13px;padding:20px 0;text-align:center">No audit entries yet. Actions will be logged here with cryptographic hash-chain verification.</p>
+            </div>
+          </div>
+
+          <!-- PANEL: FILES -->
+          <div class="content-panel" id="panel-files" role="region" aria-label="Files">
+            <div class="workspace-layout">
+              <div class="file-tree">
+                <div style="padding:8px 8px 6px;border-bottom:1px solid var(--line);font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.07em">Workspace</div>
+                <div id="file-tree-content" style="padding-top:6px">
+                  <div class="p-empty" style="padding:20px 10px"><p>Loading workspace&#8230;</p></div>
+                </div>
+              </div>
+              <div class="file-preview">
+                <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" style="width:36px;height:36px;opacity:.2;margin-bottom:10px"><path d="M12 6h16l8 8v28H12V6z"/><path d="M28 6v8h8"/></svg>
+                <p>Select a file to preview</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- PANEL: PERMISSIONS -->
+          <div class="content-panel" id="panel-permissions" role="region" aria-label="Permissions">
+            <div style="padding:12px 16px;border-bottom:1px solid var(--line);flex-shrink:0">
+              <strong>Permission Center</strong>
+              <p style="margin:4px 0 0;font-size:12.5px;color:var(--muted)">Current mode: <strong id="perm-mode-display">Guarded</strong> &#x2014; approve commands and high-risk actions.</p>
+            </div>
+            <div style="flex:1;overflow-y:auto;padding:12px 0">
+              <div class="perm-section-title">Low Risk &#x2014; Automatically Allowed</div>
+              <div class="perm-row"><div class="perm-icon low"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M4 2h8a1 1 0 011 1v10H3V3a1 1 0 011-1z"/></svg></div><div class="perm-info"><strong>Read files in workspace</strong><small>List and read files within the configured workspace directory</small></div><span style="color:var(--mint);font-size:11px;font-weight:700">ALLOWED</span></div>
+              <div class="perm-row"><div class="perm-icon low"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M1.5 12L5 7l3 3 3-5 3 2"/></svg></div><div class="perm-info"><strong>Read MT5 market data</strong><small>Fetch quotes, OHLC, symbol info &#x2014; read-only, no orders</small></div><span style="color:var(--mint);font-size:11px;font-weight:700">ALLOWED</span></div>
+              <div class="perm-section-title" style="margin-top:12px">Medium Risk &#x2014; Require Approval (Guarded Mode)</div>
+              <div class="perm-row"><div class="perm-icon med"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M3 13V4a1 1 0 011-1h4l1.5 2H12a1 1 0 011 1v7"/></svg></div><div class="perm-info"><strong>Modify files in workspace</strong><small>Write, create, or overwrite files within the workspace</small></div><span style="color:var(--amber);font-size:11px;font-weight:700">APPROVAL</span></div>
+              <div class="perm-row"><div class="perm-icon med"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2 2-2 2"/></svg></div><div class="perm-info"><strong>Run shell commands</strong><small>Execute PowerShell or CMD in a safe working directory</small></div><span style="color:var(--amber);font-size:11px;font-weight:700">APPROVAL</span></div>
+              <div class="perm-section-title" style="margin-top:12px">High Risk &#x2014; Always Require Explicit Approval</div>
+              <div class="perm-row"><div class="perm-icon high"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M3 13h10M8 2v9"/></svg></div><div class="perm-info"><strong>Delete files</strong><small>Permanently remove files or directories &#x2014; irreversible</small></div><span style="color:var(--danger);font-size:11px;font-weight:700">EXPLICIT ONLY</span></div>
+              <div class="perm-row"><div class="perm-icon high"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M1.5 12L5 7l3 3 3-5 3 2"/></svg></div><div class="perm-info"><strong>Place financial orders (MT5)</strong><small>Live buy/sell execution is not implemented; the MT5 adapter is read-only</small></div><span style="color:var(--danger);font-size:11px;font-weight:700">NOT IMPLEMENTED</span></div>
+              <div class="perm-row"><div class="perm-icon high"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="8" cy="8" r="6.5"/><path d="M8 4v4M8 11v1"/></svg></div><div class="perm-info"><strong>Send external messages / webhooks</strong><small>Outbound HTTP, email, or external API calls with credentials</small></div><span style="color:var(--danger);font-size:11px;font-weight:700">EXPLICIT ONLY</span></div>
+            </div>
+          </div>
+
+        </div><!-- .main-column-inner -->
+      </main>
+
+      <!-- ======== CONTEXT PANE ======== -->
+      <aside class="context-pane" id="context-pane" aria-label="Context panel">
+        <div class="context-tabs" role="tablist" aria-label="Context panels">
+          <button role="tab" data-panel="plan" aria-selected="true" tabindex="0">Plan</button>
+          <button role="tab" data-panel="tools-ctx" aria-selected="false" tabindex="-1">Tools</button>
+          <button role="tab" data-panel="approvals-ctx" aria-selected="false" tabindex="-1">Approvals</button>
+          <button role="tab" data-panel="memory-ctx" aria-selected="false" tabindex="-1">Memory</button>
+          <button role="tab" data-panel="audit-ctx" aria-selected="false" tabindex="-1">Audit</button>
+        </div>
+        <div class="context-panel" id="panel-plan" role="tabpanel">
+          <div class="plan-status">
+            <div>
+              <div class="plan-ring-wrap" aria-hidden="true">
+                <svg class="plan-ring" viewBox="0 0 44 44" id="plan-progress-ring-ctx" data-sam-role="plan-progress-indicator" data-progress-kind="ring">
+                  <circle class="plan-ring-track" cx="22" cy="22" r="18"/>
+                  <circle class="plan-ring-fill" cx="22" cy="22" r="18"/>
+                </svg>
+                <span class="plan-ring-label" id="plan-progress-label-ctx" data-sam-role="plan-progress-label">0%</span>
+              </div>
+            </div>
+            <div>
+              <strong id="plan-status-title-ctx" data-sam-role="plan-status-title">No active plan</strong>
+              <span id="plan-status-copy-ctx" data-sam-role="plan-status-copy">A task plan will appear here when SAM starts multi-step work.</span>
+            </div>
+          </div>
+          <button class="context-action" type="button" data-action="refresh-plan">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+            Refresh plan
+          </button>
+          <ol id="plan-list-ctx" data-sam-role="plan-list" class="plan-list"></ol>
+          <div class="tool-activity" id="tool-activity-ctx" data-sam-role="tool-activity" hidden>
+            <strong>Live tool activity</strong>
+            <div id="tool-activity-items-ctx" data-sam-role="tool-activity-items"></div>
+          </div>
+        </div>
+        <div class="context-panel" id="panel-tools-ctx" role="tabpanel" hidden>
+          <div style="padding:8px 0"><p style="font-size:12px;color:var(--muted);margin:0 0 8px">Active tools this session:</p><div id="ctx-tool-list" style="display:flex;flex-direction:column;gap:6px"><div class="p-empty"><p>Tool usage will appear here during a task.</p></div></div></div>
+        </div>
+        <div class="context-panel" id="panel-approvals-ctx" role="tabpanel" hidden>
+          <button class="context-action" type="button" data-action="refresh-approvals">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+            Refresh
+          </button>
+          <div id="approval-list-ctx" data-sam-role="approval-list" aria-label="Approval requests"></div>
+          <p id="approvals-empty-ctx" data-sam-role="approvals-empty">No pending approvals.</p>
+        </div>
+        <div class="context-panel" id="panel-memory-ctx" role="tabpanel" hidden>
+          <div style="padding:8px 0 10px"><label class="sr-only" for="memory-search-ctx">Search memories</label><input class="text-field" id="memory-search-ctx" data-sam-role="memory-search" type="search" placeholder="Search memories&#8230;" autocomplete="off" style="width:100%;font-size:13px;padding:8px 10px" /></div>
+          <button class="context-action" type="button" data-action="refresh-memory">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+            Refresh
+          </button>
+          <div id="memory-list-ctx" data-sam-role="memory-list" style="display:flex;flex-direction:column;gap:8px"></div>
+          <p id="memory-empty-ctx" data-sam-role="memory-empty">No stored memories.</p>
+        </div>
+        <div class="context-panel" id="panel-audit-ctx" role="tabpanel" hidden>
+          <div style="display:flex;gap:8px;padding:8px 0 10px;align-items:center">
+            <label class="sr-only" for="audit-filter-ctx">Filter audit events</label>
+            <select class="text-field" id="audit-filter-ctx" data-sam-role="audit-filter" style="flex:1;font-size:12px;padding:6px 8px">
+              <option value="all">All events</option>
+              <option value="tool">Tool calls</option>
+              <option value="approval">Approvals</option>
+              <option value="security">Security</option>
+              <option value="error">Errors</option>
+            </select>
+            <button class="micro-button" type="button" data-action="refresh-audit">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M13.5 4.5A6 6 0 012 8.5"/><path d="M2.5 11.5A6 6 0 0014 7.5"/><path d="M12 2l2 2.5L11.5 7"/><path d="M4 14l-2-2.5L4.5 9"/></svg>
+            </button>
+          </div>
+          <div id="audit-list-ctx" data-sam-role="audit-list" style="display:flex;flex-direction:column"></div>
+          <p id="audit-empty-ctx" data-sam-role="audit-empty">No audit entries yet.</p>
+          <button class="context-action" type="button" data-action="export-audit">Export audit JSON</button>
+        </div>
+      </aside>
+    </div><!-- .app -->
+
+    <!-- ======== MODALS ======== -->
+    <dialog class="modal" id="approval-modal" aria-labelledby="approval-modal-title">
+      <div class="modal-shell">
+        <div class="modal-heading">
+          <div class="modal-symbol" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" style="width:24px;height:24px"><path d="M12 2l3 7h7l-6 4.5 2.5 7.5L12 17l-6.5 4 2.5-7.5L2 9h7L12 2z"/></svg>
+          </div>
+          <div><span class="modal-kicker">ACTION APPROVAL REQUIRED</span><h2 id="approval-modal-title">Review this action</h2></div>
+          <form method="dialog"><button class="icon-button" aria-label="Close"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 4L4 12M4 4l8 8"/></svg></button></form>
+        </div>
+        <dl class="approval-details">
+          <div><dt>Description</dt><dd id="approval-description">&#8212;</dd></div>
+          <div><dt>Risk level</dt><dd id="approval-risk">&#8212;</dd></div>
+          <div id="approval-command-wrap"><dt>Command / Target</dt><dd><code id="approval-command" class="approval-command"></code></dd><button class="text-button" type="button" data-action="copy-approval-command">Copy</button></div>
+          <div><dt>Scope</dt><dd id="approval-scope">This action only</dd></div>
+        </dl>
+        <div class="approval-warning" role="alert">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:15px;height:15px;flex-shrink:0"><path d="M8 1.5l6 11H2L8 1.5z"/><path d="M8 6v3.5M8 11.5v.5"/></svg>
+          <p id="approval-warning-copy">Only approve if you understand and expect this action.</p>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary-button" type="button" data-action="deny-approval">Deny</button>
+          <button class="primary-button" type="button" data-action="approve-action">Approve this action</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog class="modal settings-modal" id="settings-modal" aria-labelledby="settings-modal-title">
+      <form method="dialog" class="modal-shell settings-shell" id="settings-form">
+        <div class="modal-heading">
+          <div class="modal-symbol" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" style="width:24px;height:24px"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          </div>
+          <div><span class="modal-kicker">ڕێکخستن</span><h2 id="settings-modal-title">ڕێکخستنەکانی ئەجێنت</h2></div>
+          <button class="icon-button" type="button" data-action="close-settings" aria-label="Close settings"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 4L4 12M4 4l8 8"/></svg></button>
+        </div>
+        <div class="settings-body">
+          <nav class="settings-nav" role="tablist">
+            <button class="settings-tab" type="button" role="tab" data-settings-panel="general" aria-selected="true" tabindex="0">گشتی</button>
+            <button class="settings-tab" type="button" role="tab" data-settings-panel="models" aria-selected="false" tabindex="-1">مۆدێلەکان</button>
+            <button class="settings-tab" type="button" role="tab" data-settings-panel="voice" aria-selected="false" tabindex="-1">دەنگ</button>
+            <button class="settings-tab" type="button" role="tab" data-settings-panel="safety" aria-selected="false" tabindex="-1">پاراستن</button>
+            <button class="settings-tab" type="button" role="tab" data-settings-panel="privacy" aria-selected="false" tabindex="-1">تایبەتمەندی</button>
+          </nav>
+          <div class="settings-content">
+            <section class="settings-panel" data-settings-section="general">
+              <div class="settings-section-heading"><h3>General</h3><p>Basic agent identity and interface preferences.</p></div>
+              <label class="field-label" for="settings-agent-name">Agent name</label>
+              <input class="text-field" id="settings-agent-name" name="agent_name" value="SAM" autocomplete="off" />
+              <label class="field-label" for="settings-language">زمانی ڕووکار</label>
+              <select class="text-field" id="settings-language" name="language"><option value="ckb-IQ" selected>کوردی سۆرانی</option><option value="en">English</option><option value="auto">Auto-detect</option></select>
+              <label class="switch-row"><span><strong>Show task plans</strong><small>Display multi-step plan progress in the context panel</small></span><input type="checkbox" name="show_plans" checked /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Desktop notifications</strong><small>System notifications for approvals and task completion</small></span><input type="checkbox" name="notifications" /><i aria-hidden="true"></i></label>
+            </section>
+            <section class="settings-panel" data-settings-section="models" hidden>
+              <div class="settings-section-heading"><h3>Models</h3><p>Use Ollama locally or connect an optional cloud provider.</p></div>
+              <label class="field-label" for="settings-provider">Provider</label>
+              <select class="text-field" id="settings-provider" name="provider">
+                <option value="auto">Auto router</option>
+                <option value="ollama">Ollama (local)</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="litellm">LiteLLM</option>
+                <option value="openai">OpenAI</option>
+              </select>
+              <label class="field-label" for="settings-model-mode">Routing mode</label>
+              <select class="text-field" id="settings-model-mode" name="model_mode"><option value="AUTO">Auto fallback</option><option value="LOCAL_ONLY">Local only</option><option value="CLOUD_ONLY">Configured cloud only</option><option value="MANUAL">Manual provider</option></select>
+              <label class="field-label" for="settings-model">Default model</label>
+              <select class="text-field" id="settings-model" name="model"><option value="">Loading models&#8230;</option></select>
+              <label class="field-label" for="settings-temperature">Creativity <output id="temperature-output">0.2</output></label>
+              <input class="range-field" id="settings-temperature" name="temperature" type="range" min="0" max="1" step="0.1" value="0.2" />
+              <label class="field-label" for="settings-daily-budget">Daily cloud budget (USD)</label>
+              <input class="text-field" id="settings-daily-budget" name="daily_budget_usd" type="number" min="0" max="100000" step="0.1" value="2" />
+              <label class="field-label" for="settings-monthly-budget">Monthly cloud budget (USD)</label>
+              <input class="text-field" id="settings-monthly-budget" name="monthly_budget_usd" type="number" min="0" max="1000000" step="1" value="30" />
+              <div class="settings-callout"><span aria-hidden="true">&#x2139;</span><p>Cloud provider credentials are stored by the backend and are never returned to this interface.</p></div>
+            </section>
+            <section class="settings-panel" data-settings-section="voice" hidden>
+              <div class="settings-section-heading"><h3>Voice</h3><p>Use supported browser speech features for hands-free conversations.</p></div>
+              <label class="switch-row"><span><strong>Voice input</strong><small>Show the microphone control in the composer</small></span><input type="checkbox" name="voice_input" checked /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Read replies aloud</strong><small>Speak completed SAM messages</small></span><input type="checkbox" id="settings-voice-output" name="voice_output" /><i aria-hidden="true"></i></label>
+              <label class="field-label" for="settings-voice-mode">Listening mode</label>
+              <select class="text-field" id="settings-voice-mode" name="voice_mode"><option value="PUSH_TO_TALK">Push to talk</option><option value="CONVERSATION">Conversation</option><option value="ALWAYS_LISTENING">Always listening</option><option value="WAKE_WORD">Wake word</option></select>
+              <label class="field-label" for="settings-voice-language">Recognition language</label>
+              <input class="text-field" id="settings-voice-language" name="voice_language" value="ckb-IQ" autocomplete="off" />
+              <label class="field-label" for="settings-wake-word">Wake word</label>
+              <input class="text-field" id="settings-wake-word" name="voice_wake_word" value="SAM" autocomplete="off" />
+              <label class="field-label" for="settings-voice">System voice</label>
+              <select class="text-field" id="settings-voice" name="voice"><option value="">System default</option></select>
+              <label class="field-label" for="settings-speech-rate">Speech rate <output id="speech-rate-output">1.0x</output></label>
+              <input class="range-field" id="settings-speech-rate" name="speech_rate" type="range" min="0.6" max="1.5" step="0.1" value="1" />
+              <p class="compatibility-note" id="voice-compatibility-note"></p>
+            </section>
+            <section class="settings-panel" data-settings-section="safety" hidden>
+              <div class="settings-section-heading"><h3>Safety</h3><p>Keep broad capability behind clear, inspectable boundaries.</p></div>
+              <label class="field-label" for="settings-permission-mode">Permission mode</label>
+              <select class="text-field" id="settings-permission-mode" name="permission_mode">
+                <option value="guarded">Guarded &#x2014; approve commands and high-risk actions</option>
+                <option value="strict">Strict &#x2014; approve changes and navigation</option>
+                <option value="trusted">Trusted workspace &#x2014; allow classified-safe commands</option>
+              </select>
+              <label class="switch-row"><span><strong>Computer Control</strong><small>Allow audited window focus, app launch, and guarded desktop actions</small></span><input type="checkbox" name="computer_control_enabled" /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Screen Access</strong><small>Allow screenshots when explicitly requested</small></span><input type="checkbox" name="screen_access_enabled" /><i aria-hidden="true"></i></label>
+              <div class="safety-policy-list">
+                <div><span class="policy-icon" aria-hidden="true">&#x2713;</span><span><strong>Workspace edits</strong><small>Allowed within the selected workspace</small></span></div>
+                <div><span class="policy-icon warn" aria-hidden="true">!</span><span><strong>Destructive &amp; system actions</strong><small>Always require explicit approval</small></span></div>
+                <div><span class="policy-icon warn" aria-hidden="true">!</span><span><strong>Credentials &amp; external messages</strong><small>Always require explicit approval</small></span></div>
+                <div><span class="policy-icon warn" aria-hidden="true">!</span><span><strong>Financial order execution</strong><small>Not implemented &#x2014; this build is market-data read-only</small></span></div>
+              </div>
+            </section>
+            <section class="settings-panel" data-settings-section="privacy" hidden>
+              <div class="settings-section-heading"><h3>Privacy</h3><p>Control persistent memory and diagnostic data.</p></div>
+              <label class="switch-row"><span><strong>Persistent memory</strong><small>Remember preferences and user-approved facts</small></span><input type="checkbox" name="memory_enabled" checked /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Audit logging</strong><small>Keep a local record of commands and decisions</small></span><input type="checkbox" name="audit_enabled" checked /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Cloud fallback</strong><small>Allow configured cloud models when local models are unavailable</small></span><input type="checkbox" name="cloud_fallback" /><i aria-hidden="true"></i></label>
+              <div class="settings-callout"><span aria-hidden="true">&#x2139;</span><p>Audit logs and memories are stored locally unless you explicitly configure a remote service.</p></div>
+            </section>
+          </div>
+        </div>
+        <div class="modal-actions settings-actions">
+          <span id="settings-save-status" role="status"></span>
+          <button class="secondary-button" type="button" data-action="close-settings">Cancel</button>
+          <button class="primary-button" type="submit" value="default">Save changes</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal workspace-modal" id="workspace-modal" aria-labelledby="workspace-modal-title">
+      <form method="dialog" class="modal-shell compact-shell" id="workspace-form">
+        <div class="modal-heading">
+          <div class="modal-symbol" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" style="width:22px;height:22px"><path d="M3 19V9a1 1 0 011-1h5l2-3h8a1 1 0 011 1v13a1 1 0 01-1 1H4a1 1 0 01-1-1z"/></svg>
+          </div>
+          <div><span class="modal-kicker">ACTIVE SCOPE</span><h2 id="workspace-modal-title">Workspace</h2></div>
+          <button class="icon-button" value="cancel" aria-label="Close workspace dialog"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M12 4L4 12M4 4l8 8"/></svg></button>
+        </div>
+        <div class="workspace-detail">
+          <label class="field-label" for="workspace-path-input">Folder path</label>
+          <input class="text-field mono-field" id="workspace-path-input" name="path" autocomplete="off" readonly />
+          <p>SAM may read and edit files inside this folder. Actions outside it require additional approval.</p>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary-button" value="cancel">Cancel</button>
+          <button class="primary-button" type="submit" value="default">Done</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- Templates (required by existing app.js) -->
+    <template id="message-template">
+      <article class="message">
+        <div class="message-avatar" aria-hidden="true"></div>
+        <div class="message-body">
+          <div class="message-meta"><strong></strong><time></time><span class="message-state"></span></div>
+          <div class="message-content"></div>
+          <div class="message-tools" hidden></div>
+          <div class="message-actions">
+            <button type="button" data-message-action="copy">Copy</button>
+            <button type="button" data-message-action="speak">Read aloud</button>
+          </div>
+        </div>
+      </article>
+    </template>
+    <template id="session-template">
+      <button class="session-item" type="button" role="listitem">
+        <span class="session-glyph" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:12px;height:12px"><path d="M2 4h12M2 8h8M2 12h5"/></svg>
+        </span>
+        <span class="session-copy"><strong></strong><small></small></span>
+        <span class="session-menu" aria-hidden="true">&#x22EF;</span>
+      </button>
+    </template>
+    <template id="approval-template">
+      <button class="approval-card" type="button">
+        <span class="approval-card-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" style="width:14px;height:14px"><path d="M8 2l1.5 3.5h3.5l-2.8 2 1.1 3.5L8 9l-3.3 2 1.1-3.5L3 5.5h3.5L8 2z"/></svg>
+        </span>
+        <span class="approval-card-copy"><span class="approval-type"></span><strong></strong><small></small></span>
+        <span class="approval-arrow" aria-hidden="true">&#x203A;</span>
+      </button>
+    </template>
+    <template id="audit-template">
+      <article class="audit-event">
+        <span class="audit-marker" aria-hidden="true"></span>
+        <div><div class="audit-meta"><strong></strong><time></time></div><p></p><code hidden></code></div>
+      </article>
+    </template>
+
+    <script src="./i18n.js"></script>
+    <script src="./app.js" defer></script>
+    <script src="./panels.js" defer></script>
+  </body>
+</html>

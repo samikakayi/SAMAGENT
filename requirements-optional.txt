@@ -1,0 +1,12 @@
+# Optional components. Install only the groups you intend to configure.
+# LiteLLM gateway
+litellm[proxy]
+
+# Semantic Windows UI Automation
+pywinauto
+
+# Fully local voice fallback (large download; browser voice works without these)
+faster-whisper
+silero-vad
+onnxruntime
+piper-tts

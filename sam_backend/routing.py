@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import re
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from .config import Settings
+from .db import Database
+from .models import AdapterRegistry, AssistantTurn, ModelError
+
+
+@dataclass(slots=True)
+class TaskProfile:
+    complexity: str
+    needs_tools: bool
+    needs_vision: bool
+    privacy_sensitive: bool
+    realtime: bool
+    deterministic_candidate: bool
+
+
+@dataclass(slots=True)
+class RouteChoice:
+    provider: str
+    model: str
+    reason: str
+
+
+class ModelRouter:
+    def __init__(self, settings: Settings, adapters: AdapterRegistry, database: Database) -> None:
+        self.settings = settings
+        self.adapters = adapters
+        self.database = database
+        self._health_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self.failures: dict[str, int] = {}
+
+    @staticmethod
+    def profile(message: str) -> TaskProfile:
+        lowered = message.lower()
+        needs_vision = any(token in lowered for token in ("screenshot", "screen", "chart image", "سەیری شاشە", "وێنە", "چارتەکە"))
+        realtime = any(token in lowered for token in ("realtime", "live voice", "لایڤ", "دەنگ"))
+        privacy = any(token in lowered for token in ("credential", "secret", "password", "api key", ".env", "نهێنی", "پاسوۆرد"))
+        complex_markers = (
+            "compare", "analyze", "analysis", "strategy", "theory", "wyckoff", "ict", "smc", "backtest",
+            "بەراورد", "شیکاری", "تیۆری", "ستراتیژی",
+        )
+        complex_count = sum(token in lowered for token in complex_markers)
+        complexity = "strong" if complex_count >= 2 or len(message) > 1200 else "balanced" if complex_count else "fast"
+        deterministic = bool(re.search(r"(?i)(open|focus|switch|set|بکەرەوە|بچۆ)\s+.{0,30}(tradingview|timeframe|[0-9]+m|[0-9]+h)", message))
+        tool_markers = (
+            "file", "folder", "directory", "workspace", "project", "terminal", "powershell", "command", "shell",
+            "python", "script", "code", "browser", "website", "url", "launch", "application", "search", "find",
+            "read ", "write ", "edit", "change", "create", "delete", "remove", "copy", "move", "rename", "list",
+            "inspect", "run ", "execute", "remember", "memory", "plan", "desktop", "screen", "tradingview", "download",
+            "install", "do it", "فایل", "فۆڵدەر", "پرۆژە", "تێرمیناڵ", "پاوەرشێڵ", "پایتۆن", "کۆد", "براوزەر",
+            "وێبسایت", "بکەرەوە", "بدۆزەوە", "بخوێنەوە", "بنووسە", "دەستکاری", "دروست بکە", "بسڕەوە",
+            "بگوازەوە", "لیست", "پلان", "شاشە", "ئەپ", "داگرە", "دابمەزرێنە", "بیکە",
+        )
+        needs_tools = needs_vision or deterministic or any(token in lowered for token in tool_markers)
+        return TaskProfile(complexity, needs_tools, needs_vision, privacy, realtime, deterministic)
+
+    async def _models(self, provider: str) -> list[dict[str, Any]]:
+        cached = self._health_cache.get(provider)
+        cache_ttl = 30 if cached and cached[1] else 3
+        if cached and time.monotonic() - cached[0] < cache_ttl:
+            return cached[1]
+        try:
+            models = await self.adapters.get(provider).list_models()
+        except Exception:
+            models = []
+        # A transient timeout must not make a known local model disappear for
+        # 30 seconds while its single CPU inference slot is busy.
+        if not models and cached and cached[1]:
+            return cached[1]
+        self._health_cache[provider] = (time.monotonic(), models)
+        return models
+
+    def budget_state(self) -> dict[str, Any]:
+        summary = self.database.model_cost_summary()
+        daily = float(summary["today"]["cost_usd"])
+        monthly = float(summary["month"]["cost_usd"])
+        daily_ratio = daily / self.settings.daily_budget_usd if self.settings.daily_budget_usd > 0 else 0.0
+        monthly_ratio = monthly / self.settings.monthly_budget_usd if self.settings.monthly_budget_usd > 0 else 0.0
+        ratio = max(daily_ratio, monthly_ratio)
+        if ratio >= self.settings.budget_hard_ratio:
+            mode = "LOCAL_ONLY"
+        elif ratio >= self.settings.budget_warning_ratio:
+            mode = "LOCAL_FIRST"
+        else:
+            mode = "NORMAL"
+        return {
+            "mode": mode,
+            "daily_ratio": daily_ratio,
+            "monthly_ratio": monthly_ratio,
+            "daily_budget_usd": self.settings.daily_budget_usd,
+            "monthly_budget_usd": self.settings.monthly_budget_usd,
+            **summary,
+        }
+
+    def _openrouter_slug(self, candidate: str | None) -> str:
+        value = str(candidate or "").strip()
+        # OpenRouter ids look like "anthropic/claude-sonnet-4.5". Local Ollama
+        # tags like "qwen3.5:4b" must never be forwarded there.
+        if "/" in value and not value.lower().startswith("qwen"):
+            return value
+        return ""
+
+    def _model_for(self, provider: str, profile: TaskProfile, explicit_model: str | None = None) -> str:
+        if provider == "openrouter":
+            saved = self._openrouter_slug(explicit_model) or self._openrouter_slug(self.settings.default_model)
+            if profile.needs_vision:
+                return saved or self.settings.openrouter_vision_model
+            if profile.complexity == "strong":
+                return saved or self.settings.openrouter_strong_model
+            return saved or self.settings.openrouter_fast_model
+        if explicit_model:
+            return explicit_model
+        if provider == "ollama":
+            return self.settings.default_model
+        if provider == "openai":
+            return self.settings.openai_model
+        if provider == "litellm":
+            if profile.needs_vision:
+                return self.settings.litellm_vision_model
+            return self.settings.litellm_strong_model if profile.complexity == "strong" else self.settings.litellm_fast_model
+        raise ModelError(f"Unsupported route provider: {provider}")
+
+    async def route(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> tuple[TaskProfile, list[RouteChoice]]:
+        profile = self.profile(message)
+        mode = self.settings.model_mode
+        explicit = provider and provider.lower() not in {"auto", ""}
+        if explicit:
+            selected = provider.lower()
+            return profile, [RouteChoice(selected, self._model_for(selected, profile, model), "Explicit provider selection")]
+        budget = self.budget_state()
+        if budget["mode"] == "LOCAL_ONLY":
+            mode = "LOCAL_ONLY"
+        elif budget["mode"] == "LOCAL_FIRST" and mode == "AUTO":
+            mode = "LOCAL_FIRST"
+
+        ollama_available = bool(await self._models("ollama"))
+        litellm_available = bool(await self._models("litellm"))
+        openrouter_configured = bool(self.settings.openrouter_api_key)
+        openai_configured = bool(self.settings.openai_api_key)
+        local = [RouteChoice("ollama", self._model_for("ollama", profile), "Local privacy/cost route")] if ollama_available else []
+        cloud: list[RouteChoice] = []
+        if litellm_available:
+            cloud.append(RouteChoice("litellm", self._model_for("litellm", profile), "Normalized LiteLLM gateway"))
+        if openrouter_configured:
+            cloud.append(RouteChoice("openrouter", self._model_for("openrouter", profile), "OpenRouter cloud fallback"))
+        if openai_configured:
+            cloud.append(RouteChoice("openai", self._model_for("openai", profile), "Direct OpenAI fallback"))
+
+        if mode == "LOCAL_ONLY":
+            choices = local
+        elif mode == "CLOUD_ONLY":
+            choices = cloud
+        elif mode == "MANUAL":
+            selected = self.settings.default_provider
+            choices = [RouteChoice(selected, self._model_for(selected, profile, model), "Manual configured route")]
+        elif mode == "LOCAL_FIRST" or profile.privacy_sensitive or profile.complexity == "fast":
+            choices = local + cloud
+        else:
+            choices = cloud + local if profile.complexity == "strong" or profile.needs_vision else local + cloud
+        # Stable de-duplication, then penalize repeatedly failing providers.
+        deduplicated: dict[tuple[str, str], RouteChoice] = {}
+        for choice in choices:
+            deduplicated.setdefault((choice.provider, choice.model), choice)
+        ordered = list(deduplicated.values())
+        ordered.sort(key=lambda choice: self.failures.get(choice.provider, 0))
+        if not ordered:
+            raise ModelError(
+                "No AI model route is available. Start Ollama with a downloaded model, configure LiteLLM, or set OPENROUTER_API_KEY."
+            )
+        return profile, ordered
+
+    async def complete(
+        self,
+        *,
+        message: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        provider: str | None,
+        model: str | None,
+        conversation_id: str | None,
+        task_id: str | None = None,
+    ) -> tuple[AssistantTurn, RouteChoice, list[dict[str, str]]]:
+        _, choices = await self.route(message, provider=provider, model=model)
+        failures: list[dict[str, str]] = []
+        for choice in choices:
+            try:
+                turn = await self.adapters.get(choice.provider).complete(messages, tools, choice.model)
+                self.failures[choice.provider] = max(0, self.failures.get(choice.provider, 0) - 1)
+                raw = turn.raw or {}
+                usage = raw.get("usage") or {}
+                input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+                output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+                cost = usage.get("cost", usage.get("total_cost"))
+                try:
+                    cost_value = float(cost) if cost is not None else None
+                except (TypeError, ValueError):
+                    cost_value = None
+                self.database.add_model_usage(
+                    provider=choice.provider,
+                    model=str(raw.get("model") or choice.model),
+                    route_mode=self.settings.model_mode,
+                    input_tokens=int(input_tokens) if input_tokens is not None else None,
+                    output_tokens=int(output_tokens) if output_tokens is not None else None,
+                    cost_usd=cost_value,
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    metadata={"reason": choice.reason, "fallbacks_before_success": failures, "usage_cost_reported": cost is not None},
+                )
+                turn.raw = {**raw, "route": {"provider": choice.provider, "model": choice.model, "reason": choice.reason}, "fallbacks": failures}
+                return turn, choice, failures
+            except ModelError as exc:
+                self.failures[choice.provider] = self.failures.get(choice.provider, 0) + 1
+                failures.append({"provider": choice.provider, "model": choice.model, "error": str(exc)})
+        raise ModelError("All model routes failed: " + " | ".join(f"{item['provider']}: {item['error']}" for item in failures))
