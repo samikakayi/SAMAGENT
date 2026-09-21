@@ -191,6 +191,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         agent.adapters = refreshed
         router._health_cache.clear()
         router.failures.clear()
+        orchestrator.health.invalidate()
 
     monitor_stop = asyncio.Event()
 

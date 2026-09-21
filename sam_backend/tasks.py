@@ -98,7 +98,7 @@ class TaskStep:
 class TaskEvent:
     """A timeline entry. This is what the activity UI renders."""
 
-    kind: str  # state | thought | action | tool | result | error | fix | success | approval
+    kind: str  # state | thought | action | tool | result | error | fix | fallback | success | approval
     message: str
     at: float = field(default_factory=time.time)
     detail: dict[str, Any] = field(default_factory=dict)

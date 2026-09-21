@@ -36,6 +36,7 @@
     success: { icon: "✓", tone: "ok", label: "Done" },
     error: { icon: "✕", tone: "bad", label: "Error" },
     fix: { icon: "↻", tone: "warn", label: "Self-correction" },
+    fallback: { icon: "⇄", tone: "warn", label: "Model fallback" },
     approval: { icon: "⚠", tone: "warn", label: "Approval needed" },
   };
 
@@ -186,6 +187,27 @@
       .agent-history button:hover { background: var(--panel-hover); }
       .agent-history .badge { font-size: 10px; color: var(--muted); flex: none; }
       .agent-empty { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.5; }
+      .agent-model {
+        display: flex; align-items: flex-start; gap: 9px; padding: 9px 11px;
+        background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius-md);
+        font-size: 12px; line-height: 1.5; color: var(--text-soft);
+      }
+      .agent-model .icon { flex: none; font-size: 13px; line-height: 1.4; }
+      .agent-model .body { flex: 1; min-width: 0; }
+      .agent-model .body strong { color: var(--text); font-family: ui-monospace, monospace; font-size: 11.5px; overflow-wrap: anywhere; }
+      .agent-model .why { display: block; margin-top: 2px; }
+      .agent-model .tag { font-size: 10px; color: var(--muted); margin-left: 6px; }
+      .agent-model.tone-ok { border-color: rgba(78, 205, 150, .35); }
+      .agent-model.tone-ok .icon { color: var(--mint); }
+      .agent-model.tone-warn { border-color: rgba(244, 184, 90, .35); }
+      .agent-model.tone-warn .icon { color: var(--amber); }
+      .agent-model.tone-bad { border-color: rgba(240, 96, 96, .35); }
+      .agent-model.tone-bad .icon, .agent-model.tone-bad .why { color: var(--danger); }
+      .agent-model button {
+        flex: none; padding: 3px 8px; border-radius: var(--radius-sm); border: 1px solid var(--line);
+        background: transparent; color: var(--muted); font: inherit; font-size: 10.5px; cursor: pointer;
+      }
+      .agent-model button:hover { background: var(--panel-hover); color: var(--text); }
       .agent-summary {
         font-size: 12px; line-height: 1.55; color: var(--text-soft); white-space: pre-wrap;
         padding: 10px 11px; background: var(--panel-raised); border: 1px solid var(--line);
@@ -223,6 +245,11 @@
             <button class="agent-run" id="agent-run" type="button">Run autonomously</button>
             <button class="agent-stop" id="agent-stop" type="button" hidden>Stop</button>
           </div>
+        </div>
+        <div class="agent-model tone-muted" id="agent-model">
+          <span class="icon">○</span>
+          <span class="body">Checking which model will run…</span>
+          <button type="button" id="agent-model-refresh" title="Re-check the provider (costs no tokens)">Re-check</button>
         </div>
         <div class="agent-state">
           <span class="agent-dot" id="agent-dot"></span>
@@ -281,6 +308,8 @@
       });
     });
 
+    tab.addEventListener("click", () => loadModelResolution(false));
+    document.getElementById("agent-model-refresh").addEventListener("click", () => loadModelResolution(true));
     document.getElementById("agent-run").addEventListener("click", startTask);
     document.getElementById("agent-stop").addEventListener("click", stopTask);
     document.getElementById("agent-view-diff").addEventListener("click", toggleDiff);
@@ -302,6 +331,61 @@
       throw new Error(`${response.status} ${detail.slice(0, 300)}`);
     }
     return response.json();
+  }
+
+  // -- which model will actually run ----------------------------------------
+  async function loadModelResolution(refresh) {
+    const node = document.getElementById("agent-model");
+    if (!node) return;
+    if (refresh) node.querySelector(".body").textContent = "Re-checking the provider…";
+    try {
+      const payload = await api(`/api/providers/resolution${refresh ? "?refresh=true" : ""}`);
+      renderModelResolution(payload.resolution);
+    } catch (error) {
+      renderModelResolution(null, error.message);
+    }
+  }
+
+  const describeModel = (capability) => {
+    if (!capability) return "";
+    const tags = [capability.cost_class !== "unknown" ? capability.cost_class : "", capability.supports_tools ? "tools" : ""]
+      .filter(Boolean).join(" · ");
+    return `<strong>${escapeHtml(capability.model)}</strong>${tags ? `<span class="tag">${escapeHtml(tags)}</span>` : ""}`;
+  };
+
+  function renderModelResolution(resolution, failure) {
+    const node = document.getElementById("agent-model");
+    if (!node) return;
+    let tone = "muted";
+    let icon = "○";
+    let body;
+    if (!resolution) {
+      tone = "bad"; icon = "✕";
+      body = `Could not check the provider.<span class="why">${escapeHtml(failure || "")}</span>`;
+    } else if (resolution.blocked) {
+      // No run will start until the operator changes something; say exactly what.
+      tone = "bad"; icon = "✕";
+      body = `${describeModel(resolution.primary)} is unavailable, so runs are blocked.` +
+        `<span class="why">${escapeHtml(resolution.primary.reason || resolution.primary.availability)}` +
+        `${resolution.fallback_enabled ? "" : " Fallback is disabled."}` +
+        `${resolution.fallback ? ` Configured fallback: ${escapeHtml(resolution.fallback.model)}` +
+          `${resolution.fallback.usable ? "" : ` (${escapeHtml(resolution.fallback.reason || "not usable")})`}.` : ""}</span>`;
+    } else if (resolution.fallback_engaged) {
+      tone = "warn"; icon = "⇄";
+      body = `Will run on fallback ${describeModel(resolution.active)}` +
+        `<span class="why">${escapeHtml(resolution.primary.model)} is unavailable: ` +
+        `${escapeHtml(resolution.primary.reason || resolution.primary.availability)}</span>`;
+    } else if (resolution.active.availability === "UNKNOWN") {
+      body = `Model: ${describeModel(resolution.active)}<span class="why">${escapeHtml(resolution.active.reason || "Not checked ahead of time.")}</span>`;
+    } else {
+      tone = "ok"; icon = "✓";
+      body = `Model: ${describeModel(resolution.active)}` +
+        `${resolution.fallback ? `<span class="why">Fallback ${escapeHtml(resolution.fallback.model)} ` +
+          `${resolution.fallback_enabled ? "enabled" : "configured but disabled"}.</span>` : ""}`;
+    }
+    node.className = `agent-model tone-${tone}`;
+    node.querySelector(".icon").textContent = icon;
+    node.querySelector(".body").innerHTML = body;
   }
 
   async function startTask() {
@@ -678,6 +762,7 @@
     injectStyles();
     if (!mount()) return;
     refreshHistory();
+    loadModelResolution(false);
     connect();
   }
 

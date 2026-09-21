@@ -266,6 +266,11 @@ class ProviderHealth:
     async def capability(self, provider: str, model: str, adapters: Any, *, refresh: bool = False) -> ModelCapability:
         if not model:
             return ModelCapability(provider, model, Availability.UNSUPPORTED, "No model is configured.")
+        if provider in ("", "auto"):
+            # The router picks per request, so there is nothing to interrogate
+            # yet. UNKNOWN lets the run proceed rather than inventing a fault.
+            return ModelCapability(provider, model, Availability.UNKNOWN,
+                                   "Automatic routing chooses the model per request.")
         if not refresh:
             cached = self.cached(provider, model)
             if cached is not None:

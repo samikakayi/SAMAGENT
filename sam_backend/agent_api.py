@@ -228,6 +228,16 @@ class AgentApi:
             payload["summary"] = project_map.summary_text()
             return {"map": payload}
 
+        @router.get("/api/providers/resolution")
+        async def get_provider_resolution(refresh: bool = False) -> dict[str, Any]:
+            """Which real model the next autonomous run would use, and why.
+
+            Costs no tokens: served from the bounded verdict cache, or from
+            the provider's free catalogue and key endpoints when refreshed.
+            """
+            resolution = await orchestrator.health.resolve(self._adapters(), refresh=refresh)
+            return {"resolution": resolution.as_dict()}
+
         @router.get("/api/environment")
         async def get_environment() -> dict[str, Any]:
             """Which developer tools and model providers are actually usable."""

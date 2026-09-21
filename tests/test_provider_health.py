@@ -429,7 +429,7 @@ def test_a_run_on_a_usable_primary_records_which_model_it_used(run_settings: Set
     assert task.state is not TaskState.FAILED
     assert orchestrator.active_route == ("openrouter", PAID_MODEL)
     assert any(PAID_MODEL in event.message for event in task.events if event.kind == "thought")
-    assert not any(event.kind == "fix" for event in task.events), "no fallback was engaged"
+    assert not any(event.kind == "fallback" for event in task.events), "no fallback was engaged"
 
 
 def test_a_run_switches_to_the_fallback_and_names_both_models(run_settings: Settings):
@@ -439,7 +439,7 @@ def test_a_run_switches_to_the_fallback_and_names_both_models(run_settings: Sett
     orchestrator, router, task = run_with(settings, health, [plan_turn(("Report", "report")), done_turn()])
 
     assert orchestrator.active_route == ("openrouter", FREE_MODEL)
-    switch = [event for event in task.events if event.kind == "fix"]
+    switch = [event for event in task.events if event.kind == "fallback"]
     assert len(switch) == 1, "exactly one visible fallback event"
     assert PAID_MODEL in switch[0].message and FREE_MODEL in switch[0].message
     assert "no credit" in switch[0].message
@@ -493,3 +493,14 @@ def test_the_fallback_is_a_real_model_on_the_same_provider(run_settings: Setting
     assert resolution.active is not None
     assert resolution.active.provider == resolution.primary.provider == "openrouter"
     assert resolution.active.model == FREE_MODEL
+
+
+def test_automatic_routing_has_nothing_to_preflight_and_is_not_blocked():
+    """default_provider may be "auto": the router picks per request, so a
+    preflight cannot name a model to check and must not report a fault."""
+    settings = Settings(default_provider="auto", default_model="anything", fallback_enabled=False)
+
+    resolution = asyncio.run(ProviderHealth(settings).resolve(FakeRegistry([], fail=True)))
+
+    assert resolution.primary.availability is Availability.UNKNOWN
+    assert not resolution.blocked

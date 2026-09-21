@@ -386,7 +386,7 @@ class AutonomousOrchestrator:
             # different brain than the operator configured is worse than one
             # that stops and says so.
             await self._emit(
-                task, "fix",
+                task, "fallback",
                 f"Primary model unavailable: {resolution.primary.model} "
                 f"({resolution.primary.reason or resolution.primary.availability.value}). "
                 f"Using configured fallback: {active.model}",
