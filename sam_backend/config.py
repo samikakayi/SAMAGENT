@@ -57,6 +57,10 @@ class Settings:
     openrouter_fast_model: str = "openrouter/auto"
     openrouter_strong_model: str = "openrouter/auto"
     openrouter_vision_model: str = "openrouter/auto"
+    # A real model to fall back to when the configured one is unavailable.
+    # Never a scripted or mock model: fallback is between real providers.
+    fallback_model: str = ""
+    fallback_enabled: bool = False
     openrouter_http_referer: str | None = None
     openrouter_title: str = "SAM Local Agent"
     openai_base_url: str = "https://api.openai.com/v1"
@@ -141,6 +145,8 @@ class Settings:
             openrouter_fast_model=os.getenv("OPENROUTER_FAST_MODEL", "openrouter/auto"),
             openrouter_strong_model=os.getenv("OPENROUTER_STRONG_MODEL", "openrouter/auto"),
             openrouter_vision_model=os.getenv("OPENROUTER_VISION_MODEL", "openrouter/auto"),
+            fallback_model=os.getenv("SAM_FALLBACK_MODEL", ""),
+            fallback_enabled=_env_bool("SAM_FALLBACK_ENABLED", False),
             openrouter_http_referer=os.getenv("OPENROUTER_HTTP_REFERER"),
             openrouter_title=os.getenv("OPENROUTER_TITLE", "SAM Local Agent"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
@@ -211,6 +217,7 @@ class Settings:
         allowed = {
             "default_provider", "default_model", "model_mode", "openai_model", "permission_mode",
             "openrouter_fast_model", "openrouter_strong_model", "openrouter_vision_model",
+            "fallback_model", "fallback_enabled",
             "max_tool_iterations", "command_timeout_seconds", "daily_budget_usd", "monthly_budget_usd",
             "computer_control_enabled", "screen_access_enabled", "default_trading_theory", "minimum_rr",
             "voice_mode", "voice_language", "voice_vad_threshold", "voice_silence_ms", "voice_wake_word",

@@ -35,6 +35,7 @@ from ..models import ModelError, ToolCall
 from ..planner import Planner
 from ..policy import RiskPolicy
 from ..project_map import ProjectScanner
+from ..provider_health import ProviderHealth
 from ..tasks import AgentTask, TaskState, TaskStep, TaskStore
 from ..tools import ToolRegistry
 from ..ui_review import review_screenshot
@@ -84,6 +85,7 @@ class AutonomousOrchestrator:
         verifier: VerificationEngine | None = None,
         capabilities: CapabilityRegistry | None = None,
         cancellation: CancellationManager | None = None,
+        health: ProviderHealth | None = None,
         broadcast: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         self.settings = settings
@@ -97,6 +99,11 @@ class AutonomousOrchestrator:
         self.capabilities = capabilities or tools.capabilities
         self.cancellation = cancellation
         self.executor = ToolExecutor(settings, database, tools, policy)
+        self.health = health or ProviderHealth(settings)
+        # The model this run resolved to. None until preflight has run; every
+        # model call routes through it so a run cannot drift onto a different
+        # model than the one the operator was shown.
+        self.active_route: tuple[str, str] | None = None
         self.planner = Planner(router)
         self.context = ContextEngine(settings)
         self.broadcast = broadcast
@@ -242,6 +249,8 @@ class AutonomousOrchestrator:
         try:
             if task.state is TaskState.IDLE:
                 await self._understand(task)
+                if not await self._preflight(task):
+                    return task
                 await self._scan(task)
                 await self._plan(task)
             return await self._drive(task)
@@ -337,6 +346,57 @@ class AutonomousOrchestrator:
         return await self._drive(task)
 
     # -- stages ------------------------------------------------------------
+    async def _preflight(self, task: AgentTask) -> bool:
+        """Settle which real model will drive this run, before spending one.
+
+        Discovering mid-run that the configured model cannot be paid for wastes
+        the work already done and leaves a half-finished task. The check costs
+        no tokens, and its outcome is recorded so the operator can see which
+        model actually ran and why.
+        """
+        adapters = getattr(self.router, "adapters", None)
+        if adapters is None:
+            # Nothing to interrogate. Preflight exists to avoid wasted work,
+            # never to invent a blocker, so an unanswerable check proceeds and
+            # lets the first real model call report the truth.
+            return True
+        resolution = await self.health.resolve(adapters)
+        if resolution.blocked:
+            self.active_route = None
+            await self._emit(
+                task, "error",
+                f"Provider unavailable: {resolution.fallback_reason}",
+                primary=resolution.primary.as_dict(),
+                fallback=resolution.fallback.as_dict() if resolution.fallback else None,
+            )
+            await self._transition(task, TaskState.FAILED, "No usable model provider")
+            task.completion_status = "provider_unavailable"
+            task.summary = (
+                f"The run did not start: {resolution.fallback_reason} "
+                "No work was attempted and nothing was changed."
+            )
+            self.store.save(task)
+            return False
+
+        active = resolution.active
+        assert active is not None
+        self.active_route = (active.provider, active.model)
+        if resolution.as_dict()["fallback_engaged"]:
+            # Naming both models matters: an agent quietly running on a
+            # different brain than the operator configured is worse than one
+            # that stops and says so.
+            await self._emit(
+                task, "fix",
+                f"Primary model unavailable: {resolution.primary.model} "
+                f"({resolution.primary.reason or resolution.primary.availability.value}). "
+                f"Using configured fallback: {active.model}",
+                primary=resolution.primary.as_dict(), active=active.as_dict(),
+            )
+        else:
+            await self._emit(task, "thought", f"Model: {active.model} ({active.provider})",
+                             active=active.as_dict())
+        return True
+
     async def _understand(self, task: AgentTask) -> None:
         await self._transition(task, TaskState.UNDERSTANDING, "Understanding the request")
         await self._emit(task, "thought", f"Goal: {task.goal[:300]}")
@@ -362,8 +422,10 @@ class AutonomousOrchestrator:
     async def _plan(self, task: AgentTask) -> None:
         await self._transition(task, TaskState.PLANNING, "Building a plan")
         project_map = self.scanner.cached(self.workspace)
+        provider, model = self.active_route or (None, None)
         result = await self.planner.plan(
             task.goal,
+            provider=provider, model=model,
             project_map=project_map,
             capabilities_summary=self.capabilities.summary_text(),
             constraints=task.constraints,
@@ -430,16 +492,21 @@ class AutonomousOrchestrator:
             capabilities_summary=self.capabilities.summary_text(),
         )
         try:
+            provider, model = self.active_route or (None, None)
             turn, choice, _fallbacks = await self.router.complete(
                 message=step.text,
                 messages=messages,
                 tools=self.tools.specs,
-                provider=None,
-                model=None,
+                provider=provider,
+                model=model,
                 conversation_id=task.conversation_id,
                 task_id=task.id,
             )
         except ModelError as exc:
+            if self.active_route:
+                # A real failure is better evidence than any preflight; record
+                # it so the next run does not probe a known-dead model again.
+                self.health.record_failure(*self.active_route, exc)
             step.status = "failed"
             step.detail = str(exc)[:500]
             task.errors.append(f"Model unavailable: {exc}")
@@ -633,8 +700,10 @@ class AutonomousOrchestrator:
         for check in report.failures:
             if check.stderr_tail or check.stdout_tail:
                 failure_text += "\n" + (check.stderr_tail or check.stdout_tail)[-2000:]
+        provider, model = self.active_route or (None, None)
         revised = await self.planner.replan(
             task.goal, failure=failure_text, attempted=task.plan,
+            provider=provider, model=model,
             project_map=self.scanner.cached(self.workspace), task_id=task.id,
         )
         task.replans += 1

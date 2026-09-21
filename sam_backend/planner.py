@@ -147,7 +147,10 @@ class Planner:
     def __init__(self, router: Any) -> None:
         self.router = router
 
-    async def _ask(self, system_prompt: str, user_prompt: str, *, task_id: str | None) -> str:
+    async def _ask(
+        self, system_prompt: str, user_prompt: str, *, task_id: str | None,
+        provider: str | None = None, model: str | None = None,
+    ) -> str:
         turn, _choice, _fallbacks = await self.router.complete(
             message=user_prompt,
             messages=[
@@ -157,8 +160,8 @@ class Planner:
             # Planning is pure reasoning: offering tools here invites the model
             # to start acting before a plan exists.
             tools=[],
-            provider=None,
-            model=None,
+            provider=provider,
+            model=model,
             conversation_id=None,
             task_id=task_id,
         )
@@ -172,6 +175,8 @@ class Planner:
         capabilities_summary: str = "",
         constraints: list[str] | None = None,
         task_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> PlanResult:
         context_lines = [f"GOAL: {goal}"]
         if project_map:
@@ -183,7 +188,8 @@ class Planner:
         prompt = "\n".join(context_lines)
 
         try:
-            reply = await self._ask(PLANNER_SYSTEM_PROMPT, prompt, task_id=task_id)
+            reply = await self._ask(PLANNER_SYSTEM_PROMPT, prompt, task_id=task_id,
+                                    provider=provider, model=model)
         except Exception as exc:  # noqa: BLE001 - any provider failure must still yield a plan
             result = fallback_plan(goal, project_map)
             result.note = f"Planning model unavailable ({type(exc).__name__}); used a structural plan."
@@ -207,6 +213,8 @@ class Planner:
         attempted: list[TaskStep],
         project_map: ProjectMap | None = None,
         task_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
     ) -> PlanResult:
         attempted_text = "\n".join(
             f"- [{step.status}] {step.text}" + (f" ({step.detail[:200]})" if step.detail else "")
@@ -220,7 +228,8 @@ class Planner:
             prompt += "\nPROJECT:\n" + project_map.summary_text()
 
         try:
-            reply = await self._ask(REPLAN_SYSTEM_PROMPT, prompt, task_id=task_id)
+            reply = await self._ask(REPLAN_SYSTEM_PROMPT, prompt, task_id=task_id,
+                                    provider=provider, model=model)
         except Exception as exc:  # noqa: BLE001
             return PlanResult(
                 steps=[
