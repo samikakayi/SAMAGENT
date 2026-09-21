@@ -4,12 +4,23 @@ A key set through the UI is written to a file the browser can never read, is
 never echoed back, and is never placed in a response body. Only its presence, a
 short fingerprint, and the outcome of a live health check are ever exposed.
 
+At rest the store is encrypted with Windows DPAPI, keyed to the logged-in user
+account. File ACLs alone only stop another account reading the file in place;
+DPAPI also makes a copy of the file useless on another machine or under another
+account. There is no key material in this repository -- the OS holds it.
+
+Where DPAPI is unavailable (non-Windows, or a hardened environment that blocks
+it) the store falls back to the previous owner-only plaintext file and says so
+through `storage_status()`, rather than silently pretending to be encrypted.
+
 Precedence is process environment, then `.env`, then this store: an operator's
 explicit environment always wins over something typed into a form earlier.
 """
 
 from __future__ import annotations
 
+import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -25,6 +36,38 @@ import httpx
 from .contracts import CapabilityState
 
 SECRETS_FILENAME = "secrets.json"
+# Marks a file whose payload is DPAPI ciphertext rather than a plain mapping.
+DPAPI_FORMAT = "dpapi-v1"
+
+
+class _Blob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(call: str, payload: bytes) -> bytes | None:
+    """Run one DPAPI round trip, or return None when it is unavailable.
+
+    Returning None rather than raising keeps a credential storable on a machine
+    where DPAPI is blocked; the caller degrades to the ACL-only file and
+    reports that state honestly.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        crypt = ctypes.windll.crypt32
+        source = _Blob(len(payload), ctypes.cast(ctypes.create_string_buffer(payload), ctypes.POINTER(ctypes.c_char)))
+        result = _Blob()
+        function = crypt.CryptProtectData if call == "protect" else crypt.CryptUnprotectData
+        # CRYPTPROTECT_UI_FORBIDDEN (0x1): never prompt; a backend has no desktop.
+        ok = function(ctypes.byref(source), None, None, None, None, 0x1, ctypes.byref(result))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(result.pbData, result.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(result.pbData)
+    except Exception:  # noqa: BLE001 - any OS-level failure means "not available"
+        return None
 # Rough shapes, used only to reject obvious paste errors before a network call.
 KEY_PATTERNS: dict[str, re.Pattern[str]] = {
     "openrouter_api_key": re.compile(r"^sk-or-[A-Za-z0-9._\-]{20,200}$"),
@@ -44,6 +87,34 @@ class SecretStore:
     def __init__(self, data_dir: Path) -> None:
         self.path = Path(data_dir) / SECRETS_FILENAME
         self._lock = threading.RLock()
+        self._encrypted_at_rest = False
+        self._migrate_plaintext()
+
+    def _migrate_plaintext(self) -> None:
+        """Encrypt a legacy plaintext store in place, once, at startup.
+
+        Reads without logging, rewrites encrypted, and only then is the
+        plaintext gone -- the rewrite is what removes it, so there is no window
+        where the credential exists in neither form.
+        """
+        with self._lock:
+            if not self.path.is_file():
+                self._encrypted_at_rest = _dpapi("protect", b"probe") is not None
+                return
+            values = self._read()
+            if not values:
+                return
+            if self._stored_format() == DPAPI_FORMAT:
+                self._encrypted_at_rest = True
+                return
+            self._write(values)
+
+    def _stored_format(self) -> str | None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return payload.get("_format") if isinstance(payload, dict) else None
 
     def _read(self) -> dict[str, str]:
         with self._lock:
@@ -53,12 +124,37 @@ class SecretStore:
                 payload = json.loads(self.path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 return {}
-            return {key: str(value) for key, value in payload.items() if isinstance(value, str)}
+            if not isinstance(payload, dict):
+                return {}
+            if payload.get("_format") == DPAPI_FORMAT:
+                try:
+                    blob = base64.b64decode(payload.get("data", ""))
+                except (ValueError, TypeError):
+                    return {}
+                plain = _dpapi("unprotect", blob)
+                if plain is None:
+                    # Written by another account, or DPAPI is now unavailable.
+                    # Refusing beats returning a half-decoded credential.
+                    return {}
+                try:
+                    payload = json.loads(plain.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return {}
+                if not isinstance(payload, dict):
+                    return {}
+            return {key: str(value) for key, value in payload.items()
+                    if isinstance(value, str) and not key.startswith("_")}
 
     def _write(self, values: dict[str, str]) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(values, indent=2), encoding="utf-8")
+            blob = _dpapi("protect", json.dumps(values).encode("utf-8"))
+            self._encrypted_at_rest = blob is not None
+            document = (
+                {"_format": DPAPI_FORMAT, "data": base64.b64encode(blob).decode("ascii")}
+                if blob is not None else values
+            )
+            self.path.write_text(json.dumps(document, indent=2), encoding="utf-8")
             try:
                 # Owner read/write only; the file must not be world readable.
                 self.path.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -93,6 +189,14 @@ class SecretStore:
             # Losing the hardening is worth reporting, but not worth refusing to
             # store a credential the user just entered.
             pass
+
+    def storage_status(self) -> dict[str, Any]:
+        """How the store is protected at rest. Never any value."""
+        return {
+            "encrypted_at_rest": self._encrypted_at_rest,
+            "mechanism": "windows-dpapi" if self._encrypted_at_rest else "owner-only-file",
+            "path": str(self.path),
+        }
 
     def acl_summary(self) -> dict[str, Any]:
         """Who can read the store, for the security surface. No values."""
