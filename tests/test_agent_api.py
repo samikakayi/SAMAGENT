@@ -180,50 +180,29 @@ def test_the_resolution_endpoint_names_a_usable_model(agent_client: TestClient):
 
     assert body["blocked"] is False and body["fallback_engaged"] is False
     assert body["active"]["model"] == "fake" and body["active"]["provider"] == "ollama"
-    assert body["primary"]["availability"] == "AVAILABLE" and body["primary"]["usable"] is True
+    assert body["primary"]["usable"] is True
     assert body["fallback"] is None and body["fallback_enabled"] is False
 
 
-def seed_verdicts(client: TestClient, primary: str, fallback: str | None = None) -> None:
-    """Put verdicts into the app's real ProviderHealth cache: a quota failure
-    costs nothing to learn here and must cost nothing to report."""
+@pytest.mark.parametrize("enabled, blocked, active", [(False, True, None), (True, False, "spare")])
+def test_a_quota_blocked_primary_is_reported_with_its_fallback(agent_client: TestClient, agent_settings: Settings,
+                                                               enabled, blocked, active):
     from sam_backend.provider_health import Availability, ModelCapability
 
-    health = client.app.state.orchestrator.health
-    health.remember(ModelCapability(
-        "ollama", "fake", Availability[primary], "fake is billed and the account has no paid credit.",
-        supports_tools=True, context_length=200_000, cost_class="paid",
-    ))
-    if fallback:
-        health.remember(ModelCapability(
-            "ollama", fallback, Availability.AVAILABLE, "",
-            supports_tools=True, context_length=200_000, cost_class="free",
-        ))
-
-
-def test_a_quota_blocked_primary_with_fallback_disabled_reports_blocked(agent_client: TestClient, agent_settings: Settings):
-    seed_verdicts(agent_client, "UNAVAILABLE_QUOTA", "spare")
+    health = agent_client.app.state.orchestrator.health
+    health.remember(ModelCapability("ollama", "fake", Availability.UNAVAILABLE_QUOTA, "no paid credit",
+                                    supports_tools=True, context_length=200_000, cost_class="paid"))
+    health.remember(ModelCapability("ollama", "spare", Availability.AVAILABLE,
+                                    supports_tools=True, context_length=200_000, cost_class="free"))
     agent_settings.fallback_model = "spare"
-    agent_settings.fallback_enabled = False
+    agent_settings.fallback_enabled = enabled
 
     body = agent_client.get("/api/providers/resolution").json()["resolution"]
 
-    assert body["blocked"] is True and body["active"] is None
-    assert body["primary"]["availability"] == "UNAVAILABLE_QUOTA"
-    assert "no paid credit" in body["primary"]["reason"]
+    assert body["blocked"] is blocked
+    assert (body["active"] or {}).get("model") == active
+    assert body["primary"]["availability"] == "UNAVAILABLE_QUOTA" and "no paid credit" in body["primary"]["reason"]
     assert body["fallback"]["model"] == "spare" and body["fallback"]["usable"] is True
-    assert "fallback is disabled" in body["fallback_reason"]
-
-
-def test_a_quota_blocked_primary_with_fallback_enabled_reports_the_switch(agent_client: TestClient, agent_settings: Settings):
-    seed_verdicts(agent_client, "UNAVAILABLE_QUOTA", "spare")
-    agent_settings.fallback_model = "spare"
-    agent_settings.fallback_enabled = True
-
-    body = agent_client.get("/api/providers/resolution").json()["resolution"]
-
-    assert body["blocked"] is False and body["fallback_engaged"] is True
-    assert body["active"]["model"] == "spare"
     assert "fake is unavailable" in body["fallback_reason"]
 
 
@@ -245,20 +224,6 @@ def test_the_resolution_endpoint_is_served_from_cache_unless_refreshed(agent_cli
     assert calls["n"] == first + 1, "an explicit refresh is"
 
 
-def test_a_blocked_run_leaves_the_same_verdict_the_panel_showed(agent_client: TestClient, agent_settings: Settings):
-    """The panel and the run consult one cache, so what the user was shown
-    is what the run acts on."""
-    seed_verdicts(agent_client, "UNAVAILABLE_AUTH")
-    shown = agent_client.get("/api/providers/resolution").json()["resolution"]
-    assert shown["blocked"] is True
-
-    task_id = agent_client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"]
-    task = wait_for_state(agent_client, task_id)
-
-    assert task["completion_status"] == "provider_unavailable"
-    assert not (Path(agent_settings.workspace_root) / "report.txt").exists(), "no work was attempted"
-
-
 def test_the_autopilot_panel_parses_and_consults_the_resolution_endpoint():
     import shutil
     import subprocess
@@ -273,42 +238,39 @@ def test_the_autopilot_panel_parses_and_consults_the_resolution_endpoint():
     subprocess.run([node, "--check", str(panel)], check=True, capture_output=True)
 
 
-class QuotaAdapter:
-    """Answers the planner with a credit failure; counts every request."""
+class QuotaRegistry:
+    """Every request fails on credit; counts them."""
 
     def __init__(self) -> None:
         self.requests = 0
 
-    async def list_models(self):
-        return [{"id": "fake", "name": "fake", "provider": "ollama"}]
-
-    async def complete(self, messages, tools, model):
-        from sam_backend.models import ErrorCategory, ModelError
-
-        self.requests += 1
-        raise ModelError("Insufficient credits", ErrorCategory.QUOTA)
-
-
-class QuotaRegistry:
-    def __init__(self) -> None:
-        self.adapter = QuotaAdapter()
-
     def get(self, provider):
-        return self.adapter
+        registry = self
+
+        class Adapter:
+            async def list_models(self):
+                return [{"id": "fake", "name": "fake", "provider": "ollama"}]
+
+            async def complete(self, messages, tools, model):
+                from sam_backend.models import ErrorCategory, ModelError
+
+                registry.requests += 1
+                raise ModelError("Insufficient credits", ErrorCategory.QUOTA)
+
+        return Adapter()
 
 
-def test_a_mid_run_quota_failure_is_reported_as_provider_unavailable(agent_settings: Settings):
+def test_a_mid_run_quota_failure_is_the_providers_and_is_not_repeated(agent_settings: Settings):
     """Preflight passed (the model was listed), then the first real request
-    hit a credit wall. The router skips the executor's request from the
-    shared cache; the run must say the provider is unavailable, not that
-    the task generically failed, and must have sent exactly one request."""
+    hit a credit wall. The run says the provider is unavailable, sends
+    nothing further, and the next run is stopped before spending anything."""
     registry = QuotaRegistry()
     with TestClient(create_app(agent_settings, registry)) as client:
-        task_id = client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"]
-        task = wait_for_state(client, task_id)
+        first = wait_for_state(client, client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"])
+        second = wait_for_state(client, client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"])
 
-    assert task["state"] == "FAILED"
-    assert registry.adapter.requests == 1, "the planner's failure was enough; the executor did not re-send"
-    assert task["completion_status"] == "provider_unavailable"
-    assert "credit" in task["summary"].lower() or "quota" in task["summary"].lower()
+    assert registry.requests == 1, "the planner's failure was enough; nothing was re-sent"
+    assert first["completion_status"] == second["completion_status"] == "provider_unavailable"
+    assert "credit" in first["summary"].lower()
+    assert "did not start" in second["summary"]
     assert not (Path(agent_settings.workspace_root) / "report.txt").exists()

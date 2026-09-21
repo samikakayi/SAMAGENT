@@ -20,9 +20,6 @@ MAX_COMPLETION_TOKENS = 2048
 # categories are retried briefly. Auth, quota and misconfiguration are not:
 # retrying those only wastes time and, on a metered account, money.
 TRANSIENT_CATEGORIES = frozenset({"rate_limit", "timeout", "network", "malformed"})
-# A 429 whose text says the cap is daily ("free-models-per-day") will not
-# clear in seconds: it is quota for the rest of the day, not a burst limit.
-DAILY_CAP = re.compile(r"per[-_ ]day|daily", re.IGNORECASE)
 PROVIDER_RETRIES = 2
 PROVIDER_RETRY_BACKOFF_SECONDS = 1.5
 
@@ -348,7 +345,9 @@ class ChatCompletionsAdapter:
                 except ValueError:
                     pass
             category = classify_exception(exc)
-            if category is ErrorCategory.RATE_LIMIT and DAILY_CAP.search(message):
+            if category is ErrorCategory.RATE_LIMIT and re.search(r"per[-_ ]day|daily", message, re.IGNORECASE):
+                # "free-models-per-day" will not clear in seconds: it is quota
+                # for the rest of the day, not a burst limit worth retrying.
                 category = ErrorCategory.QUOTA
             raise ModelError(
                 f"{self.provider} chat request failed: {sanitize_provider_message(message)}", category,

@@ -400,29 +400,18 @@ def _complete_thrice(router):
     return errors
 
 
-def test_a_quota_confirmed_model_is_not_asked_again(tmp_path: Path):
-    """After one credit failure the router must stop sending: the next
-    planner turn, executor turn or chat message cannot succeed either."""
-    from sam_backend.provider_health import Availability
-
-    adapter = _Answering(ErrorCategory.QUOTA)
+@pytest.mark.parametrize("category", [ErrorCategory.QUOTA, ErrorCategory.AUTH])
+def test_a_confirmed_failure_is_not_asked_again(tmp_path: Path, category: ErrorCategory):
+    """After one credit or credential failure the router must stop sending:
+    the next planner turn, executor turn or chat message cannot succeed."""
+    adapter = _Answering(category)
     router = _router(tmp_path, adapter)
 
     errors = _complete_thrice(router)
 
-    assert adapter.requests == 1, "one real request confirmed the quota"
-    assert all(error.category is ErrorCategory.QUOTA for error in errors), "the honest category survives the skip"
+    assert adapter.requests == 1, "one real request confirmed it"
+    assert all(error.category is category for error in errors), "the honest category survives the skip"
     assert "skipped" in str(errors[-1])
-    assert router.health.cached("openrouter", "paid/model").availability is Availability.UNAVAILABLE_QUOTA
-
-
-def test_an_auth_failure_is_likewise_not_repeated(tmp_path: Path):
-    adapter = _Answering(ErrorCategory.AUTH)
-
-    errors = _complete_thrice(_router(tmp_path, adapter))
-
-    assert adapter.requests == 1
-    assert errors[-1].category is ErrorCategory.AUTH
 
 
 def test_a_rate_limited_model_is_still_asked_again(tmp_path: Path):

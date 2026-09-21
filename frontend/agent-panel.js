@@ -356,6 +356,7 @@
   function renderModelResolution(resolution, failure) {
     const node = document.getElementById("agent-model");
     if (!node) return;
+    // The backend composes the reason text; the panel only chooses a tone.
     let tone = "muted";
     let icon = "○";
     let body;
@@ -363,25 +364,16 @@
       tone = "bad"; icon = "✕";
       body = `Could not check the provider.<span class="why">${escapeHtml(failure || "")}</span>`;
     } else if (resolution.blocked) {
-      // No run will start until the operator changes something; say exactly what.
       tone = "bad"; icon = "✕";
-      body = `${describeModel(resolution.primary)} is unavailable, so runs are blocked.` +
-        `<span class="why">${escapeHtml(resolution.primary.reason || resolution.primary.availability)}` +
-        `${resolution.fallback_enabled ? "" : " Fallback is disabled."}` +
-        `${resolution.fallback ? ` Configured fallback: ${escapeHtml(resolution.fallback.model)}` +
-          `${resolution.fallback.usable ? "" : ` (${escapeHtml(resolution.fallback.reason || "not usable")})`}.` : ""}</span>`;
+      body = `Runs are blocked.<span class="why">${escapeHtml(resolution.fallback_reason)}</span>`;
     } else if (resolution.fallback_engaged) {
       tone = "warn"; icon = "⇄";
-      body = `Will run on fallback ${describeModel(resolution.active)}` +
-        `<span class="why">${escapeHtml(resolution.primary.model)} is unavailable: ` +
-        `${escapeHtml(resolution.primary.reason || resolution.primary.availability)}</span>`;
+      body = `Will run on fallback ${describeModel(resolution.active)}<span class="why">${escapeHtml(resolution.fallback_reason)}</span>`;
     } else if (resolution.active.availability === "UNKNOWN") {
-      body = `Model: ${describeModel(resolution.active)}<span class="why">${escapeHtml(resolution.active.reason || "Not checked ahead of time.")}</span>`;
+      body = `Model: ${describeModel(resolution.active)}<span class="why">${escapeHtml(resolution.active.reason)}</span>`;
     } else {
       tone = "ok"; icon = "✓";
-      body = `Model: ${describeModel(resolution.active)}` +
-        `${resolution.fallback ? `<span class="why">Fallback ${escapeHtml(resolution.fallback.model)} ` +
-          `${resolution.fallback_enabled ? "enabled" : "configured but disabled"}.</span>` : ""}`;
+      body = `Model: ${describeModel(resolution.active)}`;
     }
     node.className = `agent-model tone-${tone}`;
     node.querySelector(".icon").textContent = icon;

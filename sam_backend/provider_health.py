@@ -19,16 +19,16 @@ that stops.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
 import httpx
 
-from .models import DAILY_CAP, ErrorCategory, ModelError
+from .config import Settings
+from .models import ErrorCategory, ModelError
 
 OPENROUTER_CATALOGUE_TTL = 600.0
-PROBE_TIMEOUT_SECONDS = 20.0
 # SAM's executor sends the plan, observations and every tool schema each turn.
 MINIMUM_CONTEXT_TOKENS = 16_000
 
@@ -57,14 +57,15 @@ VERDICT_TTL_SECONDS: dict[Availability, float] = {
     Availability.UNKNOWN: 60.0,
 }
 
-# A runtime failure is evidence too: fold it into the same vocabulary so the
-# cache learns from real requests, not only from preflight.
-AVAILABILITY_TO_CATEGORY: dict[Availability, ErrorCategory] = {
+# Verdicts definite enough that sending another request is pure waste, and
+# the category a skipped request reports.
+CONFIRMED_UNAVAILABLE: dict[Availability, ErrorCategory] = {
     Availability.UNAVAILABLE_QUOTA: ErrorCategory.QUOTA,
     Availability.UNAVAILABLE_AUTH: ErrorCategory.AUTH,
 }
-# Verdicts definite enough that re-sending a request is pure waste.
-CONFIRMED_UNAVAILABLE = frozenset(AVAILABILITY_TO_CATEGORY)
+
+# A runtime failure is evidence too: fold it into the same vocabulary so the
+# cache learns from real requests, not only from preflight.
 CATEGORY_TO_AVAILABILITY: dict[ErrorCategory, Availability] = {
     ErrorCategory.AUTH: Availability.UNAVAILABLE_AUTH,
     ErrorCategory.QUOTA: Availability.UNAVAILABLE_QUOTA,
@@ -84,7 +85,6 @@ class ModelCapability:
     availability: Availability = Availability.UNKNOWN
     reason: str = ""
     supports_tools: bool = False
-    supports_structured_output: bool = False
     context_length: int = 0
     cost_class: str = "unknown"  # free | paid | unknown
     checked_at: float = field(default_factory=time.time)
@@ -99,10 +99,7 @@ class ModelCapability:
         )
 
     def as_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["availability"] = self.availability.value
-        payload["usable"] = self.usable
-        return payload
+        return {**asdict(self), "availability": self.availability.value, "usable": self.usable}
 
 
 @dataclass(slots=True)
@@ -119,14 +116,17 @@ class ModelResolution:
     def blocked(self) -> bool:
         return self.active is None
 
+    @property
+    def fallback_engaged(self) -> bool:
+        return self.active is not None and self.active is self.fallback
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "primary": self.primary.as_dict(),
             "fallback": self.fallback.as_dict() if self.fallback else None,
             "active": self.active.as_dict() if self.active else None,
             "fallback_enabled": self.fallback_enabled,
-            "fallback_engaged": bool(self.active and self.fallback and self.active.model == self.fallback.model
-                                     and self.active.model != self.primary.model),
+            "fallback_engaged": self.fallback_engaged,
             "fallback_reason": self.fallback_reason,
             "blocked": self.blocked,
         }
@@ -135,10 +135,10 @@ class ModelResolution:
 class ProviderHealth:
     """Cheap, cached answers about whether a model can drive a run."""
 
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._verdicts: dict[tuple[str, str], ModelCapability] = {}
-        self._catalogue: tuple[float, dict[str, dict[str, Any]], Availability, str] | None = None
+        self._catalogue: tuple[float, dict[str, dict[str, Any]], str] | None = None
 
     # -- cache -------------------------------------------------------------
     def cached(self, provider: str, model: str) -> ModelCapability | None:
@@ -146,7 +146,7 @@ class ProviderHealth:
         if entry is None:
             return None
         if time.time() - entry.checked_at > VERDICT_TTL_SECONDS[entry.availability]:
-            self._verdicts.pop((provider, model), None)
+            del self._verdicts[(provider, model)]
             return None
         return entry
 
@@ -156,27 +156,13 @@ class ProviderHealth:
         return capability
 
     def record_failure(self, provider: str, model: str, error: ModelError) -> None:
-        """Teach the cache from a real request that failed.
-
-        Without this, a run that dies on a credit error would be followed by
-        another run that probes the same paid model all over again.
-        """
-        availability = CATEGORY_TO_AVAILABILITY.get(getattr(error, "category", ErrorCategory.UNKNOWN))
+        """Teach the cache from a real request that failed, keeping whatever
+        the catalogue already said about the model itself."""
+        availability = CATEGORY_TO_AVAILABILITY.get(error.category)
         if availability is None:
             return
-        if availability is Availability.UNAVAILABLE_RATE_LIMIT and DAILY_CAP.search(str(error)):
-            # "Rate limit exceeded: free-models-per-day" is a quota for the
-            # rest of the day, not a burst limit that clears in a minute.
-            availability = Availability.UNAVAILABLE_QUOTA
-        known = self.cached(provider, model)
-        self.remember(ModelCapability(
-            provider=provider, model=model, availability=availability,
-            reason=str(error)[:300],
-            supports_tools=known.supports_tools if known else False,
-            supports_structured_output=known.supports_structured_output if known else False,
-            context_length=known.context_length if known else 0,
-            cost_class=known.cost_class if known else "unknown",
-        ))
+        known = self.cached(provider, model) or ModelCapability(provider, model)
+        self.remember(replace(known, availability=availability, reason=str(error)[:300]))
 
     def invalidate(self) -> None:
         self._verdicts.clear()
@@ -184,15 +170,17 @@ class ProviderHealth:
 
     # -- OpenRouter: catalogue + key, both free ----------------------------
     async def _openrouter_catalogue(self) -> tuple[dict[str, dict[str, Any]], Availability, str]:
+        """The catalogue and a note about the account, or why neither could
+        be fetched. Only a successful fetch is cached."""
         if self._catalogue and time.time() - self._catalogue[0] < OPENROUTER_CATALOGUE_TTL:
-            return self._catalogue[1], self._catalogue[2], self._catalogue[3]
-        key = getattr(self.settings, "openrouter_api_key", None)
+            return self._catalogue[1], Availability.AVAILABLE, self._catalogue[2]
+        key = self.settings.openrouter_api_key
         if not key:
             return {}, Availability.UNAVAILABLE_AUTH, "No OpenRouter credential is configured."
         headers = {"Authorization": f"Bearer {key}"}
-        base = getattr(self.settings, "openrouter_base_url", "https://openrouter.ai/api/v1")
+        base = self.settings.openrouter_base_url
         try:
-            async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_SECONDS, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
                 key_response = await client.get(f"{base}/key", headers=headers)
                 if key_response.status_code in (401, 403):
                     return {}, Availability.UNAVAILABLE_AUTH, "The OpenRouter credential was rejected."
@@ -209,10 +197,9 @@ class ProviderHealth:
         catalogue = {str(item.get("id")): item for item in entries if item.get("id")}
         # A free-tier key cannot pay for a billed model. Knowing that here
         # saves starting a run that would die on its first paid request.
-        remaining = account.get("limit_remaining")
-        broke = bool(account.get("is_free_tier")) and not remaining
+        broke = bool(account.get("is_free_tier")) and not account.get("limit_remaining")
         note = "free-tier key with no paid credit" if broke else ""
-        self._catalogue = (time.time(), catalogue, Availability.AVAILABLE, note)
+        self._catalogue = (time.time(), catalogue, note)
         return catalogue, Availability.AVAILABLE, note
 
     async def _check_openrouter(self, model: str) -> ModelCapability:
@@ -223,17 +210,14 @@ class ProviderHealth:
         if entry is None:
             return ModelCapability("openrouter", model, Availability.UNSUPPORTED,
                                    f"{model} is not in this provider's catalogue.")
-        parameters = entry.get("supported_parameters") or []
         pricing = entry.get("pricing") or {}
         try:
             billed = float(pricing.get("prompt") or 0) > 0 or float(pricing.get("completion") or 0) > 0
         except (TypeError, ValueError):
             billed = False
         capability = ModelCapability(
-            provider="openrouter", model=model,
-            availability=Availability.AVAILABLE, reason="",
-            supports_tools="tools" in parameters,
-            supports_structured_output="structured_outputs" in parameters or "response_format" in parameters,
+            "openrouter", model, Availability.AVAILABLE,
+            supports_tools="tools" in (entry.get("supported_parameters") or []),
             context_length=int(entry.get("context_length") or 0),
             cost_class="paid" if billed else "free",
         )
@@ -266,11 +250,8 @@ class ProviderHealth:
             return ModelCapability(provider, model, Availability.UNSUPPORTED,
                                    f"{provider} does not serve {model}.")
         # A local runtime bills nothing and its served models take tools.
-        return ModelCapability(
-            provider, model, Availability.AVAILABLE, "",
-            supports_tools=True, supports_structured_output=True,
-            context_length=MINIMUM_CONTEXT_TOKENS, cost_class="free",
-        )
+        return ModelCapability(provider, model, Availability.AVAILABLE,
+                               supports_tools=True, context_length=MINIMUM_CONTEXT_TOKENS, cost_class="free")
 
     # -- public ------------------------------------------------------------
     async def capability(self, provider: str, model: str, adapters: Any, *, refresh: bool = False) -> ModelCapability:
@@ -281,10 +262,8 @@ class ProviderHealth:
             # yet. UNKNOWN lets the run proceed rather than inventing a fault.
             return ModelCapability(provider, model, Availability.UNKNOWN,
                                    "Automatic routing chooses the model per request.")
-        if not refresh:
-            cached = self.cached(provider, model)
-            if cached is not None:
-                return cached
+        if not refresh and (cached := self.cached(provider, model)) is not None:
+            return cached
         if provider == "openrouter":
             capability = await self._check_openrouter(model)
         else:
@@ -293,35 +272,28 @@ class ProviderHealth:
 
     async def resolve(self, adapters: Any, *, refresh: bool = False) -> ModelResolution:
         """Decide which real model drives the next run."""
-        provider = str(getattr(self.settings, "default_provider", "") or "")
-        primary_model = str(getattr(self.settings, "default_model", "") or "")
-        primary = await self.capability(provider, primary_model, adapters, refresh=refresh)
+        provider = self.settings.default_provider
+        primary = await self.capability(provider, self.settings.default_model, adapters, refresh=refresh)
+        fallback = None
+        if self.settings.fallback_model and self.settings.fallback_model != primary.model:
+            fallback = await self.capability(provider, self.settings.fallback_model, adapters, refresh=refresh)
+        enabled = self.settings.fallback_enabled
 
-        fallback_model = str(getattr(self.settings, "fallback_model", "") or "")
-        enabled = bool(getattr(self.settings, "fallback_enabled", False))
-        fallback: ModelCapability | None = None
-        if fallback_model and fallback_model != primary_model:
-            fallback = await self.capability(provider, fallback_model, adapters, refresh=refresh)
-
-        if primary.usable:
+        # A non-answer must not become an outage: an UNKNOWN primary proceeds
+        # and the first real request decides.
+        if primary.usable or primary.availability is Availability.UNKNOWN:
             return ModelResolution(primary, fallback, primary, enabled)
-        if primary.availability is Availability.UNKNOWN:
-            # The check could not reach a verdict. Refusing to start on a
-            # non-answer would turn a diagnostic into an outage, so the run
-            # proceeds and the first real request decides.
-            return ModelResolution(primary, fallback, primary, enabled)
+        problem = f"{primary.model} is unavailable ({primary.reason or primary.availability.value})"
         if not enabled:
             # Honest stop. Silently switching models is the thing this policy
             # exists to prevent.
-            return ModelResolution(primary, fallback, None, enabled,
-                                   f"{primary.model} is unavailable ({primary.reason or primary.availability.value}) "
-                                   "and fallback is disabled.")
+            return ModelResolution(primary, fallback, None, enabled, f"{problem} and fallback is disabled.")
         if fallback is not None and fallback.usable:
-            return ModelResolution(primary, fallback, fallback, enabled,
-                                   f"{primary.model} is unavailable: {primary.reason or primary.availability.value}")
+            return ModelResolution(primary, fallback, fallback, enabled, f"{problem}.")
         if fallback is None:
-            why = "no fallback is configured."
-        else:
-            why = f"the fallback {fallback.model} is also unavailable ({fallback.reason or fallback.availability.value})."
-        return ModelResolution(primary, fallback, None, enabled,
-                               f"{primary.model} is unavailable ({primary.reason or primary.availability.value}) and {why}")
+            return ModelResolution(primary, fallback, None, enabled, f"{problem} and no fallback is configured.")
+        return ModelResolution(
+            primary, fallback, None, enabled,
+            f"{problem} and the fallback {fallback.model} is also unavailable "
+            f"({fallback.reason or fallback.availability.value}).",
+        )

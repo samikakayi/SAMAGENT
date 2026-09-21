@@ -379,9 +379,8 @@ class AutonomousOrchestrator:
             return False
 
         active = resolution.active
-        assert active is not None
         self.active_route = (active.provider, active.model)
-        if resolution.as_dict()["fallback_engaged"]:
+        if resolution.fallback_engaged:
             # Naming both models matters: an agent quietly running on a
             # different brain than the operator configured is worse than one
             # that stops and says so.
@@ -503,11 +502,6 @@ class AutonomousOrchestrator:
                 task_id=task.id,
             )
         except ModelError as exc:
-            if self.active_route:
-                # A real failure is better evidence than any preflight. The
-                # shared router records it too; recording twice is harmless
-                # and a router that does not share the cache still teaches it.
-                self.health.record_failure(*self.active_route, exc)
             step.status = "failed"
             step.detail = str(exc)[:500]
             task.errors.append(f"Model unavailable: {exc}")

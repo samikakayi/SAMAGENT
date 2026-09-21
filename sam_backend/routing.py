@@ -8,7 +8,7 @@ from typing import Any
 from .config import Settings
 from .db import Database
 from .models import AdapterRegistry, AssistantTurn, ErrorCategory, ModelError
-from .provider_health import AVAILABILITY_TO_CATEGORY, CONFIRMED_UNAVAILABLE, ProviderHealth
+from .provider_health import CONFIRMED_UNAVAILABLE, ProviderHealth
 
 
 @dataclass(slots=True)
@@ -209,7 +209,7 @@ class ModelRouter:
                 failures.append({
                     "provider": choice.provider, "model": choice.model,
                     "error": f"skipped, {verdict.reason}",
-                    "category": str(AVAILABILITY_TO_CATEGORY[verdict.availability]),
+                    "category": str(CONFIRMED_UNAVAILABLE[verdict.availability]),
                 })
                 continue
             try:
