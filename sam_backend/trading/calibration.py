@@ -401,15 +401,28 @@ class ChartCalibrator:
 
     @staticmethod
     def cluster_columns(anchors: list[dict[str, Any]], tolerance: float = 70.0) -> list[list[dict[str, Any]]]:
-        """Group numeric labels into vertical columns by their X position."""
+        """Group numeric labels into vertical columns by their X position.
+
+        Comparing each candidate against the column's running mean -- not just
+        the most recently added label -- stops a chain of labels, each a
+        little further right than the last, from drifting a single "column"
+        across two genuinely separate ones (the price axis and an adjacent
+        watchlist or icon rail, for example). Letting that happen would dilute
+        the real axis fit with unrelated numbers and could fail verification,
+        or in the worst case pass a corrupted fit.
+        """
         columns: list[list[dict[str, Any]]] = []
+        sums: list[float] = []
         for anchor in sorted(anchors, key=lambda item: item["x"]):
-            for column in columns:
-                if abs(column[-1]["x"] - anchor["x"]) <= tolerance:
+            for index, column in enumerate(columns):
+                mean_x = sums[index] / len(column)
+                if abs(mean_x - anchor["x"]) <= tolerance:
                     column.append(anchor)
+                    sums[index] += anchor["x"]
                     break
             else:
                 columns.append([anchor])
+                sums.append(anchor["x"])
         return columns
 
     def calibrate(

@@ -140,14 +140,29 @@ def pick_visible_interval(
     A closed TradingView toolbar shows one interval button immediately to the
     right of the symbol. An open interval menu shows many; in that case the
     left-most interval still to the right of the symbol is the armed button.
+
+    The symbol anchor tolerates broker-prefixed/suffixed tickers (OCR often
+    reads ``OANDA:XAUUSD`` or ``XAUUSD.a`` rather than a bare ``XAUUSD``), but
+    if the requested symbol cannot be found in this OCR pass at all, the
+    anchor is unknown and no interval is guessed: picking the left-most
+    interval-shaped token from an unanchored band risks confirming the wrong
+    timeframe, which is worse than reporting it unverified.
     """
     symbol_x: float | None = None
     if symbol:
         wanted = symbol.strip().upper()
-        for text, x in tokens:
-            if text.strip().upper() == wanted:
-                symbol_x = x
-                break
+        if wanted:
+            for text, x in tokens:
+                candidate = text.strip().upper()
+                if not candidate:
+                    continue
+                if candidate == wanted or (
+                    len(candidate) >= 3 and (candidate in wanted or wanted in candidate)
+                ):
+                    symbol_x = x
+                    break
+            if symbol_x is None:
+                return None
     ranked: list[tuple[str, float]] = []
     for text, x in tokens:
         if symbol_x is not None and x <= symbol_x + 6:

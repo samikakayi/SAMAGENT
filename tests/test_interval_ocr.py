@@ -59,3 +59,22 @@ def test_interval_tokens_to_the_left_of_the_symbol_are_not_the_chart_interval():
 def test_a_toolbar_with_no_interval_returns_nothing():
     tokens = [("XAUUSD", 40.0), ("Indicators", 200.0)]
     assert pick_visible_interval(tokens, symbol="XAUUSD") is None
+
+
+def test_a_broker_prefixed_symbol_still_anchors_the_interval():
+    tokens = [("OANDA:XAUUSD", 40.0), ("15m", 160.0), ("Indicators", 300.0)]
+    assert pick_visible_interval(tokens, symbol="XAUUSD") == "M15"
+
+
+def test_a_broker_suffixed_symbol_still_anchors_the_interval():
+    tokens = [("XAUUSD.a", 40.0), ("1h", 160.0)]
+    assert pick_visible_interval(tokens, symbol="XAUUSD") == "H1"
+
+
+def test_an_unfound_symbol_does_not_guess_an_interval():
+    """If OCR never located the requested symbol at all, the interval tokens
+    in the band cannot be anchored to it -- guessing the left-most one risks
+    confirming the wrong timeframe, which is worse than reporting unverified.
+    """
+    tokens = [("EURUSD", 40.0), ("15m", 160.0)]
+    assert pick_visible_interval(tokens, symbol="XAUUSD") is None

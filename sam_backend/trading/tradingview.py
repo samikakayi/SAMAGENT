@@ -600,6 +600,28 @@ class TradingViewController:
             error_code="SYMBOL_MISMATCH",
         )
 
+    def _confirm_toolbar_timeframe(
+        self, target: str, *, timeout_seconds: float, poll_interval: float = 0.4, required_matches: int = 2,
+    ) -> tuple[Any | None, dict[str, Any]]:
+        """Poll the toolbar until ``target`` reads consistently, not just once.
+
+        A single OCR pass can misread a button mid-animation, under a cursor,
+        or under a tooltip. Requiring the same result on back-to-back passes
+        avoids confirming (or dismissing) a timeframe on a one-off misread.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        matches = 0
+        state: Any = None
+        meta: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            state = self.observe()
+            picked, meta = self._read_toolbar_timeframe(state)
+            matches = matches + 1 if picked == target else 0
+            if matches >= required_matches:
+                return state, meta
+            time.sleep(poll_interval)
+        return None, meta
+
     def set_timeframe(self, timeframe: str, timeout_seconds: float = 8.0) -> StandardResult:
         started = time.perf_counter()
         normalized = normalize_timeframe(timeframe)
@@ -615,13 +637,13 @@ class TradingViewController:
             return focused
         state = self.observe()
         if self.screen_access:
-            current, preview = self._read_toolbar_timeframe(state)
-            if current == normalized and state.window_handle:
-                self._last_verified_timeframe[state.window_handle] = normalized
-                state.timeframe = normalized
-                state.timeframe_verified = True
+            confirmed, preview = self._confirm_toolbar_timeframe(normalized, timeout_seconds=0.6, poll_interval=0.15)
+            if confirmed is not None and confirmed.window_handle:
+                self._last_verified_timeframe[confirmed.window_handle] = normalized
+                confirmed.timeframe = normalized
+                confirmed.timeframe_verified = True
                 return StandardResult.success(
-                    {**state.as_dict(), "toolbar": preview},
+                    {**confirmed.as_dict(), "toolbar": preview},
                     verified=True, started_at=started,
                     observations=[f"The toolbar already shows {normalized}."],
                 )
@@ -632,20 +654,16 @@ class TradingViewController:
 
         last_meta: dict[str, Any] = {}
         if self.screen_access:
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                after = self.observe()
-                picked, last_meta = self._read_toolbar_timeframe(after)
-                if picked == normalized and after.window_handle:
-                    self._last_verified_timeframe[after.window_handle] = normalized
-                    after.timeframe = normalized
-                    after.timeframe_verified = True
-                    return StandardResult.success(
-                        {**after.as_dict(), "toolbar": last_meta},
-                        verified=True, started_at=started,
-                        observations=[f"Toolbar OCR confirmed {normalized}."],
-                    )
-                time.sleep(0.4)
+            after, last_meta = self._confirm_toolbar_timeframe(normalized, timeout_seconds=timeout_seconds)
+            if after is not None and after.window_handle:
+                self._last_verified_timeframe[after.window_handle] = normalized
+                after.timeframe = normalized
+                after.timeframe_verified = True
+                return StandardResult.success(
+                    {**after.as_dict(), "toolbar": last_meta},
+                    verified=True, started_at=started,
+                    observations=[f"Toolbar OCR confirmed {normalized} on two consecutive reads."],
+                )
             try:
                 _, win32api, win32con, _, _ = self._modules()
                 win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
