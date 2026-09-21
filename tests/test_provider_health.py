@@ -263,7 +263,7 @@ def test_no_configured_fallback_blocks_even_when_enabled(restore_httpx):
     resolution = resolution_for(free_tier=True, fallback="", enabled=True)
 
     assert resolution.blocked
-    assert "no usable fallback" in resolution.fallback_reason
+    assert "no fallback is configured" in resolution.fallback_reason
 
 
 def test_an_unusable_fallback_does_not_rescue_the_run(restore_httpx):
@@ -504,3 +504,30 @@ def test_automatic_routing_has_nothing_to_preflight_and_is_not_blocked():
 
     assert resolution.primary.availability is Availability.UNKNOWN
     assert not resolution.blocked
+
+
+def test_a_daily_cap_is_remembered_as_quota_not_a_burst_limit():
+    """Seen live: OpenRouter answers 429 "free-models-per-day". Trusting that
+    for only sixty seconds would let a new run fail the same way every minute."""
+    health = ProviderHealth(Settings())
+
+    health.record_failure("openrouter", FREE_MODEL,
+                          ModelError("Rate limit exceeded: free-models-per-day. Add 10 credits", ErrorCategory.RATE_LIMIT))
+    daily = health.cached("openrouter", FREE_MODEL)
+    health.record_failure("openrouter", PAID_MODEL, ModelError("Rate limit exceeded: burst", ErrorCategory.RATE_LIMIT))
+    burst = health.cached("openrouter", PAID_MODEL)
+
+    assert daily is not None and daily.availability is Availability.UNAVAILABLE_QUOTA
+    assert burst is not None and burst.availability is Availability.UNAVAILABLE_RATE_LIMIT
+
+
+def test_an_unavailable_fallback_is_named_as_such_not_called_missing(run_settings: Settings):
+    settings = with_fallback(run_settings, enabled=True)
+    health = seeded_health(settings, Availability.UNAVAILABLE_QUOTA, "no credit")
+    health.record_failure("openrouter", FREE_MODEL, ModelError("free-models-per-day", ErrorCategory.RATE_LIMIT))
+
+    resolution = asyncio.run(health.resolve(FakeRegistry([])))
+
+    assert resolution.blocked
+    assert FREE_MODEL in resolution.fallback_reason and "also unavailable" in resolution.fallback_reason
+    assert "no fallback is configured" not in resolution.fallback_reason

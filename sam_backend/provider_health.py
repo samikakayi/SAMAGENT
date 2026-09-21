@@ -18,6 +18,7 @@ that stops.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -56,6 +57,9 @@ VERDICT_TTL_SECONDS: dict[Availability, float] = {
     Availability.UNSUPPORTED: 900.0,
     Availability.UNKNOWN: 60.0,
 }
+
+# A 429 whose text says the cap is daily will not clear in seconds.
+DAILY_CAP = re.compile(r"per[-_ ]day|daily", re.IGNORECASE)
 
 # A runtime failure is evidence too: fold it into the same vocabulary so the
 # cache learns from real requests, not only from preflight.
@@ -158,6 +162,10 @@ class ProviderHealth:
         availability = CATEGORY_TO_AVAILABILITY.get(getattr(error, "category", ErrorCategory.UNKNOWN))
         if availability is None:
             return
+        if availability is Availability.UNAVAILABLE_RATE_LIMIT and DAILY_CAP.search(str(error)):
+            # "Rate limit exceeded: free-models-per-day" is a quota for the
+            # rest of the day, not a burst limit that clears in a minute.
+            availability = Availability.UNAVAILABLE_QUOTA
         known = self.cached(provider, model)
         self.remember(ModelCapability(
             provider=provider, model=model, availability=availability,
@@ -309,6 +317,9 @@ class ProviderHealth:
         if fallback is not None and fallback.usable:
             return ModelResolution(primary, fallback, fallback, enabled,
                                    f"{primary.model} is unavailable: {primary.reason or primary.availability.value}")
+        if fallback is None:
+            why = "no fallback is configured."
+        else:
+            why = f"the fallback {fallback.model} is also unavailable ({fallback.reason or fallback.availability.value})."
         return ModelResolution(primary, fallback, None, enabled,
-                               f"{primary.model} is unavailable ({primary.reason or primary.availability.value}) "
-                               "and no usable fallback is configured.")
+                               f"{primary.model} is unavailable ({primary.reason or primary.availability.value}) and {why}")
