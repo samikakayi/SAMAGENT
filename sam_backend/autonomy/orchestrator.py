@@ -514,8 +514,10 @@ class AutonomousOrchestrator:
             self.store.save(task)
             await self._emit(task, "error", f"No model could handle this step: {exc}")
             await self._transition(task, TaskState.FAILED, "No model provider was reachable")
-            task.completion_status = "failed"
-            task.summary = "The run stopped because no configured model provider was reachable."
+            # The same outcome preflight reports, reached one step later: the
+            # provider, not the task, is what failed, and the UI should say so.
+            task.completion_status = "provider_unavailable"
+            task.summary = f"The run stopped because the model provider could not be used: {exc}"
             self.store.save(task)
             return None
 

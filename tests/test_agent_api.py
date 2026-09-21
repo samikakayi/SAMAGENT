@@ -271,3 +271,44 @@ def test_the_autopilot_panel_parses_and_consults_the_resolution_endpoint():
     if node is None:
         pytest.skip("node is not installed")
     subprocess.run([node, "--check", str(panel)], check=True, capture_output=True)
+
+
+class QuotaAdapter:
+    """Answers the planner with a credit failure; counts every request."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def list_models(self):
+        return [{"id": "fake", "name": "fake", "provider": "ollama"}]
+
+    async def complete(self, messages, tools, model):
+        from sam_backend.models import ErrorCategory, ModelError
+
+        self.requests += 1
+        raise ModelError("Insufficient credits", ErrorCategory.QUOTA)
+
+
+class QuotaRegistry:
+    def __init__(self) -> None:
+        self.adapter = QuotaAdapter()
+
+    def get(self, provider):
+        return self.adapter
+
+
+def test_a_mid_run_quota_failure_is_reported_as_provider_unavailable(agent_settings: Settings):
+    """Preflight passed (the model was listed), then the first real request
+    hit a credit wall. The router skips the executor's request from the
+    shared cache; the run must say the provider is unavailable, not that
+    the task generically failed, and must have sent exactly one request."""
+    registry = QuotaRegistry()
+    with TestClient(create_app(agent_settings, registry)) as client:
+        task_id = client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"]
+        task = wait_for_state(client, task_id)
+
+    assert task["state"] == "FAILED"
+    assert registry.adapter.requests == 1, "the planner's failure was enough; the executor did not re-send"
+    assert task["completion_status"] == "provider_unavailable"
+    assert "credit" in task["summary"].lower() or "quota" in task["summary"].lower()
+    assert not (Path(agent_settings.workspace_root) / "report.txt").exists()

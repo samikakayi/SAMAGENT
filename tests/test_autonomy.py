@@ -323,6 +323,7 @@ def test_an_unreachable_model_fails_cleanly(settings: Settings, workspace: Path)
     task = asyncio.run(orchestrator.start("Do a thing"))
 
     assert task.state is TaskState.FAILED
+    assert task.completion_status == "provider_unavailable", "the provider failed, not the task"
     assert "reachable" in task.summary
 
 
