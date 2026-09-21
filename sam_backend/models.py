@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 import re
@@ -14,6 +15,13 @@ from .config import Settings
 
 # One tool-loop turn is a short instruction plus a tool call, never a book.
 MAX_COMPLETION_TOKENS = 2048
+# A gateway occasionally answers 200 with no choices, or rate-limits a burst.
+# One flake should cost a moment, not an entire autonomous run, so transient
+# categories are retried briefly. Auth, quota and misconfiguration are not:
+# retrying those only wastes time and, on a metered account, money.
+TRANSIENT_CATEGORIES = frozenset({"rate_limit", "timeout", "network", "malformed"})
+PROVIDER_RETRIES = 2
+PROVIDER_RETRY_BACKOFF_SECONDS = 1.5
 
 
 class ErrorCategory(StrEnum):
@@ -296,6 +304,19 @@ class ChatCompletionsAdapter:
         return converted
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str) -> AssistantTurn:
+        """Request one completion, retrying only genuinely transient faults."""
+        last: ModelError | None = None
+        for attempt in range(PROVIDER_RETRIES + 1):
+            try:
+                return await self._complete_once(messages, tools, model)
+            except ModelError as exc:
+                last = exc
+                if exc.category not in TRANSIENT_CATEGORIES or attempt == PROVIDER_RETRIES:
+                    raise
+                await asyncio.sleep(PROVIDER_RETRY_BACKOFF_SECONDS * (attempt + 1))
+        raise last  # unreachable; keeps the type checker honest
+
+    async def _complete_once(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], model: str) -> AssistantTurn:
         if self.key_required and not self.api_key:
             raise ModelError(f"{self.provider.upper()} credential is not configured", ErrorCategory.NOT_CONFIGURED)
         payload = {
