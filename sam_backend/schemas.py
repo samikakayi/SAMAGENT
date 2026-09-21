@@ -240,3 +240,25 @@ class ComposedStrategyRequest(BaseModel):
     timeframes: list[str] = Field(default_factory=list, max_length=8)
     minimum_rr: float = Field(default=1.5, gt=0, le=50)
     direction: Literal["LONG", "SHORT", "BOTH"] = "BOTH"
+
+
+class AgentTaskCreate(BaseModel):
+    """Start an autonomous run."""
+
+    goal: str = Field(min_length=1, max_length=20_000)
+    conversation_id: str | None = None
+    constraints: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("goal")
+    @classmethod
+    def normalize_goal(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("goal cannot be blank")
+        return normalized
+
+
+class AgentTaskApproval(BaseModel):
+    approval_id: str = Field(min_length=1, max_length=120)
+    decision: Literal["approved", "denied"]
+    note: str = Field(default="", max_length=2_000)

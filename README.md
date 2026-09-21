@@ -21,6 +21,16 @@ OpenAI adapters are included; no credential is bundled or returned by the API.
 - Browser navigation plus optional isolated browser automation.
 - Windows application launching.
 - Structured planning and a bounded multi-step tool loop.
+- **Autonomous runs**: give SAM a goal and it inspects the project, plans,
+  edits files, runs the project's own tests, diagnoses failures, re-plans, and
+  retries until the work is verified or it can honestly say it is stuck. Live
+  progress appears in the **Autopilot** panel.
+- Project intelligence: a cached map of structure, dependencies, commands, API
+  routes, test suites and git state.
+- Verification engine that runs a project's declared test/build/lint checks and
+  parses the result, so "done" is proven rather than asserted.
+- Capability discovery for installed developer tools and reachable model
+  providers.
 - Approval cards that show the exact operation, risk, reason, and arguments.
 - Redacted, hash-linked audit records.
 - Responsive UI, keyboard navigation, light/dark themes, and optional browser

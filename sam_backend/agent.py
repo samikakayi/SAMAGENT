@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections import defaultdict
 from contextlib import suppress
 from typing import Any
@@ -9,10 +8,11 @@ from typing import Any
 from .cancellation import CancellationManager, CancellationToken
 from .config import Settings
 from .db import Database
-from .models import AdapterRegistry, AssistantTurn, ModelError, ToolCall
+from .execution import ToolExecutor, ToolOutcome
+from .models import AdapterRegistry, ModelError, ToolCall
 from .policy import RiskPolicy
 from .routing import ModelRouter
-from .tools import ToolRegistry, ToolResult
+from .tools import ToolRegistry
 from .trading.service import TradingService
 
 
@@ -49,6 +49,7 @@ class AgentService:
         self.cancellation = cancellation or CancellationManager()
         self.router = router or ModelRouter(settings, adapters, database)
         self.trading = trading
+        self.executor = ToolExecutor(settings, database, tools, policy)
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def _default_model(self, provider: str) -> str:
@@ -223,52 +224,23 @@ class AgentService:
                 return self._response(conversation_id, assistant_message, "completed", active_provider, active_model, events=events)
 
             call = calls[0]
-            decision = self.policy.evaluate(call.name, call.arguments)
-            safe_arguments = self.policy.sanitize_arguments(call.arguments)
+            outcome = await self.executor.run(call, conversation_id=conversation_id)
             base_event = {
-                "tool_name": call.name, "tool_call_id": call.id, "risk_level": decision.risk_level.value,
-                "reason": decision.reason, "arguments": safe_arguments,
+                "tool_name": call.name, "tool_call_id": call.id, "risk_level": outcome.decision.risk_level.value,
+                "reason": outcome.decision.reason, "arguments": outcome.safe_arguments,
             }
-            if not decision.allowed:
-                result = ToolResult(False, error=decision.reason, sensitive=decision.sensitive)
-                self._record_tool_result(conversation_id, call, result, decision.sensitive)
+            if outcome.status == "blocked":
+                self._record_tool_result(conversation_id, outcome)
                 events.append({**base_event, "status": "blocked"})
-                self.database.add_audit(
-                    "tool", "blocked", decision.reason, conversation_id=conversation_id, tool_name=call.name,
-                    risk_level=decision.risk_level.value, details={"arguments": safe_arguments},
-                )
                 continue
-
-            if decision.approval_required:
-                approval = self.database.create_approval(
-                    conversation_id=conversation_id, tool_name=call.name, tool_call_id=call.id,
-                    risk_level=decision.risk_level.value, reason=decision.reason, arguments=call.arguments,
-                    ttl_minutes=self.settings.approval_ttl_minutes,
-                )
-                public_approval = self.public_approval(approval)
-                events.append({**base_event, "status": "awaiting_approval", "approval_id": approval["id"]})
-                self.database.add_audit(
-                    "approval", "pending", decision.reason, conversation_id=conversation_id, tool_name=call.name,
-                    risk_level=decision.risk_level.value,
-                    details={"approval_id": approval["id"], "request_hash": approval["request_hash"], "arguments": safe_arguments},
-                )
+            if outcome.status == "awaiting_approval":
+                events.append({**base_event, "status": "awaiting_approval", "approval_id": outcome.approval_id})
                 return self._response(
                     conversation_id, assistant_message, "awaiting_approval", active_provider, active_model,
-                    approvals=[public_approval], events=events,
+                    approvals=[self.public_approval(outcome.approval or {})], events=events,
                 )
-
-            result = await asyncio.to_thread(self.tools.execute, call.name, call.arguments, approved=False)
-            self._record_tool_result(conversation_id, call, result, decision.sensitive)
-            events.append({**base_event, "status": "completed" if result.ok else "failed", "result": self._public_result(result)})
-            self.database.add_audit(
-                "tool", "completed" if result.ok else "failed", f"Tool {call.name} {'completed' if result.ok else 'failed'}",
-                conversation_id=conversation_id, tool_name=call.name, risk_level=decision.risk_level.value,
-                details={
-                    "arguments": safe_arguments, "ok": result.ok, "error": result.error,
-                    "truncated": result.truncated, "sensitive": decision.sensitive,
-                    "result_metadata": self._audit_result_metadata(result),
-                },
-            )
+            self._record_tool_result(conversation_id, outcome)
+            events.append({**base_event, "status": "completed" if outcome.ok else "failed", "result": outcome.public_result()})
 
         content = f"I stopped after {self.settings.max_tool_iterations} tool steps to keep this run bounded. Ask me to continue if needed."
         assistant_message = self.database.add_message(conversation_id, "assistant", content, metadata={"bounded": True})
@@ -276,14 +248,9 @@ class AgentService:
         return self._response(conversation_id, assistant_message, "bounded", active_provider, active_model, events=events)
 
     async def resolve_approval(self, approval_id: str, decision: str, note: str = "") -> dict[str, Any]:
-        record = self.database.authorize_approval(approval_id, decision, note)
+        record = self.database.get_approval(approval_id)
         if record is None:
             raise KeyError("Approval not found")
-        if decision == "approved" and record["status"] != "executing":
-            raise RuntimeError(f"Approval is already {record['status']}")
-        if decision == "denied" and record["status"] != "denied":
-            raise RuntimeError(f"Approval is already {record['status']}")
-
         conversation_id = record.get("conversation_id")
         if not conversation_id:
             raise RuntimeError("Approval is not bound to a conversation")
@@ -292,79 +259,26 @@ class AgentService:
             raise RuntimeError("Approval's conversation no longer exists")
 
         async with self._locks[conversation_id]:
-            if decision == "denied":
-                result = ToolResult(False, error="The user denied this action.")
-                call = ToolCall(record["tool_call_id"], record["tool_name"], record["arguments"])
-                self._record_tool_result(conversation_id, call, result, False)
-                self.database.add_audit(
-                    "approval", "denied", "User denied tool execution", actor="user", conversation_id=conversation_id,
-                    tool_name=record["tool_name"], risk_level=record["risk_level"], details={"approval_id": approval_id, "note": note[:1000]},
-                )
-                return await self._run_loop(conversation_id, conversation["provider"], conversation["model"])
-
-            expected_hash = self.database.approval_hash(conversation_id, record["tool_name"], record["arguments"], record["tool_call_id"])
-            if expected_hash != record["request_hash"]:
-                self.database.set_approval_result(approval_id, {"ok": False, "error": "Approval binding mismatch"}, "blocked")
-                self.database.add_audit(
-                    "approval", "blocked", "Approval binding mismatch", conversation_id=conversation_id,
-                    tool_name=record["tool_name"], risk_level="critical", details={"approval_id": approval_id},
-                )
+            # The executor owns single-use, hash-binding and re-evaluation;
+            # this loop only decides how a refusal reads to the chat.
+            outcome = await self.executor.resolve(approval_id, decision, note)
+            if outcome.status == "binding_mismatch":
                 raise RuntimeError("Approval binding mismatch; action was not executed")
-
-            fresh = self.policy.evaluate(record["tool_name"], record["arguments"])
-            if not fresh.allowed:
-                self.database.set_approval_result(approval_id, {"ok": False, "error": fresh.reason}, "blocked")
-                raise RuntimeError(f"Action is now blocked by policy: {fresh.reason}")
-            call = ToolCall(record["tool_call_id"], record["tool_name"], record["arguments"])
-            result = await asyncio.to_thread(self.tools.execute, call.name, call.arguments, approved=True)
-            result.sensitive = result.sensitive or fresh.sensitive
-            self._record_tool_result(conversation_id, call, result, fresh.sensitive)
-            self.database.set_approval_result(approval_id, self._public_result(result), "executed" if result.ok else "failed")
-            self.database.add_audit(
-                "approval", "executed" if result.ok else "failed", "Approved tool call executed",
-                actor="user", conversation_id=conversation_id, tool_name=call.name, risk_level=fresh.risk_level.value,
-                details={
-                    "approval_id": approval_id, "request_hash": record["request_hash"], "ok": result.ok,
-                    "error": result.error, "sensitive": fresh.sensitive,
-                    "result_metadata": self._audit_result_metadata(result),
-                },
-            )
-            # Sensitive values never re-enter model context, including for a
-            # local provider. The persisted tool result is an omission marker.
+            if outcome.status == "policy_blocked":
+                raise RuntimeError(f"Action is now blocked by policy: {outcome.error}")
+            self._record_tool_result(conversation_id, outcome)
             return await self._run_loop(conversation_id, conversation["provider"], conversation["model"])
 
-    def _record_tool_result(self, conversation_id: str, call: ToolCall, result: ToolResult, sensitive: bool) -> dict[str, Any]:
-        content = "[Sensitive tool result omitted from persistent history.]" if sensitive else result.model_text()
+    def _record_tool_result(self, conversation_id: str, outcome: ToolOutcome) -> dict[str, Any]:
+        result = outcome.result
         return self.database.add_message(
-            conversation_id, "tool", content, tool_name=call.name, tool_call_id=call.id,
-            metadata={"ok": result.ok, "sensitive": sensitive, "truncated": result.truncated},
+            conversation_id, "tool", outcome.model_text(), tool_name=outcome.call.name, tool_call_id=outcome.call.id,
+            metadata={"ok": bool(result and result.ok), "sensitive": outcome.sensitive,
+                      "truncated": bool(result and result.truncated)},
         )
 
-    @staticmethod
-    def _public_result(result: ToolResult) -> dict[str, Any]:
-        if result.sensitive:
-            return {"ok": result.ok, "output": "[Sensitive output hidden]", "error": result.error, "sensitive": True, "truncated": result.truncated}
-        return result.as_dict()
-
-    @staticmethod
-    def _audit_result_metadata(result: ToolResult) -> dict[str, Any]:
-        if result.sensitive or not isinstance(result.output, dict):
-            return {"sensitive": result.sensitive}
-        allowed_keys = {
-            "path", "bytes", "created", "overwritten", "deleted", "recoverable", "backup",
-            "before_sha256", "after_sha256", "exit_code", "cwd", "url", "opened", "application", "pid",
-        }
-        return {key: value for key, value in result.output.items() if key in allowed_keys}
-
     def public_approval(self, record: dict[str, Any]) -> dict[str, Any]:
-        return {
-            **{key: value for key, value in record.items() if key not in {"arguments", "result"}},
-            "arguments": self.policy.sanitize_arguments(record.get("arguments") or {}),
-            "result": None if record.get("result") is None else {
-                "ok": record["result"].get("ok"), "error": record["result"].get("error"),
-                "sensitive": record["result"].get("sensitive", False),
-            },
-        }
+        return self.executor.public_approval(record)
 
     def _response(
         self,

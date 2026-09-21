@@ -27,6 +27,55 @@ class PolicyDecision:
     sensitive: bool = False
 
 
+# Provider keys are recognisable by shape alone, so a bare key written into a
+# file is caught even when no nearby variable name hints at it.
+SECRET_SHAPE = re.compile(
+    r"(?:sk-or-v1-[A-Za-z0-9._-]{16,}"          # OpenRouter
+    r"|sk-ant-[A-Za-z0-9._-]{16,}"              # Anthropic
+    r"|sk-proj-[A-Za-z0-9._-]{16,}"             # OpenAI project
+    r"|sk-[A-Za-z0-9]{32,}"                     # OpenAI classic
+    r"|gh[pousr]_[A-Za-z0-9]{30,}"              # GitHub
+    r"|AKIA[0-9A-Z]{16}"                        # AWS access key id
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"            # Slack
+    r"|AIza[0-9A-Za-z._-]{30,})"                # Google
+)
+SECRET_ASSIGNMENT = re.compile(
+    # The name prefix is optional so a bare "password: ..." is caught as well
+    # as "OPENAI_API_KEY=...". A diff line's leading +/- is tolerated.
+    r"(?im)^(\s*[-+]?\s*(?:export\s+)?[A-Za-z0-9_]*"
+    r"(?:password|passwd|secret|token|api[_-]?key|credential|private[_-]?key)[A-Za-z0-9_]*\s*[:=]\s*)"
+    r"(\S.*)$"
+)
+
+
+def redact_secrets(text: str) -> tuple[str, int]:
+    """Blank out credential-looking values in free text.
+
+    Diffs and command output flow straight into model context and the UI, so
+    a value that merely looks like a key is replaced rather than risked. The
+    count is returned so callers can tell the user redaction happened instead
+    of silently altering what they asked to see.
+    """
+    if not text:
+        return text, 0
+    redactions = 0
+
+    def mask_assignment(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return f"{match.group(1)}[REDACTED]"
+
+    result = SECRET_ASSIGNMENT.sub(mask_assignment, text)
+
+    def mask_shape(match: re.Match[str]) -> str:
+        nonlocal redactions
+        redactions += 1
+        return "[REDACTED]"
+
+    result = SECRET_SHAPE.sub(mask_shape, result)
+    return result, redactions
+
+
 _CREDENTIAL_NAMES = {
     ".env", ".env.local", ".env.production", "credentials", "credentials.json",
     "id_rsa", "id_ed25519", "known_hosts", ".npmrc", ".pypirc", ".netrc",
@@ -161,7 +210,35 @@ class RiskPolicy:
             )
         if tool_name in {"remember", "recall", "create_plan"}:
             return PolicyDecision(True, False, RiskLevel.LOW, "Local planning and memory action.")
+        if tool_name in {"project_map", "git_status", "git_log", "list_capabilities"}:
+            return PolicyDecision(True, False, RiskLevel.LOW, "Read-only inspection of the project and this machine.")
+        if tool_name == "git_diff":
+            # Diffs are read-only but can carry credential values from a
+            # tracked .env, so the tool redacts before returning.
+            return PolicyDecision(True, False, RiskLevel.LOW, "Read-only diff; credential-shaped values are redacted.")
+        if tool_name == "run_tests":
+            return self._run_tests_policy(arguments)
         return PolicyDecision(False, False, RiskLevel.HIGH, f"Unknown tool: {tool_name}")
+
+    def _run_tests_policy(self, arguments: dict[str, Any]) -> PolicyDecision:
+        """Running a project's own declared checks is the heart of autonomous
+        verification, so it is allowed without a prompt. An arbitrary override
+        command is a different thing entirely and is gated like any shell."""
+        override = str(arguments.get("command", "")).strip()
+        raw_path = str(arguments.get("path", "."))
+        candidate = Path(raw_path).expanduser()
+        resolved = candidate.resolve(strict=False) if candidate.is_absolute() else (self.workspace / candidate).resolve(strict=False)
+        if not resolved.is_relative_to(self.workspace):
+            return PolicyDecision(True, True, RiskLevel.HIGH, "Running checks outside the configured workspace requires explicit approval.")
+        if override:
+            decision = self._command_policy(override)
+            if not decision.allowed:
+                return decision
+            return PolicyDecision(True, True, RiskLevel.MEDIUM, "An explicit test command is arbitrary execution and needs approval.")
+        return PolicyDecision(
+            True, False, RiskLevel.MEDIUM,
+            "Runs only the test/build/lint command the project itself declares, inside the workspace.",
+        )
 
     def _browser_policy(self, arguments: dict[str, Any]) -> PolicyDecision:
         start_url = str(arguments.get("url", ""))

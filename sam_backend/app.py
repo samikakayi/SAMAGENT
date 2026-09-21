@@ -13,14 +13,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from .agent import AgentService
+from .agent_api import AgentApi
+from .autonomy import AutonomousOrchestrator
 from .cancellation import CancellationManager
+from .capabilities import CapabilityRegistry
 from .config import Settings, is_elevated_windows_process
 from .contracts import ExecutionStatus
 from .dpi import ensure_dpi_awareness, status as dpi_status
 from .db import Database
 from .models import AdapterRegistry
 from .policy import RiskPolicy
+from .project_map import ProjectScanner
 from .routing import ModelRouter
+from .tasks import TaskStore
+from .verification import VerificationEngine
 from .schemas import (
     ApprovalDecision,
     BacktestRequest,
@@ -132,10 +138,30 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         computer_control=settings.computer_control_enabled,
         screen_access=settings.screen_access_enabled,
     )
-    tools = ToolRegistry(settings, database, trading=trading, windows=windows, cancellation=cancellation)
+    # One scanner/verifier/registry is shared by the tools and the
+    # orchestrator so a project is fingerprinted once per change, not once per
+    # caller.
+    scanner = ProjectScanner()
+    verifier = VerificationEngine()
+    capability_registry = CapabilityRegistry()
+    tools = ToolRegistry(
+        settings, database, trading=trading, windows=windows, cancellation=cancellation,
+        scanner=scanner, verifier=verifier, capabilities=capability_registry,
+    )
     adapters = adapters or AdapterRegistry(settings)
     router = ModelRouter(settings, adapters, database)
     agent = AgentService(settings, database, tools, policy, adapters, router, trading, cancellation)
+    task_store = TaskStore(database)
+    orchestrator = AutonomousOrchestrator(
+        settings, database, tools, policy, router,
+        store=task_store, scanner=scanner, verifier=verifier, capabilities=capability_registry,
+        cancellation=cancellation,
+    )
+    agent_api = AgentApi(
+        settings=settings, database=database, orchestrator=orchestrator, scanner=scanner,
+        verifier=verifier, capabilities=capability_registry, cancellation=cancellation,
+        adapters=lambda: application.state.adapters,
+    )
     secret_store = SecretStore(settings.data_dir)
     # The Sorani providers are configured by key, so the voice service resolves
     # them from the store on use rather than at construction.
@@ -182,6 +208,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     @asynccontextmanager
     async def lifespan(active_app: FastAPI):
         monitor_stop.clear()
+        await agent_api.startup()
         active_app.state.monitor_task = asyncio.create_task(setup_monitor_worker())
         try:
             yield
@@ -190,6 +217,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
             task = getattr(active_app.state, "monitor_task", None)
             if task:
                 await task
+            agent_api.shutdown()
 
     application = FastAPI(
         title="SAM Local Agent API",
@@ -213,6 +241,12 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     application.state.voice = voice
     application.state.secrets = secret_store
     application.state.replay = replay
+    application.state.orchestrator = orchestrator
+    application.state.tasks = task_store
+    application.state.scanner = scanner
+    application.state.capabilities = capability_registry
+    application.state.agent_api = agent_api
+    application.include_router(agent_api.router)
     application.state.started_at = time.monotonic()
 
     application.add_middleware(
@@ -432,6 +466,23 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
 
     @application.post("/api/approvals/{approval_id}/decision")
     async def decide_approval(approval_id: str, payload: ApprovalDecision) -> dict[str, Any]:
+        """Resolve any pending approval, from whichever panel raised it.
+
+        Chat turns and autonomous runs both queue approvals into one table, so
+        this dispatches on the recorded owner rather than assuming a
+        conversation exists.
+        """
+        record = database.get_approval(approval_id)
+        if record is None:
+            raise HTTPException(404, "Approval not found")
+        owning_task = record.get("task_id")
+        if owning_task:
+            agent_api.schedule_approval(owning_task, approval_id, payload.decision, payload.note)
+            return {
+                "approval": agent.public_approval(database.get_approval(approval_id) or {}),
+                "task_id": owning_task,
+                "accepted": True,
+            }
         try:
             result = await agent.resolve_approval(approval_id, payload.decision, payload.note)
             record = database.get_approval(approval_id)
@@ -1066,13 +1117,6 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         database.add_audit("emergency_stop", "executed", "Emergency stop cancelled active work", actor="user", details={**outcome, "stopped_monitors": stopped_monitors})
         return {"aborted": True, **outcome, "stopped_monitors": stopped_monitors}
 
-    @application.post("/api/tasks/{task_id}/cancel")
-    async def cancel_task(task_id: str) -> dict[str, Any]:
-        cancelled = cancellation.cancel(task_id, "user")
-        if not cancelled:
-            raise HTTPException(404, "Active task not found")
-        return {"cancelled": True, "task_id": task_id}
-
     @application.post("/api/desktop/action")
     async def api_desktop_action(request: Request) -> dict[str, Any]:
         payload = await request.json()
@@ -1099,10 +1143,12 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
             await websocket.close(code=1008)
             return
         await websocket.accept()
+        await agent_api.hub.add(websocket)
         await websocket.send_json({
             "type": "state",
             "state": "IDLE",
             "tasks": cancellation.snapshot(),
+            "agent_tasks": task_store.list(limit=10),
             "trading": database.get_trading_context(),
         })
         try:
@@ -1123,6 +1169,8 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
                     })
         except WebSocketDisconnect:
             return
+        finally:
+            await agent_api.hub.remove(websocket)
 
     frontend_candidates = [
         settings.project_root / "frontend" / "dist",

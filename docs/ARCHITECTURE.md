@@ -5,10 +5,23 @@ conversation data, memory, approvals, and audit events are stored locally in
 SQLite.
 
 ```text
-Browser UI (127.0.0.1)
+Browser UI (127.0.0.1)  <--- live activity over /ws/live
         |
         v
-Local API / Agent loop
+Local API
+        |---- Agent loop (chat turns) ------.
+        |                                    |
+        |---- Autonomous orchestrator -------+--> ToolExecutor --> Policy
+        |         (multi-step goals)              (one owner of        |
+        |                                          tool safety)        v
+        |                                                        Approval queue
+        |         |
+        |         |-- Project scanner --- cached project map
+        |         |-- Planner ----------- plan / re-plan
+        |         |-- Context engine ---- bounded per-step prompt
+        |         |-- Task store -------- durable state + timeline
+        |         `-- Verifier ---------- runs the project's own checks
+        |
         |---- Model router ----- Ollama / LiteLLM / OpenRouter / OpenAI
         |
         `---- Tool broker ---- Policy engine ---- Approval queue
@@ -40,8 +53,27 @@ Local API / Agent loop
 
 ## Main components
 
-- `sam_backend/app.py`: local HTTP API and static UI hosting.
-- `sam_backend/agent.py`: bounded model/tool loop and planning context.
+- `sam_backend/app.py`: local HTTP API, service wiring and static UI hosting.
+- `sam_backend/agent_api.py`: HTTP surface for autonomous runs (tasks, project
+  map, environment) plus the live-event fan-out and the background-run
+  registry. Wired into `create_app` as a router.
+- `sam_backend/execution.py`: the single owner of "safely run a tool call" --
+  policy, approvals, execution and audit.
+- `sam_backend/agent.py`: bounded model/tool loop for conversational turns.
+- `sam_backend/autonomy.py`: the autonomous orchestrator -- the understand ->
+  scan -> plan -> execute -> validate -> fix -> retry loop.
+- `sam_backend/planner.py`: model-driven planning and re-planning, with a
+  deterministic fallback so planning never hard-fails.
+- `sam_backend/tasks.py`: durable task state, a validated state machine, and
+  the activity timeline the UI renders.
+- `sam_backend/project_map.py`: cached project intelligence (structure,
+  dependencies, commands, routes, tests, git state).
+- `sam_backend/verification.py`: runs the project's own checks and parses them
+  into a structured verdict.
+- `sam_backend/context_engine.py`: assembles a bounded, relevant prompt per
+  step instead of replaying the whole conversation.
+- `sam_backend/capabilities.py`: probes which developer tools and model
+  providers this machine can actually use.
 - `sam_backend/models.py` and `routing.py`: Ollama, LiteLLM, OpenRouter, and
   OpenAI adapters, capability routing, fallback, and cost budgets.
 - `sam_backend/trading/`: read-only MT5 data, deterministic indicators,
@@ -76,3 +108,61 @@ policy rule before exposing it to a model. A tool without an explicit policy is
 denied. Prefer narrow tools such as `read_file` and `apply_patch` over a shell
 command. Never put API keys, cookies, passwords, or approval tokens in a tool
 description, prompt, model-visible result, or audit record.
+
+
+## Autonomous runs
+
+A goal posted to `POST /api/tasks` starts a run that outlives the request.
+The orchestrator moves it through a validated state machine
+(`IDLE -> UNDERSTANDING -> SCANNING -> PLANNING -> EXECUTING -> OBSERVING ->
+VALIDATING -> COMPLETED`, with `FIXING`/`RETRYING` on failure and
+`WAITING_FOR_APPROVAL` when policy demands a human decision). Every
+transition and event is persisted, so a run can be inspected afterwards,
+survives a restart, and resumes after an approval.
+
+Three independent bounds stop a run: tool steps, self-heal retries, and
+re-plans. Exhausting one reports honestly rather than continuing silently.
+
+Completion is earned. A task is only `completed_verified` when the
+verification engine actually executed the project's declared checks and they
+passed; when nothing could be verified the run reports
+`completed_unverified` and says so in its summary.
+
+### Secret handling in the new surfaces
+
+- The project map records environment variable *names* only; no `.env` value
+  is ever read into it, because the map is summarised into model prompts.
+- `git_diff` output passes through `redact_secrets` before it reaches the
+  model or the UI, so a tracked credential cannot leak through a diff.
+
+
+## Structure of the autonomous stack
+
+Both loops -- the conversational one in `agent.py` and the orchestrator in
+`autonomy.py` -- call **one** `ToolExecutor` (`execution.py`) to run a tool.
+It evaluates policy, queues an approval when one is required, and on
+resolution enforces the three guarantees that make an approval meaningful:
+single use (a second click cannot replay the tool), hash binding (the request
+must still match the tool and arguments it was issued for), and re-evaluation
+(policy runs again at execution time). It writes the tool and approval audit
+entries and decides what counts as sensitive.
+
+The loops never re-implement that sequence. They consume a `ToolOutcome` and
+decide only how the result *reads* -- a chat message, or a timeline event and
+a state transition. That split is why the two can no longer drift apart the
+way they did when each carried its own copy.
+
+Ownership, so later passes do not duplicate it again:
+
+| Concern | Owner |
+| --- | --- |
+| Tool safety: policy, approvals, audit, sensitivity | `execution.ToolExecutor` |
+| Run state, plan, timeline, checkpoints | `tasks.TaskStore` / `AgentTask` |
+| Driving a run; one driver per task id | `autonomy.AutonomousOrchestrator` |
+| HTTP shape of runs; background drivers; live fan-out | `agent_api.AgentApi` |
+| Which checks exist and what they prove | `verification.VerificationEngine` |
+| Service construction and wiring | `app.create_app` |
+
+Data flows one way: HTTP -> orchestrator -> executor -> tools, with results
+travelling back as `ToolOutcome` and reaching the UI as task events. The API
+layer holds no run state; the orchestrator holds no HTTP concerns.

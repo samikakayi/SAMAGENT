@@ -36,6 +36,18 @@ class Database:
         finally:
             connection.close()
 
+    @contextmanager
+    def write(self) -> Iterator[sqlite3.Connection]:
+        """Serialised write transaction, committed on clean exit.
+
+        Modules that own their own tables (the task store, for example) use
+        this rather than reaching for the private write lock, so every writer
+        still serialises through one place.
+        """
+        with self._write_lock, self.connect() as connection:
+            yield connection
+            connection.commit()
+
     def migrate(self) -> None:
         schema = """
         PRAGMA journal_mode=WAL;
@@ -72,6 +84,7 @@ class Database:
         CREATE TABLE IF NOT EXISTS approvals (
             id TEXT PRIMARY KEY,
             conversation_id TEXT,
+            task_id TEXT,
             tool_name TEXT NOT NULL,
             tool_call_id TEXT NOT NULL DEFAULT '',
             risk_level TEXT NOT NULL,
@@ -198,6 +211,12 @@ class Database:
         with self._write_lock, self.connect() as connection:
             connection.executescript(schema)
             approval_columns = {row[1] for row in connection.execute("PRAGMA table_info(approvals)")}
+            # An approval belongs to whichever runtime raised it. Without this
+            # the chat loop and the autonomous orchestrator cannot tell each
+            # other's requests apart, and resolving one through the wrong
+            # resolver fails.
+            if "task_id" not in approval_columns:
+                connection.execute("ALTER TABLE approvals ADD COLUMN task_id TEXT")
             if "tool_call_id" not in approval_columns:
                 connection.execute("ALTER TABLE approvals ADD COLUMN tool_call_id TEXT NOT NULL DEFAULT ''")
             if "request_hash" not in approval_columns:
@@ -408,15 +427,16 @@ class Database:
         reason: str,
         arguments: dict[str, Any],
         ttl_minutes: int,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
         approval_id = self._id("apr")
         now_dt = datetime.now(UTC)
         request_hash = self.approval_hash(conversation_id, tool_name, arguments, tool_call_id)
         with self._write_lock, self.connect() as connection:
             connection.execute(
-                "INSERT INTO approvals(id,conversation_id,tool_name,tool_call_id,risk_level,reason,arguments_json,request_hash,status,requested_at,expires_at) "
-                "VALUES(?,?,?,?,?,?,?,?, 'pending',?,?)",
-                (approval_id, conversation_id, tool_name, tool_call_id, risk_level, reason, json.dumps(arguments), request_hash, now_dt.isoformat(), (now_dt + timedelta(minutes=ttl_minutes)).isoformat()),
+                "INSERT INTO approvals(id,conversation_id,task_id,tool_name,tool_call_id,risk_level,reason,arguments_json,request_hash,status,requested_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?, 'pending',?,?)",
+                (approval_id, conversation_id, task_id, tool_name, tool_call_id, risk_level, reason, json.dumps(arguments), request_hash, now_dt.isoformat(), (now_dt + timedelta(minutes=ttl_minutes)).isoformat()),
             )
             connection.commit()
         return self.get_approval(approval_id) or {}

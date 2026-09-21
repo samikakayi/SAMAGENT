@@ -18,10 +18,13 @@ from urllib.parse import urlparse
 
 from .browser_automation import BrowserAutomationError, run_browser_workflow
 from .cancellation import CancellationManager
+from .capabilities import CapabilityRegistry
 from .config import Settings
 from .contracts import ExecutionStatus, ToolManifest
 from .db import Database
-from .policy import RiskPolicy, windows_path_violation
+from .policy import RiskPolicy, redact_secrets, windows_path_violation
+from .project_map import ProjectScanner, run_git
+from .verification import VerificationEngine
 from .trading.drawing import Layer, SEMANTIC_TYPES, TWO_ANCHOR_TYPES
 from .trading.service import TradingService
 from .windows_control import WindowsController
@@ -57,6 +60,9 @@ class ToolRegistry:
         trading: TradingService | None = None,
         windows: WindowsController | None = None,
         cancellation: CancellationManager | None = None,
+        scanner: ProjectScanner | None = None,
+        verifier: VerificationEngine | None = None,
+        capabilities: CapabilityRegistry | None = None,
     ):
         self.settings = settings
         self.database = database
@@ -64,6 +70,11 @@ class ToolRegistry:
         self.windows = windows
         self.cancellation = cancellation
         self.workspace = settings.workspace_root.resolve()
+        # Engineering collaborators are shared with the orchestrator so the
+        # project map is scanned once per change, not once per tool call.
+        self.scanner = scanner or ProjectScanner()
+        self.verifier = verifier or VerificationEngine()
+        self.capabilities = capabilities or CapabilityRegistry()
         self._handlers: dict[str, Callable[[dict[str, Any], bool], ToolResult]] = {
             "list_files": self._list_files,
             "search_files": self._search_files,
@@ -79,6 +90,12 @@ class ToolRegistry:
             "remember": self._remember,
             "recall": self._recall,
             "create_plan": self._create_plan,
+            "project_map": self._project_map,
+            "git_status": self._git_status,
+            "git_diff": self._git_diff,
+            "git_log": self._git_log,
+            "run_tests": self._run_tests,
+            "list_capabilities": self._list_capabilities,
         }
         if trading is not None:
             self._handlers.update({
@@ -185,6 +202,32 @@ class ToolRegistry:
             ("create_plan", "Create a structured task plan without executing it.", _schema({
                 "goal": {"type": "string"}, "steps": {"type": "array", "items": {"type": "string"}},
             }, ["goal", "steps"])),
+            ("project_map", "Understand a project: structure, languages, dependencies, commands, API routes, test suites and git state. Cached; prefer this over listing files one by one.", _schema({
+                "path": {"type": "string", "default": "."},
+                "refresh": {"type": "boolean", "default": False},
+                "detail": {"type": "string", "enum": ["summary", "full"], "default": "summary"},
+            })),
+            ("git_status", "Show the working tree status: branch, staged, modified and untracked files.", _schema({
+                "path": {"type": "string", "default": "."},
+            })),
+            ("git_diff", "Show a unified diff of uncommitted changes, optionally for one path.", _schema({
+                "path": {"type": "string", "default": "."},
+                "target": {"type": "string", "default": ""},
+                "staged": {"type": "boolean", "default": False},
+            })),
+            ("git_log", "Show recent commits for orientation.", _schema({
+                "path": {"type": "string", "default": "."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            })),
+            ("run_tests", "Run the project's own declared checks (test/build/lint/typecheck) and return a parsed verdict.", _schema({
+                "path": {"type": "string", "default": "."},
+                "kinds": {"type": "array", "items": {"type": "string", "enum": ["test", "build", "lint", "typecheck"]}, "maxItems": 4},
+                "command": {"type": "string", "default": ""},
+                "timeout_seconds": {"type": "integer", "minimum": 5, "maximum": 1800, "default": 600},
+            })),
+            ("list_capabilities", "List which developer tools and runtimes are actually installed on this machine.", _schema({
+                "category": {"type": "string", "default": ""},
+            })),
             ("market_snapshot", "Read an exact current MetaTrader 5 snapshot with feed metadata.", _schema({
                 "symbol": {"type": "string", "default": "XAUUSD"},
                 "timeframes": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
@@ -280,7 +323,7 @@ class ToolRegistry:
     @property
     def manifests(self) -> list[dict[str, Any]]:
         destructive = {"delete_path", "stop_process", "window_action", "clear_sam_drawings"}
-        cancellable = {"run_terminal", "run_python", "browser_automate", "analyze_market", "draw_analysis_on_chart", "clear_sam_drawings", "backtest_strategy"}
+        cancellable = {"run_terminal", "run_python", "browser_automate", "analyze_market", "draw_analysis_on_chart", "clear_sam_drawings", "backtest_strategy", "run_tests"}
         permission_classes = {
             "list_files": "filesystem", "search_files": "filesystem", "read_file": "filesystem", "write_file": "filesystem",
             "replace_text": "filesystem", "delete_path": "destructive_actions", "run_terminal": "shell", "run_python": "shell",
@@ -296,6 +339,8 @@ class ToolRegistry:
             "draw_tradingview_level": "desktop", "draw_tradingview_object": "desktop", "draw_analysis_on_chart": "desktop",
             "list_sam_drawings": "memory", "clear_sam_drawings": "destructive_actions", "set_chart_layer": "memory",
             "create_plan": "planning", "emergency_stop": "safety",
+            "project_map": "filesystem", "git_status": "filesystem", "git_diff": "filesystem",
+            "git_log": "filesystem", "run_tests": "shell", "list_capabilities": "agent",
         }
         result = []
         for spec in self.specs:
@@ -639,6 +684,106 @@ class ToolRegistry:
         if not goal or not steps:
             raise ValueError("goal and at least one step are required")
         return ToolResult(True, {"goal": goal, "steps": [{"index": index, "status": "pending", "text": step} for index, step in enumerate(steps, 1)]})
+
+    # -- project intelligence and engineering ------------------------------
+
+    def _project_map(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        root = self._resolve(str(arguments.get("path", ".")), approved=approved, must_exist=True)
+        project_map = self.scanner.scan(root, force=bool(arguments.get("refresh", False)))
+        if str(arguments.get("detail", "summary")) == "full":
+            return ToolResult(True, project_map.as_dict())
+        # The summary view is what a model should normally read: the full map
+        # of a large repository would dominate the context window.
+        payload = project_map.as_dict()
+        for heavy in ("tree", "dependencies", "scripts"):
+            payload.pop(heavy, None)
+        payload["api_routes"] = payload["api_routes"][:40]
+        payload["summary"] = project_map.summary_text()
+        return ToolResult(True, payload)
+
+    def _git_root(self, arguments: dict[str, Any], approved: bool) -> Path:
+        root = self._resolve(str(arguments.get("path", ".")), approved=approved, must_exist=True)
+        if not (root / ".git").exists():
+            # Walk up: the agent is often pointed at a subdirectory of a repo.
+            for parent in root.parents:
+                if (parent / ".git").exists():
+                    return parent
+            raise FileNotFoundError(f"{root} is not inside a git repository")
+        return root
+
+    def _git_status(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        root = self._git_root(arguments, approved)
+        porcelain = run_git(root, "status", "--porcelain=v1", "--branch")
+        entries: list[dict[str, str]] = []
+        branch = ""
+        for line in porcelain.splitlines():
+            if line.startswith("##"):
+                branch = line[2:].strip()
+                continue
+            if len(line) > 3:
+                entries.append({"code": line[:2].strip() or "??", "path": line[3:].strip()})
+        return ToolResult(True, {
+            "root": str(root), "branch": branch, "changed": entries, "clean": not entries,
+            "head": run_git(root, "rev-parse", "--short", "HEAD").strip(),
+        })
+
+    def _git_diff(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        root = self._git_root(arguments, approved)
+        command = ["diff"]
+        if bool(arguments.get("staged", False)):
+            command.append("--cached")
+        target = str(arguments.get("target", "")).strip()
+        if target:
+            command.extend(["--", target])
+        raw_diff = run_git(root, *command, timeout=30)
+        # A tracked .env or a pasted key would otherwise travel straight into
+        # model context and the UI through the diff.
+        safe_diff, redactions = redact_secrets(raw_diff)
+        diff, truncated = self._truncate(safe_diff)
+        return ToolResult(True, {
+            "root": str(root), "diff": diff, "empty": not diff.strip(), "redactions": redactions,
+        }, truncated=truncated)
+
+    def _git_log(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        root = self._git_root(arguments, approved)
+        limit = max(1, min(50, int(arguments.get("limit", 10))))
+        raw = run_git(root, "log", f"-{limit}", "--pretty=format:%h%x1f%an%x1f%ar%x1f%s")
+        commits = []
+        for line in raw.splitlines():
+            parts = line.split("")
+            if len(parts) == 4:
+                commits.append({"hash": parts[0], "author": parts[1], "when": parts[2], "subject": parts[3]})
+        return ToolResult(True, {"root": str(root), "commits": commits})
+
+    def _run_tests(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        root = self._resolve(str(arguments.get("path", ".")), approved=approved, must_exist=True)
+        timeout = max(5, min(1800, int(arguments.get("timeout_seconds", 600))))
+        verifier = VerificationEngine(timeout=timeout, python_executable=self.verifier.python_executable)
+        explicit = str(arguments.get("command", "")).strip()
+        if explicit:
+            check = verifier.run_check("test", explicit, root, timeout=timeout)
+            return ToolResult(check.ok, check.as_dict(), None if check.ok else (check.reason or check.summary))
+        project_map = self.scanner.scan(root)
+        kinds = [str(kind) for kind in arguments.get("kinds", []) if str(kind)] or None
+        report = verifier.verify(project_map, root, kinds=kinds)
+        payload = report.as_dict()
+        payload["summary"] = report.summary_text()
+        # A report whose checks were all skipped is not a pass; the caller
+        # must be able to tell "nothing failed" from "nothing ran".
+        return ToolResult(
+            report.ok, payload,
+            None if report.ok else f"Verification failed: {report.summary_text()[:500]}",
+        )
+
+    def _list_capabilities(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        category = str(arguments.get("category", "")).strip() or None
+        payload = self.capabilities.as_dict()
+        if category:
+            payload["capabilities"] = {
+                name: item for name, item in payload["capabilities"].items() if item.get("category") == category
+            }
+        payload["summary"] = self.capabilities.summary_text()
+        return ToolResult(True, payload)
 
     @staticmethod
     def _standard_result(result: Any) -> ToolResult:
