@@ -19,29 +19,27 @@ when there was genuinely nothing to verify and that is stated plainly.
 from __future__ import annotations
 
 import asyncio
-import difflib
-import os
-import shutil
 import time
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .cancellation import CancellationManager
-from .capabilities import CapabilityRegistry
-from .config import Settings
-from .context_engine import ContextEngine
-from .db import Database
-from .execution import ApprovalStateError, ToolExecutor, ToolOutcome
-from .models import ModelError, ToolCall
-from .planner import Planner
-from .policy import RiskPolicy
-from .project_map import ProjectScanner
-from .tasks import AgentTask, TaskState, TaskStep, TaskStore
-from .tools import ToolRegistry
-from .ui_review import review_screenshot
-from .verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
+from ..cancellation import CancellationManager
+from ..capabilities import CapabilityRegistry
+from ..config import Settings
+from ..context_engine import ContextEngine
+from ..db import Database
+from ..execution import ApprovalStateError, ToolExecutor, ToolOutcome
+from ..models import ModelError, ToolCall
+from ..planner import Planner
+from ..policy import RiskPolicy
+from ..project_map import ProjectScanner
+from ..tasks import AgentTask, TaskState, TaskStep, TaskStore
+from ..tools import ToolRegistry
+from ..ui_review import review_screenshot
+from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
+from .checkpoints import MODIFYING_TOOLS, WorkspaceCheckpoints
 
 EXECUTOR_SYSTEM_PROMPT = """You are SAM, an autonomous software engineering agent executing one step of an approved plan.
 
@@ -55,8 +53,6 @@ Rules:
 - When the current step is genuinely finished and nothing further is needed, reply with a short plain-text summary and no tool call.
 - Never print, copy or store credentials."""
 
-
-MODIFYING_TOOLS = {"write_file", "replace_text", "delete_path"}
 
 
 class TaskAlreadyRunning(RuntimeError):
@@ -684,79 +680,29 @@ class AutonomousOrchestrator:
         return task
 
     # -- checkpoints, diff, rollback --------------------------------------
-    def _checkpoint_dir(self, task: AgentTask) -> Path:
-        return Path(self.settings.data_dir) / "checkpoints" / task.id
+    # The mechanics live in WorkspaceCheckpoints; what stays here is the
+    # orchestration around them: when to snapshot, what to tell the user, and
+    # what must not happen while a run is still driving.
 
-    def _target_path(self, arguments: dict[str, Any]) -> Path | None:
-        raw = str(arguments.get("path") or "").strip()
-        if not raw:
-            return None
-        path = Path(os.path.expandvars(raw)).expanduser()
-        return (path if path.is_absolute() else self.workspace / path).resolve(strict=False)
+    def _checkpoints_for(self, task: AgentTask) -> WorkspaceCheckpoints:
+        return WorkspaceCheckpoints(self.workspace, Path(self.settings.data_dir) / "checkpoints" / task.id)
 
     async def _checkpoint(self, task: AgentTask, call: ToolCall) -> None:
-        """Snapshot a file the first time this run is about to change it.
-
-        Taken before the tool runs, so the snapshot is exactly what the user
-        had -- including their own uncommitted edits -- which is what a
-        rollback must restore. git HEAD would be the wrong target.
-        """
-        if call.name not in MODIFYING_TOOLS:
+        """Snapshot a file the first time this run is about to change it."""
+        entry = await asyncio.to_thread(
+            self._checkpoints_for(task).snapshot, task.checkpoints, call.name, call.arguments,
+        )
+        if entry is None:
             return
-        target = self._target_path(call.arguments)
-        if target is None or any(item["path"] == str(target) for item in task.checkpoints):
-            return
-        entry: dict[str, Any] = {"path": str(target), "existed": target.is_file(), "snapshot": None}
-        if entry["existed"]:
-            directory = self._checkpoint_dir(task)
-            directory.mkdir(parents=True, exist_ok=True)
-            snapshot = directory / f"{len(task.checkpoints)}.bin"
-            await asyncio.to_thread(shutil.copyfile, target, snapshot)
-            entry["snapshot"] = str(snapshot)
         first = not task.checkpoints
         task.checkpoints.append(entry)
         self.store.save(task)
         if first:
-            await self._emit(task, "result", "Checkpoint recorded before the first file change", path=str(target))
-
-    def _relative(self, path: str) -> str:
-        try:
-            return Path(path).resolve().relative_to(self.workspace.resolve()).as_posix()
-        except ValueError:
-            return path
+            await self._emit(task, "result", "Checkpoint recorded before the first file change", path=entry["path"])
 
     def diff(self, task: AgentTask) -> dict[str, Any]:
-        """The run's own changes, file by file, against its checkpoints.
-
-        Computed from the snapshots rather than `git diff` because git would
-        fold in whatever the user had already changed in the same files, and
-        because the default workspace is not a repository at all.
-        """
-        preexisting = {item.replace("\\", "/") for item in task.preexisting_changes}
-        files = []
-        for entry in task.checkpoints:
-            target = Path(entry["path"])
-            before = Path(entry["snapshot"]).read_bytes() if entry.get("snapshot") else b""
-            after = target.read_bytes() if target.is_file() else b""
-            relative = self._relative(entry["path"])
-            unified = "".join(difflib.unified_diff(
-                before.decode("utf-8", "replace").splitlines(keepends=True),
-                after.decode("utf-8", "replace").splitlines(keepends=True),
-                fromfile=f"a/{relative}" if entry["existed"] else "/dev/null",
-                tofile=f"b/{relative}" if target.is_file() else "/dev/null",
-            ))
-            if entry["existed"] and not target.is_file():
-                status = "deleted"
-            elif not entry["existed"]:
-                status = "created"
-            else:
-                status = "modified" if before != after else "unchanged"
-            files.append({
-                "path": relative,
-                "status": status,
-                "diff": unified,
-                "had_user_changes": relative in preexisting,
-            })
+        """The run's own changes, file by file, against its checkpoints."""
+        files = self._checkpoints_for(task).diff(task.checkpoints, task.preexisting_changes)
         return {"task_id": task.id, "files": files, "rolled_back": task.rolled_back}
 
     async def rollback(self, task_id: str) -> dict[str, Any] | None:
@@ -768,15 +714,7 @@ class AutonomousOrchestrator:
             return {"rolled_back": False, "task_id": task_id, "reason": "Stop the task before rolling it back."}
         if task.rolled_back:
             return {"rolled_back": False, "task_id": task_id, "reason": "This run was already rolled back."}
-        restored: list[str] = []
-        for entry in task.checkpoints:
-            target = Path(entry["path"])
-            if entry.get("snapshot"):
-                target.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(shutil.copyfile, entry["snapshot"], target)
-            elif target.is_file():
-                target.unlink()
-            restored.append(self._relative(entry["path"]))
+        restored = await asyncio.to_thread(self._checkpoints_for(task).restore, task.checkpoints)
         task.rolled_back = True
         await self._emit(task, "fix", f"Rolled back {len(restored)} file(s) to their checkpoints", files=restored)
         self.store.save(task)

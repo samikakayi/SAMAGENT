@@ -60,8 +60,16 @@ Local API
 - `sam_backend/execution.py`: the single owner of "safely run a tool call" --
   policy, approvals, execution and audit.
 - `sam_backend/agent.py`: bounded model/tool loop for conversational turns.
-- `sam_backend/autonomy.py`: the autonomous orchestrator -- the understand ->
-  scan -> plan -> execute -> validate -> fix -> retry loop.
+- `sam_backend/autonomy/`: the autonomous runtime.
+  - `orchestrator.py` -- the understand -> scan -> plan -> execute -> validate
+    -> fix -> retry state machine, plus the lifecycle around it (single-driver
+    ownership, cancellation, approvals, restart handling).
+  - `checkpoints.py` -- workspace snapshot / diff / restore mechanics.
+- `sam_backend/tools/`: the tool layer.
+  - `registry.py` -- the engine: dispatch, workspace containment, process
+    execution and every handler.
+  - `catalogue.py` -- the data: model-facing schemas and per-tool permission
+    and manifest metadata.
 - `sam_backend/planner.py`: model-driven planning and re-planning, with a
   deterministic fallback so planning never hard-fails.
 - `sam_backend/tasks.py`: durable task state, a validated state machine, and
@@ -162,7 +170,25 @@ Ownership, so later passes do not duplicate it again:
 | HTTP shape of runs; background drivers; live fan-out | `agent_api.AgentApi` |
 | Which checks exist and what they prove | `verification.VerificationEngine` |
 | Service construction and wiring | `app.create_app` |
+| Undoing a run's file changes | `autonomy.checkpoints.WorkspaceCheckpoints` |
+| What tools exist and how they are classified | `tools.catalogue` |
 
 Data flows one way: HTTP -> orchestrator -> executor -> tools, with results
 travelling back as `ToolOutcome` and reaching the UI as task events. The API
 layer holds no run state; the orchestrator holds no HTTP concerns.
+
+
+### Why these two were split, and no further
+
+`autonomy/` separates the *mechanics* of undoing work from the *orchestration*
+around it: `WorkspaceCheckpoints` snapshots, diffs and restores files and knows
+nothing about tasks, events, audit or approvals. The drive loop and the
+lifecycle deliberately stay in one module -- `run -> drive -> execute ->
+observe -> drive` is a single state machine with one owner, and separating it
+would only produce two objects calling each other back.
+
+`tools/` separates the declarative catalogue from the execution engine: adding
+a tool's schema and changing how tools run are different jobs. The handlers
+themselves stay together because they share the registry's containment and
+process helpers; grouping them by domain would scatter that shared core
+without making any one group easier to read.
