@@ -145,6 +145,55 @@ def test_a_missing_credential_is_its_own_category_not_a_network_error():
     assert "not configured" in str(raised.value)
 
 
+# -- retry: transient faults only ------------------------------------------
+
+def _adapter_answering(monkeypatch, status: int, message: str):
+    """An OpenRouter adapter whose every request gets this answer; returns
+    the adapter and a counter of requests actually sent."""
+    calls = {"n": 0}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(status, json={"error": {"message": message}}, request=request)
+
+    transport = httpx.MockTransport(handle)
+    original = httpx.AsyncClient
+
+    class Patched(original):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Patched)
+    monkeypatch.setattr("sam_backend.models.PROVIDER_RETRY_BACKOFF_SECONDS", 0.0)
+    return AdapterRegistry(Settings(openrouter_api_key=PROBE_KEY)).get("openrouter"), calls
+
+
+def _ask(adapter):
+    import asyncio
+
+    with pytest.raises(ModelError) as raised:
+        asyncio.run(adapter.complete([{"role": "user", "content": "hi"}], [], "some/model"))
+    return raised.value
+
+
+@pytest.mark.parametrize("status, message, expected, requests", [
+    (503, "upstream hiccup", ErrorCategory.NETWORK, 3),
+    (429, "Rate limit exceeded: burst", ErrorCategory.RATE_LIMIT, 3),
+    (402, "Insufficient credits", ErrorCategory.QUOTA, 1),
+    (401, "Invalid key", ErrorCategory.AUTH, 1),
+    # Seen live: a 429 whose text says the cap is daily is quota, not a burst.
+    (429, "Rate limit exceeded: free-models-per-day. Add 10 credits", ErrorCategory.QUOTA, 1),
+])
+def test_only_a_transient_fault_is_retried(monkeypatch, status, message, expected, requests):
+    adapter, calls = _adapter_answering(monkeypatch, status, message)
+
+    error = _ask(adapter)
+
+    assert error.category is expected
+    assert calls["n"] == requests, "retries are for faults that can clear in seconds"
+
+
 # -- the real/mock boundary ------------------------------------------------
 
 def test_production_create_app_builds_a_real_adapter_registry(tmp_path: Path):
@@ -170,9 +219,11 @@ def test_every_route_in_the_fallback_chain_is_a_real_provider(tmp_path: Path):
     from sam_backend.db import Database
     from sam_backend.routing import ModelRouter
 
+    # A configured cloud key guarantees at least one route without touching
+    # the network; this test used to pass only while a local Ollama was up.
     settings = Settings(
         project_root=tmp_path, workspace_root=tmp_path / "workspace", data_dir=tmp_path / "data",
-        model_mode="AUTO",
+        model_mode="AUTO", openrouter_api_key=PROBE_KEY,
     )
     router = ModelRouter(settings, AdapterRegistry(settings), Database(tmp_path / "t.sqlite3"))
 
@@ -299,3 +350,116 @@ def test_new_tools_refuse_to_escape_the_workspace(tmp_path: Path, tool: str):
     # Either policy demands approval, or the resolver refuses outright.
     assert decision.approval_required or not result.ok
     assert not result.ok
+
+
+# -- the router honours a confirmed verdict --------------------------------
+
+class _Answering:
+    """A provider that fails every request the same way and counts them."""
+
+    def __init__(self, category: ErrorCategory) -> None:
+        self.category = category
+        self.requests = 0
+
+    async def list_models(self):
+        return [{"id": "paid/model", "name": "paid/model", "provider": "openrouter"}]
+
+    async def complete(self, messages, tools, model):
+        self.requests += 1
+        raise ModelError("Insufficient credits", self.category)
+
+
+def _router(tmp_path: Path, adapter):
+    from sam_backend.db import Database
+    from sam_backend.routing import ModelRouter
+
+    class Registry:
+        def get(self, provider):
+            return adapter
+
+    settings = Settings(
+        project_root=tmp_path, workspace_root=tmp_path / "workspace", data_dir=tmp_path / "data",
+        openrouter_api_key=PROBE_KEY, default_provider="openrouter", default_model="paid/model",
+        model_mode="CLOUD_ONLY",
+    )
+    return ModelRouter(settings, Registry(), Database(tmp_path / "t.sqlite3"))
+
+
+def _complete_thrice(router):
+    import asyncio
+
+    errors = []
+    for _ in range(3):
+        try:
+            asyncio.run(router.complete(
+                message="hi", messages=[{"role": "user", "content": "hi"}], tools=[],
+                provider="openrouter", model="paid/model", conversation_id=None,
+            ))
+        except ModelError as exc:
+            errors.append(exc)
+    return errors
+
+
+def test_a_quota_confirmed_model_is_not_asked_again(tmp_path: Path):
+    """After one credit failure the router must stop sending: the next
+    planner turn, executor turn or chat message cannot succeed either."""
+    from sam_backend.provider_health import Availability
+
+    adapter = _Answering(ErrorCategory.QUOTA)
+    router = _router(tmp_path, adapter)
+
+    errors = _complete_thrice(router)
+
+    assert adapter.requests == 1, "one real request confirmed the quota"
+    assert all(error.category is ErrorCategory.QUOTA for error in errors), "the honest category survives the skip"
+    assert "skipped" in str(errors[-1])
+    assert router.health.cached("openrouter", "paid/model").availability is Availability.UNAVAILABLE_QUOTA
+
+
+def test_an_auth_failure_is_likewise_not_repeated(tmp_path: Path):
+    adapter = _Answering(ErrorCategory.AUTH)
+
+    errors = _complete_thrice(_router(tmp_path, adapter))
+
+    assert adapter.requests == 1
+    assert errors[-1].category is ErrorCategory.AUTH
+
+
+def test_a_rate_limited_model_is_still_asked_again(tmp_path: Path):
+    """A burst limit clears; skipping it would turn a minute's wait into an
+    outage. Only confirmed quota and credentials are skipped."""
+    adapter = _Answering(ErrorCategory.RATE_LIMIT)
+
+    _complete_thrice(_router(tmp_path, adapter))
+
+    assert adapter.requests == 3
+
+
+def test_invalidating_the_shared_cache_lets_the_model_be_tried_again(tmp_path: Path):
+    """Adding credit or a new key is followed by a cache reset; the router
+    must then send a real request rather than trust the stale verdict."""
+    adapter = _Answering(ErrorCategory.QUOTA)
+    router = _router(tmp_path, adapter)
+
+    _complete_thrice(router)
+    router.health.invalidate()
+    _complete_thrice(router)
+
+    assert adapter.requests == 2
+
+
+def test_a_planner_failure_is_learned_by_the_shared_cache(tmp_path: Path):
+    """The planner swallows a model failure to produce a structural plan;
+    the router still records it, so the executor does not re-send."""
+    import asyncio
+
+    from sam_backend.planner import Planner
+
+    adapter = _Answering(ErrorCategory.QUOTA)
+    router = _router(tmp_path, adapter)
+
+    plan = asyncio.run(Planner(router).plan("do a thing", provider="openrouter", model="paid/model"))
+    _complete_thrice(router)
+
+    assert plan.source == "fallback"
+    assert adapter.requests == 1, "the planner's one failure was enough"

@@ -8,6 +8,7 @@ from typing import Any
 from .config import Settings
 from .db import Database
 from .models import AdapterRegistry, AssistantTurn, ErrorCategory, ModelError
+from .provider_health import AVAILABILITY_TO_CATEGORY, CONFIRMED_UNAVAILABLE, ProviderHealth
 
 
 @dataclass(slots=True)
@@ -28,10 +29,16 @@ class RouteChoice:
 
 
 class ModelRouter:
-    def __init__(self, settings: Settings, adapters: AdapterRegistry, database: Database) -> None:
+    def __init__(
+        self, settings: Settings, adapters: AdapterRegistry, database: Database,
+        health: ProviderHealth | None = None,
+    ) -> None:
         self.settings = settings
         self.adapters = adapters
         self.database = database
+        # Shared with the orchestrator's preflight: a quota or credential
+        # verdict learned anywhere is honoured everywhere.
+        self.health = health or ProviderHealth(settings)
         self._health_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self.failures: dict[str, int] = {}
 
@@ -195,6 +202,16 @@ class ModelRouter:
         _, choices = await self.route(message, provider=provider, model=model)
         failures: list[dict[str, str]] = []
         for choice in choices:
+            verdict = self.health.cached(choice.provider, choice.model)
+            if verdict is not None and verdict.availability in CONFIRMED_UNAVAILABLE:
+                # Confirmed quota or credential failure: sending another
+                # request cannot succeed and only burns the account's goodwill.
+                failures.append({
+                    "provider": choice.provider, "model": choice.model,
+                    "error": f"skipped, {verdict.reason}",
+                    "category": str(AVAILABILITY_TO_CATEGORY[verdict.availability]),
+                })
+                continue
             try:
                 turn = await self.adapters.get(choice.provider).complete(messages, tools, choice.model)
                 self.failures[choice.provider] = max(0, self.failures.get(choice.provider, 0) - 1)
@@ -222,6 +239,7 @@ class ModelRouter:
                 return turn, choice, failures
             except ModelError as exc:
                 self.failures[choice.provider] = self.failures.get(choice.provider, 0) + 1
+                self.health.record_failure(choice.provider, choice.model, exc)
                 category = getattr(exc, "category", ErrorCategory.UNKNOWN)
                 failures.append({
                     "provider": choice.provider, "model": choice.model,

@@ -24,6 +24,7 @@ from .db import Database
 from .models import AdapterRegistry
 from .policy import RiskPolicy
 from .project_map import ProjectScanner
+from .provider_health import ProviderHealth
 from .routing import ModelRouter
 from .tasks import TaskStore
 from .verification import VerificationEngine
@@ -165,13 +166,14 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
 
     apply_stored_credentials()
     adapters = adapters or AdapterRegistry(settings)
-    router = ModelRouter(settings, adapters, database)
+    provider_health = ProviderHealth(settings)
+    router = ModelRouter(settings, adapters, database, provider_health)
     agent = AgentService(settings, database, tools, policy, adapters, router, trading, cancellation)
     task_store = TaskStore(database)
     orchestrator = AutonomousOrchestrator(
         settings, database, tools, policy, router,
         store=task_store, scanner=scanner, verifier=verifier, capabilities=capability_registry,
-        cancellation=cancellation,
+        cancellation=cancellation, health=provider_health,
     )
     agent_api = AgentApi(
         settings=settings, database=database, orchestrator=orchestrator, scanner=scanner,
@@ -191,7 +193,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         agent.adapters = refreshed
         router._health_cache.clear()
         router.failures.clear()
-        orchestrator.health.invalidate()
+        provider_health.invalidate()
 
     monitor_stop = asyncio.Event()
 

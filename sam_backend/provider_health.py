@@ -18,7 +18,6 @@ that stops.
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
@@ -26,7 +25,7 @@ from typing import Any
 
 import httpx
 
-from .models import ErrorCategory, ModelError
+from .models import DAILY_CAP, ErrorCategory, ModelError
 
 OPENROUTER_CATALOGUE_TTL = 600.0
 PROBE_TIMEOUT_SECONDS = 20.0
@@ -58,11 +57,14 @@ VERDICT_TTL_SECONDS: dict[Availability, float] = {
     Availability.UNKNOWN: 60.0,
 }
 
-# A 429 whose text says the cap is daily will not clear in seconds.
-DAILY_CAP = re.compile(r"per[-_ ]day|daily", re.IGNORECASE)
-
 # A runtime failure is evidence too: fold it into the same vocabulary so the
 # cache learns from real requests, not only from preflight.
+AVAILABILITY_TO_CATEGORY: dict[Availability, ErrorCategory] = {
+    Availability.UNAVAILABLE_QUOTA: ErrorCategory.QUOTA,
+    Availability.UNAVAILABLE_AUTH: ErrorCategory.AUTH,
+}
+# Verdicts definite enough that re-sending a request is pure waste.
+CONFIRMED_UNAVAILABLE = frozenset(AVAILABILITY_TO_CATEGORY)
 CATEGORY_TO_AVAILABILITY: dict[ErrorCategory, Availability] = {
     ErrorCategory.AUTH: Availability.UNAVAILABLE_AUTH,
     ErrorCategory.QUOTA: Availability.UNAVAILABLE_QUOTA,

@@ -504,8 +504,9 @@ class AutonomousOrchestrator:
             )
         except ModelError as exc:
             if self.active_route:
-                # A real failure is better evidence than any preflight; record
-                # it so the next run does not probe a known-dead model again.
+                # A real failure is better evidence than any preflight. The
+                # shared router records it too; recording twice is harmless
+                # and a router that does not share the cache still teaches it.
                 self.health.record_failure(*self.active_route, exc)
             step.status = "failed"
             step.detail = str(exc)[:500]
