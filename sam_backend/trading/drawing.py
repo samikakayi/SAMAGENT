@@ -8,7 +8,6 @@ expected location. SAM never touches an annotation it does not own.
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -16,6 +15,7 @@ from typing import Any, Callable
 
 from ..contracts import ExecutionStatus, StandardResult
 from .calibration import Calibration, ChartCalibrator
+from .desktop_input import DesktopInput
 
 
 class Layer(StrEnum):
@@ -91,9 +91,6 @@ SEMANTIC_TYPES: dict[str, tuple[str, Layer]] = {
 # the pointer, so this leaves room for antialiasing without accepting a line
 # at a visibly different price.
 VERIFY_ROW_TOLERANCE = 6
-# Pointer approach distance and settle time that make the crosshair follow.
-MOUSE_SETTLE_OFFSET = 3
-MOUSE_SETTLE_SECONDS = 0.45
 # Time for the chart to paint a newly created object before it is verified.
 DRAW_SETTLE_SECONDS = 1.0
 # Share of a row's pixels that must differ before it counts as a new mark.
@@ -112,8 +109,6 @@ TWO_ANCHOR_TYPES: dict[str, tuple[str, Layer]] = {
 ENDPOINT_RADIUS = 14
 # Fraction of pixels in the endpoint box that must differ.
 ENDPOINT_CHANGE_RATIO = 0.02
-# Intermediate positions sent during a drag so the app tracks the motion.
-DRAG_STEPS = 12
 # Points sampled along a drawn segment when confirming it appeared.
 LINE_SAMPLES = 24
 # Pixels either side of the ideal path searched for a changed pixel.
@@ -170,11 +165,13 @@ class DrawingEngine:
         focus: Callable[[], StandardResult],
         computer_control: bool = False,
         screen_access: bool = False,
+        desktop: DesktopInput | None = None,
     ) -> None:
         self.database = database
         self.calibrator = calibrator
         self._observe = observe
         self._focus = focus
+        self.desktop = desktop or DesktopInput()
         self.computer_control = computer_control
         self.screen_access = screen_access
 
@@ -184,84 +181,11 @@ class DrawingEngine:
 
     # --- Low-level input ---------------------------------------------------
 
-    @staticmethod
-    def _modules() -> tuple[Any, Any]:
-        if os.name != "nt":
-            raise RuntimeError("TradingView drawing is available only on Windows")
-        import win32api
-        import win32con
-
-        return win32api, win32con
-
-    def _move_mouse(self, x: int, y: int) -> None:
-        """Move the pointer so the chart's crosshair actually follows it.
-
-        A single `SetCursorPos` to a position the cursor may already occupy does
-        not reliably produce a move event, leaving TradingView's crosshair — and
-        therefore any shortcut-placed drawing — at a stale price. Approaching the
-        target from a few pixels away guarantees the move is delivered.
-        """
-        win32api, _ = self._modules()
-        win32api.SetCursorPos((int(x), int(y) - MOUSE_SETTLE_OFFSET))
-        time.sleep(0.12)
-        win32api.SetCursorPos((int(x), int(y)))
-        time.sleep(MOUSE_SETTLE_SECONDS)
-
-    @staticmethod
-    def _virtual_key(key: str) -> int:
-        """The virtual-key code for a shortcut, independent of keyboard layout.
-
-        `VkKeyScan` asks the *current* layout which key produces a character, so
-        with a Kurdish or Arabic layout selected it returns -1 for plain Latin
-        letters and every drawing shortcut fails. Shortcuts are dispatched by
-        virtual key, not by character, and for ASCII letters and digits that
-        code is fixed ('A' is 0x41 on every layout), so it can be taken directly.
-        """
-        if len(key) == 1 and (key.isascii() and (key.isalpha() or key.isdigit())):
-            return ord(key.upper())
-        import win32api
-
-        virtual = win32api.VkKeyScan(key)
-        if virtual == -1:
-            raise RuntimeError(f"Cannot map shortcut key {key!r}")
-        return virtual & 0xFF
-
-    def _press_chord(self, modifier: str, key: str) -> None:
-        win32api, win32con = self._modules()
-        modifier_code = {"alt": win32con.VK_MENU, "ctrl": win32con.VK_CONTROL, "shift": win32con.VK_SHIFT}[modifier]
-        key_code = self._virtual_key(key)
-        win32api.keybd_event(modifier_code, 0, 0, 0)
-        win32api.keybd_event(key_code, 0, 0, 0)
-        win32api.keybd_event(key_code, 0, win32con.KEYEVENTF_KEYUP, 0)
-        win32api.keybd_event(modifier_code, 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.2)
-
-    def _click(self, x: int, y: int) -> None:
-        win32api, win32con = self._modules()
-        self._move_mouse(x, y)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(0.12)
-
-    def _press_key(self, key_code: int) -> None:
-        win32api, win32con = self._modules()
-        win32api.keybd_event(key_code, 0, 0, 0)
-        win32api.keybd_event(key_code, 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.15)
-
     # --- Verification ------------------------------------------------------
 
     def _grab_plot(self, geometry: dict[str, int], axis_x: float | None = None) -> Any:
-        from PIL import ImageGrab
-
-        from ..dpi import ensure_dpi_awareness
-
-        ensure_dpi_awareness()
-
         region = self.calibrator.plot_region(geometry, axis_x)
-        return ImageGrab.grab(
-            bbox=(region["left"], region["top"], region["right"], region["bottom"]), all_screens=True
-        )
+        return self.desktop.grab((region["left"], region["top"], region["right"], region["bottom"]))
 
     @staticmethod
     def changed_rows(before: Any, after: Any) -> list[tuple[int, float]]:
@@ -313,8 +237,8 @@ class DrawingEngine:
         attempts: list[dict[str, Any]] = []
         for offset in self.SELECT_OFFSETS:
             before = self._grab_plot(geometry, axis_x)
-            self._click(int(x), int(y) + offset)
-            self._press_key(delete_key)
+            self.desktop.click(int(x), int(y) + offset)
+            self.desktop.press_key(delete_key)
             time.sleep(0.35)
             after = self._grab_plot(geometry, axis_x)
             changed, detail = self._verify_horizontal(
@@ -326,26 +250,6 @@ class DrawingEngine:
         return False, {"attempts": attempts, "reason": "No click offset selected the annotation."}
 
     # --- Two-anchor (drag) drawing -----------------------------------------
-
-    def _drag(self, start: tuple[int, int], end: tuple[int, int]) -> None:
-        """Press, move through intermediate points, release.
-
-        A single jump from press to release is often treated as a click, so the
-        motion is delivered in steps the way a hand would move the pointer.
-        """
-        win32api, win32con = self._modules()
-        self._move_mouse(*start)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.12)
-        for step in range(1, DRAG_STEPS + 1):
-            ratio = step / DRAG_STEPS
-            x = int(start[0] + (end[0] - start[0]) * ratio)
-            y = int(start[1] + (end[1] - start[1]) * ratio)
-            win32api.SetCursorPos((x, y))
-            time.sleep(0.03)
-        time.sleep(0.15)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(0.2)
 
     @staticmethod
     def changed_near(before: Any, after: Any, x: float, y: float, region: dict[str, int]) -> tuple[bool, float]:
@@ -451,13 +355,12 @@ class DrawingEngine:
         try:
             before = self._grab_plot(geometry, calibration.axis_x)
             modifier, key = SHORTCUTS[primitive]
-            self._press_chord(modifier, key)
+            self.desktop.press_chord(modifier, key)
             time.sleep(0.3)
-            self._drag((int(first["x"]), int(first["y"])), (int(second["x"]), int(second["y"])))
+            self.desktop.drag((int(first["x"]), int(first["y"])), (int(second["x"]), int(second["y"])))
             time.sleep(DRAW_SETTLE_SECONDS)
             after = self._grab_plot(geometry, calibration.axis_x)
-            _, win32con = self._modules()
-            self._press_key(win32con.VK_ESCAPE)
+            self.desktop.press_key(DesktopInput.ESCAPE)
         except Exception as exc:
             return StandardResult.failure(
                 f"Drag input failed: {exc}", executed=True,
@@ -894,16 +797,15 @@ class DrawingEngine:
         target_x = float(placement.data["x_center"])
         try:
             before = self._grab_plot(geometry, calibration.axis_x)
-            self._move_mouse(int(target_x), int(target_y))
+            self.desktop.move_mouse(int(target_x), int(target_y))
             modifier, key = SHORTCUTS[primitive]
-            self._press_chord(modifier, key)
+            self.desktop.press_chord(modifier, key)
             time.sleep(DRAW_SETTLE_SECONDS)
             after = self._grab_plot(geometry, calibration.axis_x)
             # The drawing tool stays armed and the new object stays selected after
             # the shortcut. Leaving it that way makes the next click create another
             # annotation instead of selecting this one, so disarm before returning.
-            _, win32con = self._modules()
-            self._press_key(win32con.VK_ESCAPE)
+            self.desktop.press_key(DesktopInput.ESCAPE)
         except Exception as exc:
             return StandardResult.failure(
                 f"Drawing input failed: {exc}", executed=True, error_code="DRAWING_INPUT_FAILED", started_at=started
@@ -986,7 +888,7 @@ class DrawingEngine:
         if focused.status != ExecutionStatus.SUCCESS:
             return focused
         try:
-            self._press_chord("ctrl", "z")
+            self.desktop.press_chord("ctrl", "z")
         except Exception as exc:
             return StandardResult.failure(str(exc), executed=True, error_code="UNDO_FAILED", started_at=started)
         return StandardResult(
@@ -1050,7 +952,6 @@ class DrawingEngine:
             failure.duration_ms = round((time.perf_counter() - started) * 1000, 2)
             return failure
 
-        win32api, win32con = self._modules()
         geometry = self.chart_geometry(state)
         removed: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -1064,7 +965,7 @@ class DrawingEngine:
                 plot = self.calibrator.plot_region(geometry, calibration.axis_x)
                 x = payload.get("screen_x") or (plot["left"] + plot["right"]) / 2
                 changed, detail = self._select_and_delete(
-                    int(x), y, geometry=geometry, axis_x=calibration.axis_x, delete_key=win32con.VK_DELETE
+                    int(x), y, geometry=geometry, axis_x=calibration.axis_x, delete_key=DesktopInput.DELETE
                 )
             except Exception as exc:
                 skipped.append({"id": drawing["id"], "reason": f"Input failed: {exc}"})
