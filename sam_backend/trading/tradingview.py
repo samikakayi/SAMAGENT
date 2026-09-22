@@ -33,7 +33,6 @@ class TradingViewState:
     chart_type: str | None = None
     visible_price_range: dict[str, float] | None = None
     visible_time_range: dict[str, str] | None = None
-    chart_geometry: dict[str, int] | None = None
     price_scale_geometry: dict[str, int] | None = None
     time_scale_geometry: dict[str, int] | None = None
     visible_indicators: list[str] = field(default_factory=list)

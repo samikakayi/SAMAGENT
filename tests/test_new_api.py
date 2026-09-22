@@ -357,3 +357,144 @@ def test_the_manual_calibrate_endpoint_still_validates_its_anchors(tmp_path: Pat
         missing = client.post("/api/tradingview/action", json={"action": "calibrate", "price_a": 3000.0})
 
     assert missing.status_code == 400 and "required" in missing.json()["detail"]
+
+
+# --- The TradingView panel's drawing row -------------------------------------
+#
+# Found live: the API reported calibrated=true and verified_price_drawing=true
+# for a real XAUUSD chart while the panel still read "Unavailable until verified
+# chart calibration". The panel gated on `state.chart_geometry`, a field of
+# TradingViewState that observe() never assigns, so it was always null.
+
+DRAWING_ROW = "tv-drawing-state"
+UNAVAILABLE = "Unavailable until verified chart calibration"
+PANEL_GEOMETRY = {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+
+
+def observed_state(**overrides):
+    """A real TradingViewState, so the payload keys are the production ones."""
+    from sam_backend.trading.tradingview import TradingViewState
+
+    fields = dict(
+        running=True, process_ids=[4242], window_handle=919736, title="XAUUSD ▼ 4,310.55",
+        symbol="XAUUSD", feed="OANDA", timeframe="M15", timeframe_verified=True,
+        current_price=4310.55, window_geometry=PANEL_GEOMETRY, monitor={"name": r"\.\DISPLAY1"},
+        active=True, interactive=True, client_geometry=PANEL_GEOMETRY,
+    )
+    fields.update(overrides)
+    return TradingViewState(**fields)
+
+
+def panel_payload(tmp_path, *, calibrated=True, permitted=True, viewport_moved=False, window=True):
+    """The `/api/trading/status` payload for one real chart situation.
+
+    Both halves come from production code: the observation from TradingViewState,
+    the drawing row's answer from DrawingEngine.capability() over a real database.
+    """
+    from sam_backend.db import Database
+    from sam_backend.trading.calibration import ChartCalibrator, geometry_hash
+    from sam_backend.trading.drawing import DrawingEngine
+
+    state = observed_state(**({} if window else {"window_handle": None, "active": False}))
+    database = Database(tmp_path / "panel.sqlite3")
+    engine = DrawingEngine(
+        database=database, calibrator=ChartCalibrator(), observe=lambda: state,
+        focus=lambda: None, computer_control=permitted, screen_access=permitted,
+    )
+    if calibrated:
+        # Calibrated for the viewport the chart had; optionally it has since moved.
+        stored = dict(PANEL_GEOMETRY, right=1400) if viewport_moved else PANEL_GEOMETRY
+        database.save_chart_calibration(
+            window_handle=919736, symbol="XAUUSD", timeframe="M15",
+            geometry_hash=geometry_hash(stored), slope=-0.2556, intercept=4485.04,
+            method="price_axis_ocr", verified=True, axis_x=1100.0,
+        )
+    return {"tradingview": state.as_dict(), "drawing": engine.capability()}
+
+
+def render_panel(tmp_path, payload):
+    """Run the real panels.js against the payload and report what it displayed."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    finished = subprocess.run(
+        [node, str(Path(__file__).parent / "render_tradingview_panel.js"),
+         str(PROJECT_ROOT / "frontend" / "panels.js"), str(payload_file)],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    return json.loads(finished.stdout)
+
+
+def test_a_calibrated_chart_is_not_reported_as_uncalibrated(tmp_path):
+    """The live defect: the backend said yes and the panel said no."""
+    payload = panel_payload(tmp_path)
+    assert payload["drawing"]["calibrated"] is True
+    assert payload["drawing"]["verified_price_drawing"] is True
+
+    shown = render_panel(tmp_path, payload)["rendered"][DRAWING_ROW]
+
+    assert shown != UNAVAILABLE, "the panel contradicted a calibrated backend"
+    assert "available" in shown.lower()
+
+
+def test_an_uncalibrated_chart_still_reads_unavailable(tmp_path):
+    payload = panel_payload(tmp_path, calibrated=False)
+    assert payload["drawing"]["calibrated"] is False
+
+    assert render_panel(tmp_path, payload)["rendered"][DRAWING_ROW] == UNAVAILABLE
+
+
+def test_calibration_without_permission_never_claims_verified_drawing(tmp_path):
+    """Calibrated, but screen access and computer control are off."""
+    payload = panel_payload(tmp_path, permitted=False)
+    assert payload["drawing"]["calibrated"] is True
+    assert payload["drawing"]["verified_price_drawing"] is False
+
+    shown = render_panel(tmp_path, payload)["rendered"][DRAWING_ROW]
+
+    assert not re.search(r"(?<!un)available", shown, re.I), "claimed drawing it cannot perform"
+    assert "permission" in shown.lower() or "required" in shown.lower()
+
+
+def test_a_moved_viewport_invalidates_the_panel_row(tmp_path):
+    """The stored calibration belongs to a chart geometry that no longer holds."""
+    payload = panel_payload(tmp_path, viewport_moved=True)
+    assert payload["drawing"]["calibrated"] is False
+
+    assert render_panel(tmp_path, payload)["rendered"][DRAWING_ROW] == UNAVAILABLE
+
+
+def test_no_chart_window_reads_unavailable(tmp_path):
+    payload = panel_payload(tmp_path, window=False)
+    assert payload["drawing"]["calibrated"] is False
+
+    assert render_panel(tmp_path, payload)["rendered"][DRAWING_ROW] == UNAVAILABLE
+
+
+def test_the_panel_asks_the_backend_instead_of_guessing_from_geometry(tmp_path):
+    """The drawing row must consume the engine's own answer, not re-derive one."""
+    requested = render_panel(tmp_path, panel_payload(tmp_path))["requested"]
+    assert any("status" in path for path in requested), requested
+
+    script = (PROJECT_ROOT / "frontend" / "panels.js").read_text(encoding="utf-8")
+    assert "chart_geometry" not in script, "the panel still gates on a field that is never sent"
+
+
+def test_the_observed_state_declares_no_chart_geometry_of_its_own():
+    """It was never assigned, and it shadowed DrawingEngine.chart_geometry().
+
+    A reader who found `state.chart_geometry` reasonably assumed it held the
+    engine's answer; it held null, and the panel believed it.
+    """
+    import dataclasses
+
+    from sam_backend.trading.tradingview import TradingViewState
+
+    names = {field.name for field in dataclasses.fields(TradingViewState)}
+    assert "chart_geometry" not in names
+    assert "client_geometry" in names, "the geometry observe() does populate stays"

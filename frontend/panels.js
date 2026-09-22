@@ -283,15 +283,24 @@
     if (!Object.keys(theories).length) root.appendChild(element("p", "compatibility-note", "No theory output."));
   }
 
+  function drawingAvailability(drawing) {
+    // The drawing engine decides this; the panel only reports its answer.
+    if (drawing?.verified_price_drawing) return "Verified price drawing available";
+    if (drawing?.calibrated) return "Chart calibrated; desktop control permission still required";
+    return "Unavailable until verified chart calibration";
+  }
+
   async function refreshTradingView() {
     try {
-      const state = await json("/api/tradingview/state");
+      // One payload: the window observation and the drawing engine's own verdict.
+      const payload = await json("/api/trading/status");
+      const state = payload.tradingview || {};
       setStatus("tradingview-status", state.running ? "RUNNING" : "OFFLINE");
       text("tv-process-state", state.window_handle ? `Visible window · ${state.process_ids?.length || 0} process(es)` : state.running ? "Process found; no visible chart window" : "Not running");
       text("tv-observed-symbol", state.symbol || "Not exposed by title");
       text("tv-observed-price", fmt(state.current_price));
       text("tv-capture-state", state.interactive ? "Interactive session detected; permission still required" : "No interactive window");
-      text("tv-drawing-state", state.chart_geometry ? "Chart geometry observed; price calibration still required" : "Unavailable until verified chart calibration");
+      text("tv-drawing-state", drawingAvailability(payload.drawing));
       text("tv-disclosure", (state.observations || []).join(" ") || "TradingView state observed from the native Windows window.");
     } catch (error) {
       setStatus("tradingview-status", "UNAVAILABLE");
@@ -785,5 +794,6 @@
   });
 
   window.SAMTrading = { refresh: loadMarketSnapshot, analyze: analyzeMarket, tradingViewAction, latest: () => latestAnalysis,
+    tradingView: refreshTradingView,
     providers: loadProviders, triggers: loadTriggers, backtest: runBacktest, strategies: loadStrategies, journal: loadJournal };
 })();

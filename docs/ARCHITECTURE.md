@@ -327,3 +327,11 @@ is scheduled.
    written at the time can be left truncated. Known-invalid checkpoint
    evidence is caught before any mutation; an unpredictable filesystem is not.
    See the section above for what a future fix would have to promise.
+8. **`TradingViewState` declares fields `observe()` never assigns**:
+   `chart_type`, `visible_price_range`, `visible_time_range`,
+   `price_scale_geometry`, `time_scale_geometry`, `visible_indicators` and
+   `layout`. They serialise as null and read like observations that were made.
+   A sibling field, `chart_geometry`, caused a real defect this way -- the
+   panel gated drawing availability on it and contradicted a calibrated chart
+   -- so that one was removed. The rest are left until something needs them,
+   but they carry the same trap.
