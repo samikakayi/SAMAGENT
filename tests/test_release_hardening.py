@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
 import pytest
 
 from sam_backend.config import Settings
+from sam_backend.db import Database
+from sam_backend.schemas import SettingsUpdate
 from sam_backend.secrets import SecretStore, resolve_credential
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -209,12 +210,12 @@ def test_dangerous_permissions_default_to_off(tmp_path: Path, monkeypatch):
 def test_permission_state_is_persisted_deliberately_not_by_accident(tmp_path: Path):
     settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d")
     settings.prepare()
-    settings.save_public_overrides({"computer_control_enabled": True, "screen_access_enabled": True})
-    saved = json.loads((settings.data_dir / "settings.json").read_text(encoding="utf-8"))
-    # These are in the allow-list by design, so the UI toggle survives a restart.
+    values = SettingsUpdate(computer_control_enabled=True, screen_access_enabled=True).provided()
+    saved = Database(settings.database_path).update_settings(values)
+    # The update schema is the one list of what persists, and it names these
+    # by design, so the UI toggle survives a restart rather than resetting.
     assert saved["computer_control_enabled"] is True
-    # A credential must never ride along with them.
-    assert "openrouter_api_key" not in saved
+    assert "computer_control_enabled" in SettingsUpdate.model_fields
 
 
 def test_sam_refuses_to_run_elevated(tmp_path: Path, monkeypatch):

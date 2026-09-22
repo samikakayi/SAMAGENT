@@ -94,6 +94,8 @@
       monthly_budget_usd: 30,
       computer_control_enabled: false,
       screen_access_enabled: false,
+      fallback_model: "",
+      fallback_enabled: false,
       memory_enabled: true,
       audit_enabled: true,
       cloud_fallback: false,
@@ -1371,6 +1373,10 @@
         monthly_budget_usd: runtime.monthly_budget_usd ?? local.monthly_budget_usd ?? state.settings.monthly_budget_usd,
         computer_control_enabled: runtime.computer_control_enabled ?? local.computer_control_enabled ?? false,
         screen_access_enabled: runtime.screen_access_enabled ?? local.screen_access_enabled ?? false,
+        // Fallback configuration is the backend's alone: a stale local copy
+        // would misreport which model a run is actually allowed to use.
+        fallback_model: runtime.fallback_model ?? "",
+        fallback_enabled: runtime.fallback_enabled ?? false,
         voice_mode: runtime.voice_mode || local.voice_mode || state.settings.voice_mode,
         voice_language: runtime.voice_language || local.voice_language || state.settings.voice_language,
         voice_wake_word: runtime.voice_wake_word || local.voice_wake_word || state.settings.voice_wake_word,
@@ -1449,6 +1455,8 @@
           monthly_budget_usd: next.monthly_budget_usd,
           computer_control_enabled: next.computer_control_enabled,
           screen_access_enabled: next.screen_access_enabled,
+          fallback_model: next.fallback_model,
+          fallback_enabled: next.fallback_enabled,
           voice_mode: next.voice_mode,
           voice_language: next.voice_language,
           voice_wake_word: next.voice_wake_word,
@@ -1462,7 +1470,13 @@
         model: next.provider === "openai"
           ? runtime.openai_model || next.model
           : runtime.default_model || next.model,
+        fallback_model: runtime.fallback_model ?? next.fallback_model,
+        fallback_enabled: runtime.fallback_enabled ?? next.fallback_enabled,
       };
+      // The Autopilot strip owns its own state; tell it the rule changed
+      // rather than reaching into it.
+      document.dispatchEvent(new CustomEvent("sam:settings-saved"));
+      refreshFallbackStatus();
       dom.settingsStatus.textContent = t("settings.saved", "Saved");
       applyPermissionMode();
       applyUiLanguage();
@@ -2225,10 +2239,29 @@
     dom.scrim.hidden = true;
   }
 
+  // One line naming what a run would use right now. The backend already
+  // composes the reasoning, so this only reads it -- the Autopilot strip
+  // remains the place that explains a blocked run.
+  async function refreshFallbackStatus() {
+    const node = $("#settings-fallback-status");
+    if (!node) return;
+    try {
+      const { resolution } = await getJson("/api/providers/resolution");
+      const state_ = resolution.fallback_enabled ? "enabled" : "disabled";
+      const fallback = resolution.fallback
+        ? `${resolution.fallback.model} — ${resolution.fallback.availability}`
+        : "none configured";
+      node.textContent = `Primary ${resolution.primary.model} — ${resolution.primary.availability}. Fallback ${state_}: ${fallback}.`;
+    } catch {
+      node.textContent = "Could not read the current model resolution.";
+    }
+  }
+
   function openSettings(section = "general") {
     applySettingsToForm();
     selectSettingsPanel(section);
     if (!dom.settingsModal.open) dom.settingsModal.showModal();
+    refreshFallbackStatus();
   }
 
   function openWorkspace() {

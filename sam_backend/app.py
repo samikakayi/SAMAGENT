@@ -121,16 +121,11 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     settings.prepare()
     database = Database(settings.database_path)
     # Apply only the non-secret settings that were saved through the local UI.
-    persisted_settings = database.get_settings()
-    for key in {
-        "default_provider", "default_model", "model_mode", "openai_model", "permission_mode",
-        "openrouter_fast_model", "openrouter_strong_model", "openrouter_vision_model",
-        "max_tool_iterations", "command_timeout_seconds", "daily_budget_usd", "monthly_budget_usd",
-        "computer_control_enabled", "screen_access_enabled", "default_trading_theory", "minimum_rr",
-        "voice_mode", "voice_language", "voice_vad_threshold", "voice_silence_ms", "voice_wake_word",
-    }:
-        if key in persisted_settings:
-            setattr(settings, key, persisted_settings[key])
+    # The update schema is the one list of what may be persisted, so a setting
+    # the API accepts cannot be silently lost on the next restart.
+    for key, value in database.get_settings().items():
+        if key in SettingsUpdate.model_fields:
+            setattr(settings, key, value)
     policy = RiskPolicy(settings)
     cancellation = CancellationManager()
     trading = TradingService(settings, database, cancellation)
@@ -542,8 +537,22 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     @application.put("/api/settings")
     async def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
         values = payload.provided()
+        if "fallback_enabled" in values or "fallback_model" in values:
+            # Half the pair arrives at a time, so the rule is checked against
+            # the settings the change would actually produce. An armed switch
+            # with nothing behind it is the failure this prevents.
+            if values.get("fallback_enabled", settings.fallback_enabled) and not values.get("fallback_model", settings.fallback_model):
+                raise HTTPException(422, "fallback_enabled requires a fallback_model")
+        # Renaming a model leaves cached verdicts answering a question nobody
+        # is asking. Toggling the switch does not: resolve() reads it live.
+        stale_verdicts = any(
+            key in values and values[key] != getattr(settings, key)
+            for key in ("default_provider", "default_model", "fallback_model")
+        )
         for key, value in values.items():
             setattr(settings, key, value)
+        if stale_verdicts:
+            provider_health.invalidate()
         overrides = database.update_settings(values)
         trading.refresh_permissions()
         windows.refresh_permissions(

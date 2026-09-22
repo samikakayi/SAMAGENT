@@ -755,6 +755,9 @@
     if (!mount()) return;
     refreshHistory();
     loadModelResolution(false);
+    // Fallback is configured in Settings. Re-read the resolution when it
+    // changes so the strip never shows a rule the backend has stopped applying.
+    document.addEventListener("sam:settings-saved", () => loadModelResolution(false));
     connect();
   }
 
