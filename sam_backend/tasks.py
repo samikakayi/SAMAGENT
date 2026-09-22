@@ -139,6 +139,10 @@ class AgentTask:
     # The agent's own diff is always reported separately from these.
     preexisting_changes: list[str] = field(default_factory=list)
     rolled_back: bool = False
+    # Set only when a row was read back already claiming verification it
+    # cannot show. Such a record stays writable -- rolling one back must not
+    # fail because of history -- but nothing new may enter that state.
+    legacy_unverified_claim: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -154,6 +158,9 @@ class AgentTask:
         payload = asdict(self)
         payload["state"] = self.state.value
         payload["terminal"] = self.terminal
+        # An in-process detail about where this record came from, not part of
+        # the task; it must never be persisted or served.
+        payload.pop("legacy_unverified_claim", None)
         return payload
 
     def public_dict(self, *, event_limit: int = 200) -> dict[str, Any]:
@@ -163,6 +170,9 @@ class AgentTask:
         payload["events"] = payload["events"][-event_limit:]
         payload["event_count"] = len(self.events)
         return payload
+
+
+VERIFIED_STATUS = "completed_verified"
 
 
 class TaskStore:
@@ -207,6 +217,13 @@ class TaskStore:
         return task
 
     def save(self, task: AgentTask) -> AgentTask:
+        # The one authoritative rule: a run may not claim it was verified
+        # without the report that says so. Reads stay permissive so older
+        # records remain usable; only entering the state is refused.
+        if task.completion_status == VERIFIED_STATUS and task.verification is None and not task.legacy_unverified_claim:
+            raise ValueError(
+                f"{task.id} cannot be saved as {VERIFIED_STATUS} without the verification report that earned it"
+            )
         task.updated_at = time.time()
         payload = json.dumps(task.as_dict())
         with self.database.write() as connection:
@@ -327,6 +344,9 @@ def _from_payload(payload: str) -> AgentTask:
         checkpoints=list(data.get("checkpoints") or []),
         preexisting_changes=list(data.get("preexisting_changes") or []),
         rolled_back=bool(data.get("rolled_back", False)),
+        legacy_unverified_claim=(
+            data.get("completion_status") == VERIFIED_STATUS and data.get("verification") is None
+        ),
         created_at=float(data.get("created_at") or time.time()),
         updated_at=float(data.get("updated_at") or time.time()),
     )

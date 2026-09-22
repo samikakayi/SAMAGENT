@@ -36,7 +36,7 @@ from ..planner import Planner
 from ..policy import RiskPolicy
 from ..project_map import ProjectScanner
 from ..provider_health import ProviderHealth
-from ..tasks import AgentTask, TaskState, TaskStep, TaskStore
+from ..tasks import VERIFIED_STATUS, AgentTask, TaskState, TaskStep, TaskStore
 from ..tools import ToolRegistry
 from ..ui_review import review_screenshot
 from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
@@ -632,8 +632,9 @@ class AutonomousOrchestrator:
         report = await asyncio.to_thread(self.verifier.verify, project_map, self.workspace)
         if is_ui_work(task.modified_files):
             await self._validate_ui(task, project_map, report)
-        # The history keeps every attempt; the verdict names the one that
-        # decided the outcome, so completed_verified always has its evidence.
+        # The history keeps every attempt; the verdict names the last one.
+        # Recorded here too because a run that exhausts its re-plans ends in
+        # _heal and never reaches _complete, and its refusal is evidence.
         task.test_results.append(report.as_dict())
         task.verification = report.as_dict()
         await self._emit(
@@ -725,7 +726,10 @@ class AutonomousOrchestrator:
     async def _complete(self, task: AgentTask, report: Any) -> AgentTask:
         verified = bool(report is not None and report.verified)
         await self._transition(task, TaskState.COMPLETED, "Task complete")
-        task.completion_status = "completed_verified" if verified else "completed_unverified"
+        # The status and the evidence are set from the same report and reach
+        # the store in one save, so the invalid pair is never persisted.
+        task.verification = report.as_dict() if report is not None else None
+        task.completion_status = VERIFIED_STATUS if verified else "completed_unverified"
         lines = [f"Goal: {task.goal}"]
         if task.modified_files:
             lines.append("Files changed: " + ", ".join(task.modified_files[:20]))

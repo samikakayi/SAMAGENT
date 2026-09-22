@@ -104,6 +104,29 @@ def test_a_task_can_be_started_and_followed_to_completion(agent_client: TestClie
     assert listed["completion_status"] == "completed_verified"
 
 
+def test_a_legacy_verified_row_serialises_faithfully(agent_client: TestClient):
+    """History is served as it was recorded -- no crash, no invented verdict."""
+    from sam_backend.db import Database
+    from sam_backend.tasks import TaskStore
+
+    store = TaskStore(Database(agent_client.app.state.settings.database_path))
+    task = store.create("An older run")
+    stale = task.as_dict() | {"completion_status": "completed_verified", "verification": None,
+                              "state": "COMPLETED"}
+    with store.database.write() as connection:
+        connection.execute("UPDATE agent_tasks SET payload_json=?, state=? WHERE id=?",
+                           (json.dumps(stale), "COMPLETED", task.id))
+
+    body = agent_client.get(f"/api/tasks/{task.id}")
+
+    assert body.status_code == 200
+    served = body.json()["task"]
+    assert served["completion_status"] == "completed_verified"
+    assert served["verification"] is None
+    assert "legacy_unverified_claim" not in served
+    assert any(item["id"] == task.id for item in agent_client.get("/api/tasks").json()["tasks"])
+
+
 def test_a_running_task_appears_in_the_task_list(agent_client: TestClient):
     task_id = agent_client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"]
     wait_for_state(agent_client, task_id)

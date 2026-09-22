@@ -184,6 +184,54 @@ def test_the_persisted_verdict_masks_credential_shaped_output(settings: Settings
     assert report.checks[0].stdout_tail == leaked
 
 
+@pytest.mark.parametrize("status, verification, accepted", [
+    ("completed_verified", {"verified": True, "checks": []}, True),
+    ("completed_verified", None, False),
+    ("completed_unverified", None, True),
+    ("provider_unavailable", None, True),
+    ("failed", None, True),
+])
+def test_the_store_refuses_a_verified_claim_without_its_evidence(settings: Settings, status, verification, accepted):
+    """The rule lives at the write boundary, so no caller can route around it."""
+    store = TaskStore(Database(settings.database_path))
+    task = store.create("Some goal")
+    task.completion_status = status
+    task.verification = verification
+
+    if accepted:
+        assert store.save(task).completion_status == status
+    else:
+        with pytest.raises(ValueError, match="without the verification report"):
+            store.save(task)
+
+
+def test_a_legacy_verified_row_keeps_working_without_being_rewritten(settings: Settings):
+    """Records written before the rule stay readable, and still writable:
+    rolling one back must not fail because of history."""
+    database = Database(settings.database_path)
+    store = TaskStore(database)
+    task = store.create("Old run")
+    stale = task.as_dict() | {"completion_status": "completed_verified", "verification": None}
+    with database.write() as connection:
+        connection.execute("UPDATE agent_tasks SET payload_json=? WHERE id=?", (json.dumps(stale), task.id))
+
+    loaded = store.get(task.id)
+    assert loaded.completion_status == "completed_verified"
+    assert loaded.verification is None, "nothing is invented on read"
+    # The exemption is an in-process detail, never part of the record.
+    assert "legacy_unverified_claim" not in loaded.as_dict()
+
+    loaded.rolled_back = True
+    store.save(loaded)
+    assert store.get(task.id).rolled_back is True
+
+    # And it does not travel: a new task cannot make the same claim.
+    fresh = store.create("New run")
+    fresh.completion_status = "completed_verified"
+    with pytest.raises(ValueError):
+        store.save(fresh)
+
+
 def test_the_whole_run_is_persisted_and_replayable(settings: Settings, workspace: Path):
     add_passing_suite(workspace)
     router = ScriptedRouter([
