@@ -5,7 +5,6 @@ import hashlib
 import io
 import os
 import re
-import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -52,7 +51,6 @@ class TradingViewController:
         self.data_dir = data_dir
         self.computer_control = computer_control
         self.screen_access = screen_access
-        self._lock = threading.RLock()
         self._last_verified_timeframe: dict[int, str] = {}
 
     @staticmethod
