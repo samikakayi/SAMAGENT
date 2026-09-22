@@ -227,6 +227,82 @@ def test_sam_refuses_to_run_elevated(tmp_path: Path, monkeypatch):
         settings.prepare()
 
 
+# --- Importing SAM is not starting SAM ----------------------------------------
+#
+# `sam_backend/app.py` used to build the application at module scope, and
+# `sam_backend/__init__.py` imports it, so `import sam_backend` ran the whole
+# composition root: DPI setup, Settings.prepare(), the privilege guard, the
+# database and every service. On a Windows CI runner, which is elevated, that
+# made the guard fire during test collection and no test could even be found.
+#
+# Three contracts, deliberately kept apart:
+#   A. importing the package constructs nothing
+#   B. asking for an application constructs one
+#   C. asking for one on an elevated Windows process is still refused
+
+IMPORT_WHILE_ELEVATED = """
+import os, ctypes
+if os.name == "nt":
+    # What a GitHub Windows runner reports.
+    ctypes.windll.shell32.IsUserAnAdmin = lambda: 1
+import sam_backend
+import sam_backend.app
+print("imported", hasattr(sam_backend.app, "app"), callable(sam_backend.app.create_app))
+"""
+
+
+def test_importing_sam_backend_does_not_start_it(tmp_path: Path):
+    """Import must survive on an elevated process, because import is not startup."""
+    import subprocess
+    import sys
+
+    finished = subprocess.run(
+        [sys.executable, "-c", IMPORT_WHILE_ELEVATED], cwd=PROJECT_ROOT,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+
+    assert finished.returncode == 0, f"importing SAM started it:\n{finished.stderr}"
+    assert "Administrator" not in finished.stderr
+    # No application object is left lying around at module scope, and the
+    # factory is still exported for the callers that do want one.
+    assert finished.stdout.strip() == "imported False True", finished.stdout
+
+
+def test_asking_for_an_application_still_builds_one(tmp_path: Path):
+    from sam_backend.app import create_app
+
+    application = create_app(Settings(
+        project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d",
+    ))
+
+    assert application.state.settings is not None
+    assert any(getattr(route, "path", "") == "/api/health" for route in application.routes)
+
+
+def test_asking_for_an_application_while_elevated_is_still_refused(tmp_path: Path, monkeypatch):
+    """The guard protects startup, and building the app is startup."""
+    import sam_backend.config as config
+    from sam_backend.app import create_app
+
+    monkeypatch.setattr(config, "is_elevated_windows_process", lambda: True)
+
+    with pytest.raises(PermissionError, match="Administrator"):
+        create_app(Settings(
+            project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d",
+        ))
+
+
+def test_the_launch_command_names_something_that_exists():
+    """`python -m sam_backend` must still resolve to a real application."""
+    from sam_backend.app import create_app
+
+    source = (PROJECT_ROOT / "sam_backend" / "__main__.py").read_text(encoding="utf-8")
+
+    assert "sam_backend.app:create_app" in source, "the launcher names a target that no longer exists"
+    assert "factory=True" in source, "uvicorn would treat the factory as an application"
+    assert callable(create_app)
+
+
 # --- Credential detection by shape --------------------------------------------
 
 

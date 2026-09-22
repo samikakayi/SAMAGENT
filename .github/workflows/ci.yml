@@ -3,12 +3,15 @@ name: CI
 # SAM is a Windows desktop agent: its Win32 window discovery, screen capture,
 # Windows OCR and desktop input only exist on Windows, so the first runner is
 # Windows. A portability job would be a separate decision, not symmetry.
+#
+# Only `pull_request` covers the review branch -- it already re-runs on every
+# push to the branch, so listing that branch under `push` too ran everything
+# twice.
 on:
   pull_request:
   push:
     branches:
       - main
-      - release/sam-stabilization
 
 permissions:
   contents: read
@@ -25,11 +28,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 3.14 is what produced the local baseline this suite is measured against,
-      # and requirements-lock.txt is pinned against it. README requires 3.11+.
+      # 3.12 is inside the project's supported range (README: 3.11 or newer) and
+      # has mature Windows wheels. 3.14 matched the developer's machine but spent
+      # 19 minutes building several pinned dependencies from source.
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements-lock.txt
+            sam_backend/requirements-dev.txt
+
+      # Cheap and fast, so it runs before the suite and reports on its own.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check frontend syntax
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem frontend/*.js | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Syntax error in $($_.Name)" }
+            Write-Host "ok $($_.Name)"
+          }
 
       # Both files already exist in the repository; no package list is repeated
       # here. The lock file is the install setup.ps1 performs and is the only
@@ -44,16 +66,3 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Check frontend syntax
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Get-ChildItem frontend/*.js | ForEach-Object {
-            node --check $_.FullName
-            if ($LASTEXITCODE -ne 0) { throw "Syntax error in $($_.Name)" }
-            Write-Host "ok $($_.Name)"
-          }

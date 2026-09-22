@@ -12,7 +12,10 @@ def main() -> None:
     settings = Settings.from_env()
     # A computer-control API must not be exposed to the LAN. Reverse-proxy deployment is intentionally unsupported.
     host = "127.0.0.1"
-    uvicorn.run("sam_backend.app:app", host=host, port=settings.port, reload=False, access_log=False)
+    # A factory, not a module-level application: importing sam_backend must not
+    # build one. Startup happens here, where refusing an elevated process belongs.
+    uvicorn.run("sam_backend.app:create_app", host=host, port=settings.port, reload=False,
+                access_log=False, factory=True)
 
 
 if __name__ == "__main__":

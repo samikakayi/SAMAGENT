@@ -232,5 +232,3 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
 
     return application
 
-
-app = create_app()
