@@ -1037,8 +1037,15 @@ class DrawingEngine:
             )
         return StandardResult.success(payload, verified=True, started_at=started)
 
-    def capability(self) -> dict[str, Any]:
-        state = self._observe()
+    def capability(self, observation: Any = None) -> dict[str, Any]:
+        """What drawing is possible right now.
+
+        `observation` is one caller-supplied snapshot to decide from, for a caller
+        that has just observed the chart itself and needs an answer about that same
+        moment. It is read here and not kept; with no snapshot the engine observes
+        for itself, as every other caller does.
+        """
+        state = self._observe() if observation is None else observation
         ocr = self.calibrator.capability()
         calibration, failure = self.active_calibration(state) if state.window_handle else (None, None)
         return {

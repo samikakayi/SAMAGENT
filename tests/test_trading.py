@@ -702,3 +702,170 @@ def test_an_unreadable_metatrader_package_does_not_fail_the_status_endpoint(app,
     assert "someone" not in response.text and "site-packages" not in response.text
     # The rest of the payload is unaffected by the broker.
     assert "drawing" in payload and "tradingview" in payload
+
+
+# --- one window scan per status request ------------------------------------------
+# status() observed the chart itself and then called DrawingEngine.capability(),
+# which observed again through its own injected `_observe`. One API request cost
+# two Win32 window scans, and the two halves of the response could describe two
+# different moments.
+
+
+class CountingWindow:
+    """An observation source that reports a different chart on every call."""
+
+    def __init__(self, *charts):
+        self.charts = list(charts)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.charts[min(self.calls - 1, len(self.charts) - 1)]
+
+
+def chart_window(handle=7, symbol="XAUUSD", timeframe="M15", geometry=None):
+    from sam_backend.trading.tradingview import TradingViewState
+
+    box = geometry or {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+    return TradingViewState(
+        running=True, process_ids=[11], window_handle=handle, title=symbol, symbol=symbol,
+        feed=None, timeframe=timeframe, timeframe_verified=True, current_price=2500.0,
+        window_geometry=box, monitor=None, active=True, interactive=True, client_geometry=box,
+    )
+
+
+def watched_service(settings, observe):
+    """A real TradingService whose chart observation is counted, MT5 stubbed out."""
+    from sam_backend.trading.market_data import MarketDataError
+
+    settings.prepare()
+    trading = TradingService(settings, Database(settings.database_path), CancellationManager())
+    trading.tradingview.observe = trading.drawing._observe = observe
+
+    def no_broker(*args, **kwargs):
+        raise MarketDataError("MetaTrader 5 terminal is not running")
+
+    provider = trading.market_data.providers["metatrader5"]
+    provider.fetch = provider._module = no_broker
+    return trading
+
+
+def test_one_status_request_scans_the_window_once(settings):
+    window = CountingWindow(chart_window())
+
+    watched_service(settings, window).status()
+
+    assert window.calls == 1, f"one request performed {window.calls} window scans"
+
+
+def test_the_status_response_describes_a_single_moment(settings):
+    """Two scans can straddle a change: the user switches chart between them."""
+    window = CountingWindow(chart_window(symbol="XAUUSD"), chart_window(handle=99, symbol="EURUSD"))
+
+    payload = watched_service(settings, window).status()
+
+    assert window.calls == 1
+    assert payload["tradingview"]["symbol"] == "XAUUSD"
+    assert payload["tradingview"]["window_handle"] == 7
+    # The drawing verdict must be about that same chart, not the one after it.
+    assert "EURUSD" not in (payload["drawing"]["calibration_error"] or "")
+
+
+def test_capability_without_a_snapshot_still_observes_for_itself(settings):
+    """Every other caller passes nothing and must keep getting a fresh look."""
+    window = CountingWindow(chart_window())
+    trading = watched_service(settings, window)
+
+    trading.drawing.capability()
+    trading.drawing.capability()
+
+    assert window.calls == 2, "the engine stopped observing for callers that supply nothing"
+
+
+def test_a_supplied_snapshot_is_not_kept_on_the_engine(settings):
+    """It decides one answer; it must not become state the next call reads."""
+    window = CountingWindow(chart_window())
+    trading = watched_service(settings, window)
+    before = set(vars(trading.drawing))
+
+    trading.drawing.capability(chart_window(handle=404, symbol="EURUSD"))
+
+    assert window.calls == 0, "a supplied snapshot must replace the scan, not add to it"
+    assert set(vars(trading.drawing)) == before, "the engine stored the caller's snapshot"
+    # The next unsupplied call observes afresh rather than reusing what it was handed.
+    assert trading.drawing.capability()["calibrated"] is False
+    assert window.calls == 1
+
+
+def calibrate_for(trading, state, geometry=None):
+    from sam_backend.trading.calibration import geometry_hash
+
+    box = geometry or {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+    trading.database.save_chart_calibration(
+        window_handle=state.window_handle, symbol=state.symbol, timeframe=state.timeframe,
+        geometry_hash=geometry_hash(box), slope=-2.0, intercept=3200.0,
+        method="test", verified=True, axis_x=1100.0,
+    )
+
+
+def test_a_supplied_snapshot_with_a_valid_calibration_stays_available(settings):
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    calibrate_for(trading, state)
+
+    assert trading.drawing.capability(state)["verified_price_drawing"] is True
+
+
+def test_a_supplied_snapshot_without_a_calibration_is_unavailable(settings):
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+
+    capability = trading.drawing.capability(state)
+
+    assert capability["calibrated"] is False
+    assert "has not been calibrated" in capability["calibration_error"]
+
+
+def test_a_supplied_snapshot_with_no_window_is_unavailable(settings):
+    trading = watched_service(settings, CountingWindow(chart_window()))
+    calibrate_for(trading, chart_window())
+
+    capability = trading.drawing.capability(chart_window(handle=None))
+
+    assert capability["calibrated"] is False
+    assert capability["verified_price_drawing"] is False
+
+
+def test_a_supplied_snapshot_of_a_moved_viewport_refuses_the_calibration(settings):
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    calibrate_for(trading, state)
+
+    moved = chart_window(geometry={"left": 0, "top": 0, "right": 1400, "bottom": 800})
+
+    assert trading.drawing.capability(moved)["calibrated"] is False
+    # The same calibration is still good for the viewport it was taken in.
+    assert trading.drawing.capability(state)["calibrated"] is True
+
+
+def test_a_partial_snapshot_fails_closed_rather_than_guessing(settings):
+    """A window with no symbol or timeframe cannot match a calibration row."""
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    calibrate_for(trading, state)
+
+    partial = chart_window(symbol=None, timeframe=None)
+
+    assert trading.drawing.capability(partial)["calibrated"] is False
+
+
+def test_status_keys_the_calibration_to_the_observed_chart(settings):
+    """The scoping dimensions are unchanged: handle, symbol, timeframe, geometry."""
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    calibrate_for(trading, state)
+
+    assert trading.status()["drawing"]["verified_price_drawing"] is True

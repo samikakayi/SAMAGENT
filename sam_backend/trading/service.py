@@ -52,11 +52,13 @@ class TradingService:
         self.drawing.refresh_permissions(computer_control=computer_control, screen_access=screen_access)
 
     def status(self, symbol: str = "XAUUSD") -> dict[str, Any]:
+        # One window scan, so both halves of the answer describe the same moment.
+        observation = self.tradingview.observe()
         return {
             "market_data": self.market_data.health(),
             "capabilities": self.market_data.providers["metatrader5"].capabilities(symbol),
-            "tradingview": self.tradingview.observe().as_dict(),
-            "drawing": self.drawing.capability(),
+            "tradingview": observation.as_dict(),
+            "drawing": self.drawing.capability(observation),
             "context": self.database.get_trading_context(),
             "monitors": [item for item in self.database.list_trading_setups(100) if item["monitor_enabled"]],
         }
