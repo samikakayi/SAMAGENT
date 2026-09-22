@@ -192,3 +192,85 @@ a tool's schema and changing how tools run are different jobs. The handlers
 themselves stay together because they share the registry's containment and
 process helpers; grouping them by domain would scatter that shared core
 without making any one group easier to read.
+
+## Frozen decisions
+
+These were each reached by tracing the real code, and each is a decision not
+to go further. They are recorded so the next reader knows the current shape is
+deliberate rather than unfinished.
+
+**One composition root.** `create_app` builds the services and registers route
+groups; it implements no endpoint. `api/` holds those groups -- system,
+conversations, oversight, settings, providers, voice, desktop, security, and a
+`trading/` package split into market, chart, replay, strategies and record.
+Every group is registered the same way and names its dependencies at the top
+of its register function.
+
+**One owner per fact.**
+
+- `application.state.adapters` is the only answer to "which adapter registry is
+  current". Routes read it rather than holding a snapshot, because the registry
+  is replaced wholesale when a credential changes.
+- `MarketAnalyst.latest` is the only latest analysis. The chart draws from it
+  and a monitored setup is created from it; creating one before any analysis is
+  a 409, and that ordering is why those route groups must share one service.
+- The persisted calibration row is the only calibration. Manual anchors and OCR
+  both write it under the same viewport key, so either can unblock a drawing.
+- `TaskStore.save` is the only place that decides whether a task may claim it
+  was verified, and the exemption for older rows is read from the stored row,
+  never from the object in hand.
+
+**Single owners that were deliberately not split.** `AutonomousOrchestrator`
+remains the one owner of the run state machine; what is left in it after
+`observations.py` and `control.py` came out is lifecycle decisions, and
+splitting those would produce objects calling each other back. `TradingService`
+stays a facade because twenty-two of its twenty-four methods are exactly that,
+and the two that were not are now `MarketAnalyst`. `DrawingEngine` is one
+drawing engine: its pixel verification is drawing-domain knowledge, not a
+generic utility. `TradingViewController` is one controller for one window.
+
+**Desktop access has three styles, on purpose for now.** `DrawingEngine` takes
+an injected `DesktopInput`; `TradingViewController` reaches the OS through its
+`_modules()` seam; a few raw `ctypes`/clipboard calls sit below both. All three
+are correct and testable enough that the behaviour above them is pinned.
+Unifying them is a real option, but it should wait for a concrete need -- a
+feature or a test that cannot be written otherwise -- rather than being built
+speculatively.
+
+**Four methods are not unit-executed, and that is accepted.**
+`_send_unicode`, the two clipboard calls and `_open_symbol_search` sit directly
+on `SendInput`, `win32clipboard`, and screenshot-plus-OCR. Driving them under
+test would exercise a mock of Windows rather than any decision SAM makes. What
+protects them is the layer above: every gate, refusal and state assembly that
+decides *whether* to call them is covered, and a failure inside them surfaces
+as the fail-closed error the caller already asserts. If a future change needs
+their internals verified, that is the moment to introduce one shared desktop
+adapter -- not before.
+
+**History is kept as it was recorded.** Task rows written before the
+verification invariant existed still say `completed_verified` with no evidence.
+They load, they serve, and they can be rolled back; they are not rewritten.
+
+## Known debt
+
+Real, none blocking. Each is here because it is worth knowing, not because it
+is scheduled.
+
+1. **`AutonomousOrchestrator` is ~787 lines.** What remains is the state
+   machine. Reducing it further means modelling stages as data rather than
+   methods, which is a design change and needs its own decision, not another
+   extraction pass.
+2. **Four TradingView methods are not unit-executed** (see above). Accepted
+   boundary, not a gap to close with mocks.
+3. **Three desktop-access styles in `trading/`** (see above). Correct today;
+   unify only when something concrete requires it.
+4. **A repeated decision on an already-decided approval answers 200.** It
+   executes nothing and the approval keeps its original outcome, so it fails
+   closed; the response is simply more optimistic than the truth. Predates this
+   work.
+5. **`DirectToolRequest` is a schema with no route.** There is no direct
+   tool-execution endpoint at all, which is why it is dead rather than
+   dangerous.
+6. **A few unused imports** in `trading/analysis.py`, `trading/replay.py`,
+   `windows_control.py`, `tools/registry.py` and `api/desktop.py`. Inert; left
+   alone rather than swept up in a stabilisation pass.
