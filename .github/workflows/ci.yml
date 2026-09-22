@@ -64,5 +64,10 @@ jobs:
           python -m pip install -r requirements-lock.txt
           python -m pip install -r sam_backend/requirements-dev.txt
 
+      # pytest.ini keeps scratch space inside the project (work/pytest-tmp) because
+      # the shared Windows temp root can be ACL-locked. work/ is gitignored, so a
+      # fresh checkout does not have it and pytest does not create the parent.
       - name: Run tests
-        run: python -m pytest -q
+        run: |
+          New-Item -ItemType Directory -Force -Path work | Out-Null
+          python -m pytest -q
