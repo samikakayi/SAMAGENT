@@ -8,6 +8,7 @@ did not quietly get a private copy of something the runtime shares.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -238,3 +239,100 @@ def test_a_failed_rebuild_leaves_every_consumer_on_the_working_registry(tmp_path
     after = registry_identities(app)
     assert after == before, f"a failed rebuild split ownership: {before} -> {after}"
     assert len(set(after.values())) == 1
+
+
+# -- the whole chain, once -------------------------------------------------
+# Every commit on this branch has its own tests. This one asserts they still
+# compose: runtime fallback config, the composition root, the extracted
+# provider and task routes, the approval binding, the verification evidence
+# and the store invariant all take part in a single run.
+
+class ChainAdapter:
+    """Plans two steps: an allowed write, then a command that needs approval."""
+
+    def __init__(self) -> None:
+        self.turns = 0
+
+    async def list_models(self):
+        return [{"id": "fake", "name": "fake", "provider": "ollama"}]
+
+    async def complete(self, messages, tools, model):
+        from sam_backend.models import AssistantTurn, ToolCall
+
+        joined = "\n".join(str(item.get("content", "")) for item in messages)
+        if "planning stage" in joined:
+            return AssistantTurn(
+                '```json\n{"steps":[{"text":"write notes","kind":"edit"},'
+                '{"text":"run a command","kind":"verify"}]}\n```'
+            )
+        self.turns += 1
+        if self.turns == 1:
+            return AssistantTurn("writing", [ToolCall("c1", "write_file",
+                                                      {"path": "notes.txt", "content": "hello"})])
+        if self.turns == 2:
+            return AssistantTurn("running", [ToolCall("c2", "run_terminal",
+                                                      {"command": "echo done", "cwd": "."})])
+        return AssistantTurn("finished")
+
+
+class _OneAdapter:
+    def __init__(self, adapter) -> None:
+        self.adapter = adapter
+
+    def get(self, provider):
+        return self.adapter
+
+
+def test_the_whole_branch_composes_in_one_run(tmp_path):
+    """Settings -> preflight -> guarded approval -> tools -> verification ->
+    persistence -> API, with every extracted boundary in the path."""
+    from fastapi.testclient import TestClient
+    from sam_backend.db import Database
+    from sam_backend.tasks import TaskStore
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (workspace / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    settings = Settings(
+        project_root=tmp_path, workspace_root=workspace, data_dir=tmp_path / "data",
+        default_provider="ollama", default_model="fake", permission_mode="guarded",
+    )
+    app = create_app(settings, _OneAdapter(ChainAdapter()))
+
+    with TestClient(app) as client:
+        assert client.put("/api/settings", json={
+            "fallback_model": "nvidia/nemotron-3-ultra-550b-a55b:free", "fallback_enabled": True,
+        }).status_code == 200
+
+        task_id = client.post("/api/tasks", json={"goal": "write and verify"}).json()["task_id"]
+        deadline = time.time() + 60
+        task = {}
+        while time.time() < deadline:
+            task = client.get(f"/api/tasks/{task_id}").json()["task"]
+            if task["state"] == "WAITING_FOR_APPROVAL":
+                break
+            time.sleep(0.2)
+        assert task["state"] == "WAITING_FOR_APPROVAL", task.get("summary")
+
+        approval_id = next(event["detail"]["approval_id"] for event in reversed(task["events"])
+                           if event["kind"] == "approval")
+        # The task-scoped route, which must accept only its own approval.
+        assert client.post(f"/api/tasks/{task_id}/approvals",
+                           json={"approval_id": approval_id, "decision": "approved"}).status_code == 200
+
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            task = client.get(f"/api/tasks/{task_id}").json()["task"]
+            if task["terminal"]:
+                break
+            time.sleep(0.3)
+
+        assert task["state"] == "COMPLETED" and task["completion_status"] == "completed_verified"
+        assert [(c["kind"], c["outcome"]) for c in task["verification"]["checks"]] == [("test", "PASSED")]
+        assert (workspace / "notes.txt").read_text(encoding="utf-8") == "hello"
+
+        # What the API served is what a fresh reader of the store would see.
+        stored = TaskStore(Database(settings.database_path)).get(task_id)
+        assert stored.verification == task["verification"]
+        assert stored.completion_status == "completed_verified"
