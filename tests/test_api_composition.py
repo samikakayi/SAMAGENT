@@ -66,10 +66,19 @@ def surface(app) -> set[tuple[str, str]]:
     ("/api/cost", "GET"),
     ("/api/providers/status", "GET"),
     ("/api/providers/credentials", "POST"),
-    ("/api/trading/status", "GET"),              # trading
-    ("/api/tradingview/action", "POST"),
-    ("/api/research/replay/start", "POST"),
-    ("/api/trading/strategies", "GET"),
+    ("/api/trading/status", "GET"),              # trading: market
+    ("/api/trading/analyze", "POST"),
+    ("/api/trading/gann", "GET"),
+    ("/api/trading/setups", "GET"),              # trading: record
+    ("/api/trading/journal", "POST"),
+    ("/api/tradingview/action", "POST"),         # trading: chart
+    ("/api/tradingview/drawings", "GET"),
+    ("/api/tradingview/layers", "POST"),
+    ("/api/research/replay/start", "POST"),      # trading: replay
+    ("/api/research/replay/scan", "POST"),
+    ("/api/trading/strategies", "GET"),          # trading: strategies
+    ("/api/trading/backtest", "POST"),
+    ("/api/trading/triggers", "GET"),
     ("/api/voice/capabilities", "GET"),          # voice
     ("/api/voice/speak", "POST"),
     ("/api/mt5", "GET"),                         # desktop
@@ -81,6 +90,27 @@ def surface(app) -> set[tuple[str, str]]:
 ])
 def test_every_route_group_is_registered(app, path, method):
     assert (path, method) in surface(app)
+
+
+def test_no_endpoint_is_registered_twice(app):
+    """Splitting a route group is exactly how a duplicate registration happens."""
+    seen = [(route.path, method)
+            for route in app.routes
+            for method in sorted(getattr(route, "methods", None) or [])
+            if getattr(route, "path", "").startswith(("/api/trading", "/api/tradingview", "/api/research"))]
+    duplicates = {pair for pair in seen if seen.count(pair) > 1}
+    assert not duplicates, f"registered more than once: {sorted(duplicates)}"
+    assert len(seen) >= 34, f"only {len(seen)} trading route entries survived the split"
+
+
+def test_the_trading_groups_share_one_service(app):
+    """Creating a setup reads analysis state the market group wrote.
+
+    Separate TradingService instances would make POST /setups refuse work
+    that had just succeeded, with nothing in the response to explain it.
+    """
+    assert app.state.trading is app.state.tools.trading
+    assert app.state.replay.market_data is app.state.trading.market_data,         "replay research reads the same market data the analysis routes do"
 
 
 def test_the_surface_is_whole(app):
