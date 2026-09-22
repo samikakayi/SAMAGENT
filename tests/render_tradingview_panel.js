@@ -1,147 +1,82 @@
 "use strict";
-// Renders the real frontend/panels.js TradingView panel against a payload the
-// backend itself produced, and prints the text a user would actually see.
-// Driven by tests/test_new_api.py; no browser, no invented panel logic.
+// Drives the real frontend/panels.js TradingView card the way the page does --
+// SAMTrading entry points fired per poll on a virtual clock -- against scripted
+// endpoint replies, and prints what a user would see. Used by tests/test_new_api.py.
 //
-// Two scenario shapes:
-//   one `/api/trading/status` payload           -> a single refresh, real timers
-//   { polls: [{responses, advanceMs, fire}, ...] } -> several refreshes on a
-//     virtual clock, each poll fired like the page's interval would, without
-//     waiting the real seconds between them. `fire` lists the SAMTrading entry
-//     points to run in that poll (default ["tradingView"]); page load runs
-//     ["tradingView", "toolStatus"] together.
-// A scripted response may be {body, status}, {hang: true} or {delayMs, body}.
+// Scenario: { polls: [{ responses, fire, advanceMs }, ...] }
+//   responses  path -> {body, status} | {hang: true} | {delayMs, body}; kept
+//              from the previous poll when omitted
+//   fire       SAMTrading functions to run this poll (default ["tradingView"])
+//   advanceMs  virtual time to let pass afterwards (default 10s, the page's tick)
 const fs = require("node:fs");
 const vm = require("node:vm");
 
-const [panelPath, payloadPath] = process.argv.slice(2);
-const payload = JSON.parse(fs.readFileSync(payloadPath, "utf-8"));
+const [panelPath, scenarioPath] = process.argv.slice(2);
+const { polls } = JSON.parse(fs.readFileSync(scenarioPath, "utf-8"));
 
 const nodes = new Map();
-function makeNode() {
-  const classes = [];
-  return { textContent: "", className: "", classList: { add: (name) => classes.push(name), names: classes } };
-}
-
+const node = () => ({ textContent: "", className: "", classList: { add() {} } });
 const document = {
-  getElementById(id) {
-    if (!nodes.has(id)) nodes.set(id, makeNode());
-    return nodes.get(id);
-  },
-  querySelector: () => null,
-  querySelectorAll: () => [],
-  createElement: () => makeNode(),
-  addEventListener: () => {},  // the page never loads; the refresh is driven directly
+  getElementById: (id) => nodes.get(id) || nodes.set(id, node()).get(id),
+  querySelector: () => null, querySelectorAll: () => [], createElement: node,
+  addEventListener() {},  // the page never loads; entry points are fired directly
 };
 
-// --- Virtual clock (multi-poll mode only) ------------------------------------
-let now = 0;
-let timers = [];
-let nextTimer = 1;
-const clock = {
-  setTimeout(fn, ms = 0) { const id = nextTimer++; timers.push({ id, at: now + ms, fn }); return id; },
-  clearTimeout(id) { timers = timers.filter((timer) => timer.id !== id); },
-  async advance(ms) {
-    const until = now + ms;
-    for (;;) {
-      timers.sort((a, b) => a.at - b.at);
-      const due = timers[0];
-      if (!due || due.at > until) break;
-      timers.shift();
-      now = due.at;
-      due.fn();
-      await flush();
-    }
-    now = until;
+let now = 0, timers = [], nextTimer = 1;
+const setTimer = (fn, ms = 0) => { timers.push({ id: nextTimer, at: now + ms, fn }); return nextTimer++; };
+const clearTimer = (id) => { timers = timers.filter((timer) => timer.id !== id); };
+const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImmediate); };
+async function advance(ms) {
+  const until = now + ms;
+  for (timers.sort((a, b) => a.at - b.at); timers.length && timers[0].at <= until; timers.sort((a, b) => a.at - b.at)) {
+    const due = timers.shift();
+    now = due.at;
+    due.fn();
     await flush();
-  },
-};
-async function flush(rounds = 8) {
-  for (let i = 0; i < rounds; i++) await new Promise((resolve) => setImmediate(resolve));
+  }
+  now = until;
+  await flush();
 }
 
-// --- Scripted fetch ----------------------------------------------------------
-let responses = payload.responses || null;
-const requested = [];
-const inFlight = {};
-const maxInFlight = {};
+let responses = {};
+const requested = [], inFlight = {}, maxInFlight = {}, errors = [];
 function track(path, delta) {
   inFlight[path] = (inFlight[path] || 0) + delta;
   maxInFlight[path] = Math.max(maxInFlight[path] || 0, inFlight[path]);
 }
-
-function reply(path, script) {
-  const status = script.status || 200;
-  return { ok: status < 400, status, json: async () => script.body };
-}
-
-async function fetch(path, options = {}) {
+function fetch(path, options = {}) {
   requested.push(path);
-  if (!responses) {
-    // The file is one `/api/trading/status` payload, which carries the same
-    // observation under `tradingview`, so either endpoint answers truthfully.
-    const body = path === "/api/tradingview/state" ? payload.tradingview : payload;
-    return { ok: true, status: 200, json: async () => body };
-  }
   const script = responses[path];
-  if (!script) return { ok: false, status: 503, json: async () => ({ detail: `no stub for ${path}` }) };
+  if (!script) return Promise.resolve({ ok: false, status: 503, json: async () => ({ detail: `no stub for ${path}` }) });
   track(path, +1);
   return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = (fn, value) => { if (settled) return; settled = true; track(path, -1); fn(value); };
-    if (options.signal) {
-      const abort = () => finish(reject, Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
-      if (options.signal.aborted) abort(); else options.signal.addEventListener("abort", abort);
-    }
-    if (script.hang) return;                                   // a stalled broker never answers
-    if (script.delayMs) return void clock.setTimeout(() => finish(resolve, reply(path, script)), script.delayMs);
-    finish(resolve, reply(path, script));
+    const finish = (fn, value) => { if (!settled) { settled = true; track(path, -1); fn(value); } };
+    options.signal?.addEventListener("abort", () => finish(reject, Object.assign(new Error("aborted"), { name: "AbortError" })));
+    const status = script.status || 200;
+    const reply = { ok: status < 400, status, json: async () => script.body };
+    if (script.hang) return;  // a stalled broker never answers
+    if (script.delayMs) setTimer(() => finish(resolve, reply), script.delayMs);
+    else finish(resolve, reply);
   });
 }
 
 const context = {
-  document, fetch, console, AbortController,
-  setInterval: () => {},
-  setTimeout: payload.polls ? clock.setTimeout : setTimeout,
-  clearTimeout: payload.polls ? clock.clearTimeout : clearTimeout,
+  document, fetch, AbortController, setTimeout: setTimer, clearTimeout: clearTimer, setInterval() {},
+  console: { ...console, error: (...args) => errors.push(args.join(" ")) },
 };
-context.window = context;
-context.globalThis = context;
-vm.createContext(context);
-vm.runInContext(fs.readFileSync(panelPath, "utf-8"), context);
+context.window = context.globalThis = context;
+vm.runInContext(fs.readFileSync(panelPath, "utf-8"), vm.createContext(context));
 
-const errors = [];
-const originalError = console.error;
-console.error = (...args) => { errors.push(args.map(String).join(" ")); };
-
-function snapshot(from) {
-  const rendered = {};
-  for (const [id, node] of nodes) rendered[id] = node.textContent;
-  return { requested: requested.slice(from), inFlight: { ...inFlight }, rendered };
-}
-
+const rendered = () => Object.fromEntries([...nodes].map(([id, n]) => [id, n.textContent]));
 (async () => {
-  if (!payload.polls) {
-    await Promise.race([
-      context.window.SAMTrading.tradingView(),
-      new Promise((resolve) => setTimeout(resolve, Number(process.env.PANEL_TIMEOUT_MS || 1500))),
-    ]);
-    const { rendered } = snapshot(0);
-    console.log(JSON.stringify({ requested, rendered }));
-    return;
-  }
-  const polls = [];
-  for (const poll of payload.polls) {
-    if (poll.responses) responses = poll.responses;
+  const seen = [];
+  for (const poll of polls) {
+    responses = poll.responses || responses;
     const from = requested.length;
-    for (const entry of poll.fire || ["tradingView"]) {
-      context.window.SAMTrading[entry]().catch((error) => errors.push(String(error)));
-    }
-    await flush();
-    const fired = snapshot(from);
-    await clock.advance(poll.advanceMs ?? 10_000);
-    const afterInterval = snapshot(from);
-    polls.push({ fired, afterInterval });
+    for (const entry of poll.fire || ["tradingView"]) context.window.SAMTrading[entry]().catch((error) => errors.push(String(error)));
+    await advance(poll.advanceMs ?? 10_000);
+    seen.push({ requested: requested.slice(from), rendered: rendered() });
   }
-  console.log(JSON.stringify({ polls, maxInFlight, inFlight, errors, requested, rendered: snapshot(0).rendered }));
-})().catch((error) => { originalError(error.stack || String(error)); process.exit(1); });
+  console.log(JSON.stringify({ polls: seen, requested, maxInFlight, inFlight, errors, rendered: rendered() }));
+})();
