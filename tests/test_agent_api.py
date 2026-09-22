@@ -95,6 +95,13 @@ def test_a_task_can_be_started_and_followed_to_completion(agent_client: TestClie
     assert task["state"] == "COMPLETED", task.get("summary")
     assert task["completion_status"] == "completed_verified"
     assert (Path(agent_settings.workspace_root) / "report.txt").read_text(encoding="utf-8") == "done"
+    # The API hands the panel the evidence, not just the label: a verified
+    # task can never serialise its verdict as null.
+    assert task["verification"] is not None and task["verification"]["verified"] is True
+    # The list stays a headline projection; its label must not disagree with
+    # the evidence the detail carries.
+    listed = next(item for item in agent_client.get("/api/tasks").json()["tasks"] if item["id"] == task_id)
+    assert listed["completion_status"] == "completed_verified"
 
 
 def test_a_running_task_appears_in_the_task_list(agent_client: TestClient):

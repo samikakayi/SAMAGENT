@@ -120,7 +120,12 @@ class AgentTask:
     events: list[TaskEvent] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
     modified_files: list[str] = field(default_factory=list)
+    # Every validation attempt, plus the raw output of the agent's own
+    # run_tests calls -- the history a re-planning run leaves behind.
     test_results: list[dict[str, Any]] = field(default_factory=list)
+    # The verdict that decided completion: the last verification report, or
+    # None when the run ended before anything could be verified.
+    verification: dict[str, Any] | None = None
     errors: list[str] = field(default_factory=list)
     tool_calls: int = 0
     retries: int = 0
@@ -312,6 +317,7 @@ def _from_payload(payload: str) -> AgentTask:
         observations=list(data.get("observations") or []),
         modified_files=list(data.get("modified_files") or []),
         test_results=list(data.get("test_results") or []),
+        verification=data.get("verification"),
         errors=list(data.get("errors") or []),
         tool_calls=int(data.get("tool_calls") or 0),
         retries=int(data.get("retries") or 0),

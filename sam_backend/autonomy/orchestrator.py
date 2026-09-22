@@ -632,7 +632,10 @@ class AutonomousOrchestrator:
         report = await asyncio.to_thread(self.verifier.verify, project_map, self.workspace)
         if is_ui_work(task.modified_files):
             await self._validate_ui(task, project_map, report)
+        # The history keeps every attempt; the verdict names the one that
+        # decided the outcome, so completed_verified always has its evidence.
         task.test_results.append(report.as_dict())
+        task.verification = report.as_dict()
         await self._emit(
             task, "result" if report.ok else "error",
             report.summary_text()[:800], verified=report.verified, ok=report.ok,

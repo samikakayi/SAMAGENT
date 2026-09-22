@@ -119,12 +119,69 @@ def test_a_goal_is_planned_executed_and_verified(settings: Settings, workspace: 
     assert task.completion_status == "completed_verified"
     assert (workspace / "greeting.txt").read_text(encoding="utf-8") == "hello"
     assert "greeting.txt" in " ".join(task.modified_files)
-    # The verification engine really ran the project's suite.
-    assert any(
-        check.get("outcome") == "PASSED"
-        for result in task.test_results
-        for check in (result.get("checks") or [])
-    )
+    # completed_verified must carry the evidence that earned it: the verdict
+    # is the same report the completion path read, not a second opinion.
+    assert task.verification is not None and task.verification["verified"] is True
+    assert any(check["outcome"] == "PASSED" for check in task.verification["checks"])
+
+
+def test_the_verdict_survives_a_reload_and_is_absent_when_nothing_ran(settings: Settings, workspace: Path):
+    """The evidence lives in the task record, not only in memory."""
+    add_passing_suite(workspace)
+    router = ScriptedRouter([
+        plan_turn(("Write a file", "edit")),
+        tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+    ])
+    orchestrator = build_orchestrator(settings, router)
+    task = asyncio.run(orchestrator.start("Write a file"))
+
+    reloaded = orchestrator.store.get(task.id)
+    assert reloaded.completion_status == "completed_verified"
+    assert reloaded.verification == task.verification
+    assert reloaded.verification["verified"] is True
+
+    # A run that never reached validation invents nothing.
+    never_validated = orchestrator.store.create("Not started")
+    assert never_validated.verification is None
+    assert orchestrator.store.get(never_validated.id).verification is None
+
+
+def test_a_run_that_fails_verification_keeps_the_failing_evidence(settings: Settings, workspace: Path):
+    """Honest either way: the verdict is recorded when it refuses the work too."""
+    (workspace / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (workspace / "test_bad.py").write_text("def test_bad():\n    assert False\n", encoding="utf-8")
+    router = ScriptedRouter([
+        plan_turn(("Write a file", "edit")),
+        tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+        plan_turn(("Try again", "edit")),
+        tool_turn("write_file", {"path": "a.txt", "content": "y"}),
+    ])
+    orchestrator = build_orchestrator(settings, router)
+    orchestrator.max_replans = 0
+
+    task = asyncio.run(orchestrator.start("Write a file"))
+
+    assert task.completion_status != "completed_verified"
+    assert task.verification is not None and task.verification["verified"] is False
+    assert any(check["outcome"] == "FAILED" for check in task.verification["checks"])
+
+
+def test_the_persisted_verdict_masks_credential_shaped_output(settings: Settings, workspace: Path):
+    """Command output is persisted and rendered, so it is redacted first."""
+    from sam_backend.verification import CheckOutcome, CheckResult, VerificationReport
+
+    leaked = "OPENROUTER_API_KEY=sk-or-v1-VERIFICATION-SENTINEL-0123456789"
+    report = VerificationReport(checks=[CheckResult(
+        kind="test", command="pytest", outcome=CheckOutcome.FAILED,
+        stdout_tail=leaked, stderr_tail=leaked, failures=[leaked],
+    )])
+
+    payload = json.dumps(report.as_dict())
+
+    assert "sk-or-v1-VERIFICATION-SENTINEL-0123456789" not in payload
+    assert "[REDACTED]" in payload
+    # The re-planner still needs the real text, so the object keeps it.
+    assert report.checks[0].stdout_tail == leaked
 
 
 def test_the_whole_run_is_persisted_and_replayable(settings: Settings, workspace: Path):
