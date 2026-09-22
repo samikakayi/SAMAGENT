@@ -232,3 +232,26 @@ def test_concurrent_drivers_at_the_orchestrator_level_are_refused(tmp_path: Path
 
         finished = client.portal.call(race) if hasattr(client, "portal") else asyncio.run(race())
         assert finished.terminal
+
+
+def test_an_approval_cannot_be_resolved_through_an_unrelated_task(tmp_path: Path):
+    """An approval is permission for one action in one run.
+
+    The executed call is hash-bound, so another task cannot redirect it -- but
+    routing it through a second task would still mark that task's step done
+    and let a guarded run step past its own pending gate, while the run that
+    actually asked waits forever.
+    """
+    adapter = ScriptedAdapter(steps=1, tool="run_terminal", arguments={"command": "echo hi", "cwd": "."})
+    with make_client(tmp_path, adapter, mode="guarded") as client:
+        first = client.post("/api/tasks", json={"goal": "needs approval"}).json()["task_id"]
+        approval_id = pending_approval_id(wait_for(client, first, state="WAITING_FOR_APPROVAL"))
+        assert approval_id, "the run never paused for approval"
+
+        other = client.post("/api/tasks", json={"goal": "an unrelated run"}).json()["task_id"]
+        response = client.post(f"/api/tasks/{other}/approvals",
+                               json={"approval_id": approval_id, "decision": "approved"})
+
+        assert response.status_code == 404, "another task's approval must not be usable here"
+        # The approval the owner raised is untouched and still pending.
+        assert client.get(f"/api/approvals/{approval_id}").json()["approval"]["status"] == "pending"

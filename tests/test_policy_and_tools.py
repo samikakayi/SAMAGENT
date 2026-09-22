@@ -221,3 +221,54 @@ def test_workspace_root_itself_can_never_be_deleted(settings):
     result = registry.execute("delete_path", {"path": "."}, approved=True)
     assert not result.ok
     assert "workspace" in (result.error or "").lower()
+
+
+# -- containment under hostile paths ---------------------------------------
+# Every one of these was run against the real policy and registry during a
+# security review; the table is here so a future change to path handling has
+# to break a named case rather than slip through.
+
+@pytest.mark.parametrize("label, path", [
+    ("parent traversal", "../ESCAPED.txt"),
+    ("deep traversal", "../../../../../../Windows/System32/drivers/etc/hosts"),
+    ("mixed separators", r"..\ESCAPED.txt"),
+    ("dot-slash traversal", "./../ESCAPED.txt"),
+    ("embedded traversal", "sub/../../ESCAPED.txt"),
+    ("unc path", r"\127.0.0.1\C$\Windows\win.ini"),
+    ("device path", r"\.\PhysicalDrive0"),
+    ("trailing space", "../ESCAPED.txt "),
+    ("sibling prefix", "../workspace-evil/x.txt"),
+    ("alternate data stream", "inside.txt:hidden"),
+    ("null byte", "inside.txt\x00../../ESCAPED.txt"),
+])
+@pytest.mark.parametrize("tool", ["read_file", "write_file", "delete_path"])
+def test_a_hostile_path_never_reaches_the_filesystem_unapproved(settings, tmp_path, label, path, tool):
+    """Nothing outside the workspace may be touched without an approval."""
+    policy = RiskPolicy(settings)
+    arguments = {"path": path}
+    if tool == "write_file":
+        arguments["content"] = "PWNED"
+
+    decision = policy.evaluate(tool, arguments)
+
+    assert not decision.allowed or decision.approval_required, (
+        f"{label} was auto-allowed for {tool}"
+    )
+
+
+@pytest.mark.parametrize("path", ["C:ESCAPED.txt", "..%2FESCAPED.txt"])
+def test_a_path_that_only_looks_like_an_escape_stays_inside(settings, tmp_path, path):
+    """Two shapes that resolve inside the workspace, and must keep doing so.
+
+    A drive-relative path joins onto the workspace drive, and percent-encoding
+    is never decoded into a separator. Both are contained -- the risk would be
+    a future change that started treating either as an escape hatch.
+    """
+    policy = RiskPolicy(settings)
+    workspace = Path(settings.workspace_root)
+
+    decision = policy.evaluate("write_file", {"path": path, "content": "x"})
+    resolved = (workspace / Path(path)).resolve(strict=False)
+
+    assert decision.allowed and not decision.approval_required
+    assert resolved.is_relative_to(workspace), f"{path} resolved outside the workspace"
