@@ -275,6 +275,87 @@ def test_metatrader_symbol_ranking_prefers_exact_visible_name():
     assert MetaTrader5Provider._candidate_score("XAUUSD", "XAUUSD", True) < MetaTrader5Provider._candidate_score("XAUUSD.a", "XAUUSD", True)
 
 
+# --- a MetaTrader5 package that cannot be loaded ---------------------------------
+# `import MetaTrader5` reads MetaTrader5/__init__.py and then loads the _core
+# extension. A missing package or a failed DLL load arrives as ImportError; a
+# package file the process cannot read arrives as a raw OSError, because the
+# import system does not wrap I/O failures. Both mean the same thing here: the
+# broker is unavailable. Neither is a reason for a 500, and neither should put
+# a filesystem path into an API payload.
+
+UNREADABLE_PACKAGE = r"C:\Users\someone\site-packages\MetaTrader5\__init__.py"
+
+
+class UnreadableMetaTrader5:
+    """A finder/loader pair whose package file raises on read."""
+
+    def find_spec(self, name, path=None, target=None):
+        import importlib.util
+
+        if name == "MetaTrader5":
+            return importlib.util.spec_from_loader(name, self)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise PermissionError(13, "Access is denied", UNREADABLE_PACKAGE)
+
+
+@pytest.fixture()
+def unreadable_metatrader(monkeypatch):
+    import sys
+
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [UnreadableMetaTrader5(), *sys.meta_path])
+
+
+def test_an_unreadable_metatrader_package_is_an_unavailable_provider(unreadable_metatrader):
+    health = MetaTrader5Provider().health()
+
+    assert health["state"] == "UNAVAILABLE"
+    assert "could not be loaded" in health["error"]
+    assert "site-packages" not in health["error"] and "someone" not in health["error"]
+
+
+def test_an_unreadable_metatrader_package_leaks_no_path_through_capabilities(unreadable_metatrader):
+    report = MetaTrader5Provider().capabilities("XAUUSD")
+
+    assert report["state"] == "UNAVAILABLE"
+    assert "someone" not in report["error"] and "__init__" not in report["error"]
+
+
+def test_a_missing_metatrader_package_still_reads_as_not_installed(monkeypatch):
+    import sys
+
+    class Absent:
+        def find_spec(self, name, path=None, target=None):
+            if name == "MetaTrader5":
+                raise ImportError("No module named 'MetaTrader5'")
+            return None
+
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Absent(), *sys.meta_path])
+
+    assert "not installed" in MetaTrader5Provider().health()["error"]
+
+
+def test_a_corrupt_metatrader_package_is_not_silently_called_unavailable(monkeypatch):
+    """A programmer-class failure inside the package must still surface."""
+    import sys
+
+    class Corrupt(UnreadableMetaTrader5):
+        def exec_module(self, module):
+            raise SyntaxError("invalid syntax")
+
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Corrupt(), *sys.meta_path])
+
+    with pytest.raises(SyntaxError):
+        MetaTrader5Provider().health()
+
+
 # --- one owner for the latest report -------------------------------------------
 # The chart draws from the latest analysis and a monitored setup is created
 # from it. Both must read the same object from the one place that writes it.
@@ -600,3 +681,24 @@ def test_wyckoff_reads_the_phase_from_the_structure_direction(settings, monkeypa
 
     assert wyckoff["alternate_interpretations"] == expected_candidates
     assert wyckoff["phase_candidate"] == expected_phase
+
+
+def test_an_unreadable_metatrader_package_does_not_fail_the_status_endpoint(app, unreadable_metatrader):
+    from fastapi.testclient import TestClient
+
+    from sam_backend.trading.tradingview import TradingViewState
+
+    absent = TradingViewState(False, [], None, None, None, None, None, False, None, None, None, False, False)
+    app.state.trading.tradingview.observe = lambda: absent
+    app.state.trading.drawing._observe = lambda: absent
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/trading/status")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["market_data"]["metatrader5"]["state"] == "UNAVAILABLE"
+    assert payload["capabilities"]["state"] == "UNAVAILABLE"
+    assert "someone" not in response.text and "site-packages" not in response.text
+    # The rest of the payload is unaffected by the broker.
+    assert "drawing" in payload and "tradingview" in payload

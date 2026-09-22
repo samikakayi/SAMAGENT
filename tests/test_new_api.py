@@ -615,3 +615,98 @@ def test_losing_the_chart_observation_retires_the_previous_verdict(tmp_path):
 
     assert shown["tradingview-status"] == "UNAVAILABLE"
     assert shown[DRAWING_ROW] == UNREACHABLE, "left a stale availability claim standing"
+
+
+# --- Broker-status polling ------------------------------------------------------
+#
+# The page refreshes the card every ten seconds. /api/trading/status reaches the
+# broker; if it hangs, each tick must not add another unanswered request on top.
+
+STATUS, STATE = "/api/trading/status", "/api/tradingview/state"
+AVAILABLE = "Verified price drawing available"
+
+
+def observation(price):
+    return {"body": observed_state(current_price=price).as_dict()}
+
+
+def verdict(calibrated):
+    return {"body": {"drawing": {"calibrated": calibrated, "verified_price_drawing": calibrated}}}
+
+
+def poll_panel(tmp_path, polls):
+    return render_panel(tmp_path, {"polls": polls})
+
+
+def test_a_hung_broker_never_has_more_than_one_status_request_in_flight(tmp_path):
+    """Three ticks against a broker that never answers."""
+    hung = {STATE: observation(1.0), STATUS: {"hang": True}}
+
+    result = poll_panel(tmp_path, [{"responses": hung}] * 3)
+
+    fired = [poll["fired"]["requested"].count(STATUS) for poll in result["polls"]]
+    assert sum(fired) >= 1, "the broker was never asked at all"
+    assert result["maxInFlight"][STATUS] == 1, f"status requests piled up: {result['maxInFlight']}"
+
+
+def test_observation_keeps_refreshing_while_the_broker_hangs(tmp_path):
+    polls = [{"responses": {STATE: observation(price), STATUS: {"hang": True}}} for price in (1.0, 2.0, 3.0)]
+
+    result = poll_panel(tmp_path, polls)
+
+    for poll, price in zip(result["polls"], ("1.00", "2.00", "3.00")):
+        assert STATE in poll["fired"]["requested"], "the observation stopped being asked for"
+        assert poll["afterInterval"]["rendered"]["tv-observed-price"] == price
+    # A stall is reported as not reached, not as a stale verdict or a calibration claim.
+    assert result["rendered"][DRAWING_ROW] == UNREACHABLE
+    assert result["errors"] == [], f"console noise: {result['errors']}"
+
+
+def test_a_slow_old_answer_cannot_overwrite_a_newer_one(tmp_path):
+    """Request A is slow and says "available"; B, asked later, says "not calibrated"."""
+    polls = [
+        {"responses": {STATE: observation(1.0), STATUS: dict(verdict(True), delayMs=15_000)}},
+        {"responses": {STATE: observation(2.0), STATUS: verdict(False)}},
+    ]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["rendered"][DRAWING_ROW] != AVAILABLE, "a stale broker answer overwrote the newer one"
+    assert result["polls"][1]["afterInterval"]["rendered"]["tv-observed-price"] == "2.00"
+
+
+def test_the_broker_recovers_without_a_reload(tmp_path):
+    """Two hung ticks, then the broker answers; no lock may outlive the stall."""
+    hung = {STATE: observation(1.0), STATUS: {"hang": True}}
+    polls = [{"responses": hung}, {"responses": hung},
+             {"responses": {STATE: observation(3.0), STATUS: verdict(True)}}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE, result["rendered"][DRAWING_ROW]
+    assert result["inFlight"].get(STATUS, 0) == 0, "an unanswered request was left in flight"
+    assert result["errors"] == []
+
+
+def test_a_controlled_broker_error_releases_the_next_poll(tmp_path):
+    polls = [{"responses": {STATE: observation(1.0), STATUS: {"status": 500, "body": {"detail": "broker down"}}}},
+             {"responses": {STATE: observation(2.0), STATUS: verdict(True)}}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["polls"][0]["afterInterval"]["rendered"][DRAWING_ROW] == UNREACHABLE
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE
+    assert result["polls"][1]["fired"]["requested"].count(STATUS) == 1
+
+
+def test_a_refresh_inside_the_timeout_window_reuses_the_pending_request(tmp_path):
+    """tradingViewAction refreshes immediately; it must not open a second broker request."""
+    hung = {STATE: observation(1.0), STATUS: {"hang": True}}
+    polls = [{"responses": hung, "advanceMs": 3_000}, {"responses": hung, "advanceMs": 3_000},
+             {"responses": hung}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["maxInFlight"][STATUS] == 1, result["maxInFlight"]
+    assert result["requested"].count(STATUS) == 1, "each early refresh opened its own request"
+    assert result["requested"].count(STATE) == 3, "the observation itself must still refresh"

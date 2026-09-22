@@ -292,11 +292,26 @@
     return "Unavailable until verified chart calibration";
   }
 
+  // The drawing verdict lives in /api/trading/status, which also reaches the
+  // broker feed. It is asked for separately from the observation, so a slow or
+  // broken MetaTrader5 cannot stall or erase an observation that needs no broker;
+  // one request at a time, given up before the next tick, so a stalled broker
+  // never accumulates unanswered requests and an old answer never lands late.
+  const BROKER_TIMEOUT_MS = 8_000;
+  let brokerVerdict = null;
+
+  function requestDrawingVerdict() {
+    if (brokerVerdict) return brokerVerdict;
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => abort.abort(), BROKER_TIMEOUT_MS);
+    brokerVerdict = json("/api/trading/status", { signal: abort.signal })
+      .then((payload) => payload.drawing || null, () => null)  // timeout or error: no verdict, no claim
+      .finally(() => { window.clearTimeout(timer); brokerVerdict = null; });
+    return brokerVerdict;
+  }
+
   async function refreshTradingView() {
-    // The drawing verdict lives in /api/trading/status, which also reaches the
-    // broker feed. Asked for separately, so a slow or broken MetaTrader5 cannot
-    // stall or erase an observation that needs no broker at all.
-    const verdict = json("/api/trading/status").then((payload) => payload.drawing || null, () => null);
+    const verdict = requestDrawingVerdict();
     try {
       const state = await json("/api/tradingview/state");
       setStatus("tradingview-status", state.running ? "RUNNING" : "OFFLINE");
