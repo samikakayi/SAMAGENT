@@ -640,6 +640,6 @@ def test_provider_and_chart_spellings_of_one_instrument_agree(trading: TradingSe
 
 def test_an_analysis_report_cannot_be_drawn_onto_a_different_symbol(trading: TradingService, monkeypatch):
     monkeypatch.setattr(trading.tradingview, "observe", lambda: _ChartOn("GLD"))
-    trading._last_report = {"symbol": "XAUUSD", "setup": {"entry": 100.0, "stop": 99.0}, "support": [], "resistance": []}
+    trading.analyst.latest = {"symbol": "XAUUSD", "setup": {"entry": 100.0, "stop": 99.0}, "support": [], "resistance": []}
     result = trading.draw_analysis()
     assert result.error_code == "SYMBOL_MISMATCH"

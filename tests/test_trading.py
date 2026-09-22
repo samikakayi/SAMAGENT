@@ -273,3 +273,90 @@ def test_market_data_unknown_provider_fails_closed():
 
 def test_metatrader_symbol_ranking_prefers_exact_visible_name():
     assert MetaTrader5Provider._candidate_score("XAUUSD", "XAUUSD", True) < MetaTrader5Provider._candidate_score("XAUUSD.a", "XAUUSD", True)
+
+
+# --- one owner for the latest report -------------------------------------------
+# The chart draws from the latest analysis and a monitored setup is created
+# from it. Both must read the same object from the one place that writes it.
+
+def fresh_service(settings) -> TradingService:
+    settings.prepare()
+    return TradingService(settings, Database(settings.database_path), CancellationManager())
+
+
+REPORT = {
+    "symbol": "XAUUSD", "feed": "test", "setup_state": "NO_SETUP", "theories": {"default": {}},
+    "long_scenario": {"direction": "BULLISH"}, "entry": 100.0, "stop": 99.0, "tp1": 101.0,
+    "rr": 1.0, "invalidation": "x", "confidence": 0.5, "support": [], "resistance": [],
+}
+
+
+def test_the_facade_reads_the_latest_report_from_its_owner(settings):
+    service = fresh_service(settings)
+    assert service.analyst.latest is None
+
+    service.analyst.latest = REPORT
+    setup = service.create_setup_from_last_analysis("default")
+
+    assert setup["symbol"] == "XAUUSD" and setup["theory"] == "default"
+    assert not hasattr(service, "_last_report"), "the facade keeps no copy of its own"
+
+
+def test_a_failed_fetch_does_not_replace_the_latest_report(settings, monkeypatch):
+    """An analysis that cannot start leaves the last good view of the market."""
+    from sam_backend.trading.market_data import MarketDataError
+
+    service = fresh_service(settings)
+    service.analyst.latest = REPORT
+
+    def refuse(*args, **kwargs):
+        raise MarketDataError("feed is down")
+
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch", refuse)
+    result = service.analyze("XAUUSD", ["M15"])
+
+    assert not result.verified
+    assert service.analyst.latest is REPORT, "a hard failure must not clobber the last report"
+
+
+def test_analysis_public_surface_is_unchanged():
+    """Callers of TradingService keep working; the pipeline moved, the API did not."""
+    import inspect
+
+    methods = {name for name, _ in inspect.getmembers(TradingService, inspect.isfunction) if not name.startswith("_")}
+    assert {
+        "analyze", "market_snapshot", "route_natural_intent", "create_setup_from_last_analysis",
+        "create_setup_from_analysis", "draw_analysis", "draw_annotation", "draw_two_anchor",
+        "backtest", "list_entry_triggers", "poll_monitors", "status", "refresh_permissions",
+        "gann_analysis", "pitchfork_analysis", "draw_gann_fan", "draw_pitchfork",
+        "list_drawings", "clear_drawings", "set_layer_visibility", "calibrate_chart",
+        "verify_calibration", "validate_custom_theory", "save_custom_theory",
+    } <= methods
+    # The defaults callers relied on survive the delegation.
+    assert inspect.signature(TradingService.analyze).parameters["symbol"].default == "XAUUSD"
+    assert inspect.signature(TradingService.market_snapshot).parameters["symbol"].default == "XAUUSD"
+
+
+def test_a_full_analysis_builds_a_report_and_becomes_the_latest(settings, monkeypatch):
+    """The whole pipeline on synthetic candles, through the public facade.
+
+    This is the path that had no test when the pipeline moved, and the one a
+    stale reference inside it would only have broken at runtime against a
+    live feed. It also proves the analysis -> setup chain end to end.
+    """
+    service = fresh_service(settings)
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch",
+                        lambda symbol, timeframe, count: batch(timeframe=timeframe))
+
+    result = service.analyze("XAUUSD", ["M15", "M5"], ["default"])
+
+    assert result.executed, result.error
+    report = service.analyst.latest
+    assert report is not None and report is result.data, "the report the caller got is the one that is kept"
+    assert report["symbol"] == "XAUUSD" and "confidence" in report and "spoken_summary_ckb" in report
+
+    # The record group reads the same object the analysis wrote.
+    setup = service.create_setup_from_last_analysis("default")
+    assert setup["symbol"] == "XAUUSD"
+    # And the chart's source for drawing is that report too.
+    assert service.draw_analysis().error_code != "NO_ANALYSIS"
