@@ -41,7 +41,7 @@ from sam_backend.trading.indicators import (
 from sam_backend.trading.market_data import MarketDataService, MetaTrader5Provider
 from sam_backend.trading.registry import TradingKnowledgeRegistry, build_skill_registry
 from sam_backend.trading.service import TradingService
-from sam_backend.trading.types import Candle, Direction, MarketDataBatch, SetupDecision, normalize_timeframe
+from sam_backend.trading.types import Candle, Direction, MarketDataBatch, SetupDecision, SetupState, normalize_timeframe
 
 
 BASE = datetime(2025, 1, 6, 0, 0, tzinfo=UTC)
@@ -360,3 +360,243 @@ def test_a_full_analysis_builds_a_report_and_becomes_the_latest(settings, monkey
     assert setup["symbol"] == "XAUUSD"
     # And the chart's source for drawing is that report too.
     assert service.draw_analysis().error_code != "NO_ANALYSIS"
+
+
+# --- the analysis pipeline, branch by branch ---------------------------------
+# The pipeline moved into MarketAnalyst with four defects that only surfaced
+# late, because most of its branches were reached by nothing. Each moved
+# method is driven here through the public facade on synthetic candles, and
+# every assertion is on a field the chart or setup code actually reads.
+
+def analysing_service(settings, monkeypatch, *, verified: bool = False) -> TradingService:
+    """A service whose only feed is the synthetic one; verified flips the
+    quote-timestamp check that decides SUCCESS versus PARTIAL."""
+    service = fresh_service(settings)
+
+    def fetch(symbol, timeframe, count):
+        result = batch(timeframe=timeframe)
+        result.quote_timestamp_verified = verified
+        return result
+
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch", fetch)
+    return service
+
+
+@pytest.mark.parametrize("theory, field, inner", [
+    ("snr", "levels", None),                       # _execute_theory: snr branch
+    ("smc", "imbalances", None),                   # smc/ict/liquidity branch
+    ("ict", "session", None),                      # ict adds the session
+    ("wyckoff", "wyckoff", "phase_candidate"),     # _wyckoff
+    ("volume_profile", "profiles", None),
+    ("vwap", "vwap", None),
+    ("price_action", "patterns", None),
+    ("order_blocks", "order_blocks", None),
+    ("fibonacci", "fibonacci", None),
+    ("harmonic", "patterns", None),                # _harmonics -> _candles_for
+    ("elliott", "counts", None),                   # _elliott -> _candles_for
+    ("sessions", "opening_ranges", None),          # _opening_ranges -> _candles_for
+])
+def test_each_theory_branch_adds_its_own_evidence_to_the_report(settings, monkeypatch, theory, field, inner):
+    service = analysing_service(settings, monkeypatch)
+
+    result = service.analyze("XAUUSD", ["H1", "M15"], [theory])
+
+    assert result.executed, result.error
+    output = result.data["theories"][theory]
+    assert field in output, f"{theory} produced no {field!r}; keys: {sorted(output)}"
+    assert output["interpretation"]["direction"] in {"BULLISH", "BEARISH", "NEUTRAL"}
+    if inner:
+        assert inner in output[field]
+    # Every per-timeframe branch answers for each timeframe it was asked about.
+    if theory == "ict":
+        assert {"active", "sessions", "london_new_york_overlap"} <= set(output[field])
+    elif isinstance(output[field], dict) and theory not in {"wyckoff", "sessions"}:
+        assert set(output[field]) == {"H1", "M15"}
+
+
+def test_wyckoff_names_a_phase_and_refuses_to_confirm_it(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+
+    wyckoff = service.analyze("XAUUSD", ["H1"], ["wyckoff"]).data["theories"]["wyckoff"]["wyckoff"]
+
+    assert wyckoff["timeframe"] == "H1"
+    assert len(wyckoff["alternate_interpretations"]) >= 1
+    assert wyckoff["phase_candidate"].endswith("UNCONFIRMED")
+    assert 0 < wyckoff["confidence"] < 0.5, "an unconfirmed phase must not read as confident"
+
+
+def test_the_session_study_covers_both_sessions_per_timeframe(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+
+    ranges = service.analyze("XAUUSD", ["M15"], ["sessions"]).data["theories"]["sessions"]["opening_ranges"]
+
+    assert set(ranges) == {"M15"} and set(ranges["M15"]) == {"london", "new_york"}
+
+
+def test_a_custom_theory_is_evaluated_and_unsupported_predicates_are_not_guessed(settings, monkeypatch):
+    """_execute_custom_theory: supported predicates run; unknown ones are named, never executed.
+
+    save_custom_theory refuses an unsupported predicate outright, so the
+    runtime branch exists for a row that reached the table some other way;
+    it is written straight to the store here to prove the guard holds.
+    """
+    service = analysing_service(settings, monkeypatch)
+    saved = service.database.save_custom_theory("Trend Check", {
+        "name": "Trend Check", "description": "d",
+        "conditions": [
+            {"predicate": "trend_is", "timeframe": "M15", "value": "BULLISH"},
+            {"predicate": "rsi_above", "timeframe": "M15", "value": 0},
+            {"predicate": "launch_missiles", "timeframe": "M15"},
+        ],
+        "invalidation": "x", "targets": ["y"],
+    })
+
+    output = service.analyze("XAUUSD", ["M15"], ["Trend Check"]).data["theories"]["custom:Trend Check"]
+
+    assert output["theory"]["custom"] is True and output["theory"]["version"] == saved["version"]
+    statuses = [item["status"] for item in output["evaluated_conditions"]]
+    assert statuses == ["EVALUATED", "EVALUATED", "UNSUPPORTED_PREDICATE"]
+    assert output["evaluated_conditions"][1]["passed"] is True, "rsi is always above zero"
+    assert output["status"] == "PARTIALLY_AVAILABLE" and "not guessed" in output["warning"]
+    assert output["setup_match"] is False, "one unknown predicate means no match is claimed"
+
+
+def test_a_custom_theory_asking_for_a_missing_timeframe_says_so(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+    service.save_custom_theory({"name": "Needs H4", "description": "d", "invalidation": "x", "targets": ["y"],
+                                "conditions": [{"predicate": "trend_is", "timeframe": "H4", "value": "BULLISH"}]})
+
+    output = service.analyze("XAUUSD", ["M15"], ["Needs H4"]).data["theories"]["custom:Needs H4"]
+
+    assert output["evaluated_conditions"][0]["status"] == "MISSING_TIMEFRAME"
+    assert output["setup_match"] is False
+
+
+def test_an_unknown_theory_is_reported_unavailable_rather_than_invented(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+
+    output = service.analyze("XAUUSD", ["M15"], ["no_such_theory"]).data["theories"]["no_such_theory"]
+
+    assert output["status"] == "UNAVAILABLE" and "no_such_theory" in output["error"]
+
+
+def test_an_unverified_feed_completes_as_partial_and_still_becomes_the_latest(settings, monkeypatch):
+    """The PARTIAL path: gaps are named in the status and the report is kept."""
+    service = analysing_service(settings, monkeypatch, verified=False)
+
+    result = service.analyze("XAUUSD", ["M15"], ["default"])
+
+    assert result.status.value == "PARTIAL" and result.verified is False
+    assert result.error == "Analysis completed with verification gaps."
+    assert result.data["self_check"]["passed"] is False
+    assert service.analyst.latest is result.data
+
+
+def test_a_verified_feed_completes_as_success(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch, verified=True)
+
+    result = service.analyze("XAUUSD", ["M15"], ["default"])
+
+    assert result.status.value == "SUCCESS", result.error
+    assert result.data["self_check"]["passed"] is True
+    assert result.error is None
+
+
+def test_the_report_carries_what_the_chart_and_setup_code_read(settings, monkeypatch):
+    """_report, _confidence and _sorani_summary, on the fields downstream consumes."""
+    service = analysing_service(settings, monkeypatch)
+
+    report = service.analyze("XAUUSD", ["H1", "M15"], ["default", "snr"]).data
+
+    assert report["symbol"] == "XAUUSD" and report["requested_symbol"] == "XAUUSD"
+    assert set(report["timeframes"]) == {"H1", "M15"}
+    assert 0.0 <= report["confidence"] <= 1.0
+    assert report["setup_state"] in {state.value for state in SetupState}
+    assert isinstance(report["support"], list) and isinstance(report["resistance"], list)
+    assert set(report["theories"]) == {"default", "snr"}
+    # _sorani_summary: the spoken line carries the bias, the decision and
+    # what is still missing -- so a listener knows why there is no entry.
+    spoken = report["spoken_summary_ckb"]
+    assert spoken.startswith("HTF ") and str(report["htf_bias"]).lower() in spoken.lower()
+    assert str(report["decision"] or "WAIT") in spoken
+    for missing in (report.get("missing_confirmation") or [])[:3]:
+        assert str(missing) in spoken
+    # Pattern engines rerun on the candles the analysis kept; those must not be serialised.
+    assert "_candles" not in str(report)
+
+
+def test_market_snapshot_reports_quotes_for_each_timeframe(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch, verified=True)
+
+    result = service.market_snapshot("XAUUSD", ["M15", "M5"])
+
+    assert result.executed and result.verified is True
+    assert result.data["symbol"] == "XAUUSD" and result.data["feed"] == "Synthetic Test Feed"
+    assert result.data["spread"] == pytest.approx(0.10)
+    assert set(result.data["timeframes"]) == {"M15", "M5"}
+    m15 = result.data["timeframes"]["M15"]
+    assert {"open", "high", "low", "close", "time", "metadata"} <= set(m15)
+    assert m15["metadata"]["timeframe"] == "M15" and m15["metadata"]["bars"] == 180
+    assert result.data["errors"] == {}
+
+
+def test_an_unverified_snapshot_is_partial_and_says_why(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch, verified=False)
+
+    result = service.market_snapshot("XAUUSD", ["M15"])
+
+    assert result.executed and result.verified is False
+    assert result.status.value == "PARTIAL"
+    assert "verification gaps" in result.error
+
+
+def test_market_snapshot_fails_closed_when_no_timeframe_returns_data(settings, monkeypatch):
+    from sam_backend.trading.market_data import MarketDataError
+
+    service = fresh_service(settings)
+
+    def refuse(*args, **kwargs):
+        raise MarketDataError("feed down")
+
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch", refuse)
+    result = service.market_snapshot("XAUUSD", ["M15"])
+
+    assert not result.executed and result.error_code == "MARKET_DATA_UNAVAILABLE"
+    assert "feed down" in " ".join(result.observations)
+
+
+def test_analysis_stops_when_the_task_is_cancelled(settings, monkeypatch):
+    """_raise_if_cancelled: a cancelled token ends the run before theories execute."""
+    service = analysing_service(settings, monkeypatch)
+    service.cancellation.create("task_x")
+    service.cancellation.cancel("task_x", "test")
+
+    with pytest.raises(RuntimeError, match="cancel"):
+        service.analyze("XAUUSD", ["M15"], ["default"], task_id="task_x")
+
+
+def test_a_theory_whose_data_sam_cannot_see_says_so_instead_of_pretending(settings, monkeypatch):
+    """_execute_theory: no order-flow feed means no order-flow verdict."""
+    service = analysing_service(settings, monkeypatch)
+
+    output = service.analyze("XAUUSD", ["M15"], ["dom"]).data["theories"]["dom"]
+
+    assert output["status"] == "UNAVAILABLE"
+    assert output["interpretation"] is None and output["facts"] == []
+    assert output["reason"], "the refusal names what is missing"
+
+
+@pytest.mark.parametrize("slope, expected_candidates, expected_phase", [
+    (0.03, ["MARKUP", "REACCUMULATION"], "D_OR_E_UNCONFIRMED"),      # bullish structure
+    (-0.03, ["MARKDOWN", "REDISTRIBUTION"], "D_OR_E_UNCONFIRMED"),   # bearish structure
+])
+def test_wyckoff_reads_the_phase_from_the_structure_direction(settings, monkeypatch, slope, expected_candidates, expected_phase):
+    """_wyckoff: each structural direction maps to its own pair of readings."""
+    service = fresh_service(settings)
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch",
+                        lambda symbol, timeframe, count: batch(candles(slope=slope), timeframe=timeframe))
+
+    wyckoff = service.analyze("XAUUSD", ["H1"], ["wyckoff"]).data["theories"]["wyckoff"]["wyckoff"]
+
+    assert wyckoff["alternate_interpretations"] == expected_candidates
+    assert wyckoff["phase_candidate"] == expected_phase
