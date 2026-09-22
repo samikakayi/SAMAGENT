@@ -193,7 +193,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         settings=settings, database=database, policy=policy, cancellation=cancellation,
         trading=trading, windows=windows, scanner=scanner, verifier=verifier,
         capabilities=capability_registry, tools=tools, secrets=secret_store,
-        adapters=adapters, provider_health=provider_health, router=router, agent=agent,
+        provider_health=provider_health, router=router, agent=agent,
         task_store=task_store, orchestrator=orchestrator, agent_api=agent_api,
         voice=voice, replay=replay,
         apply_stored_credentials=apply_stored_credentials,

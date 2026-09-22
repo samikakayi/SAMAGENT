@@ -33,17 +33,20 @@ def register_provider_routes(application: FastAPI, sv: AppServices) -> None:
     settings = sv.settings
     database = sv.database
     secret_store = sv.secrets
-    adapters = sv.adapters
     router = sv.router
     voice = sv.voice
     apply_stored_credentials = sv.apply_stored_credentials
     rebuild_adapters = sv.rebuild_adapters
     @application.get("/api/models")
     async def models() -> dict[str, Any]:
-        async def gather(provider: str):
-            return provider, await _discover_provider_models(adapters, provider)
+        # Read the live registry once, so a rebuild mid-request cannot make
+        # one half of the answer describe a different set of adapters.
+        registry = application.state.adapters
 
-        provider_names = getattr(adapters, "providers", ["ollama", "openai"])
+        async def gather(provider: str):
+            return provider, await _discover_provider_models(registry, provider)
+
+        provider_names = getattr(registry, "providers", ["ollama", "openai"])
         pairs = await asyncio.gather(*(gather(provider) for provider in provider_names))
         providers = {provider: items for provider, items in pairs}
         return {
@@ -63,13 +66,14 @@ def register_provider_routes(application: FastAPI, sv: AppServices) -> None:
         }
     @application.get("/api/router/status")
     async def router_status() -> dict[str, Any]:
+        registry = application.state.adapters
         ollama_available, litellm_available = await asyncio.gather(
-            _discover_provider_models(adapters, "ollama"),
-            _discover_provider_models(adapters, "litellm"),
+            _discover_provider_models(registry, "ollama"),
+            _discover_provider_models(registry, "litellm"),
         )
         return {
             "mode": settings.model_mode,
-            "providers": getattr(adapters, "providers", ["ollama", "openai"]),
+            "providers": getattr(registry, "providers", ["ollama", "openai"]),
             "configured": {
                 "ollama": bool(ollama_available),
                 "litellm": bool(litellm_available),

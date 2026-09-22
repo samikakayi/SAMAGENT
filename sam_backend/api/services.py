@@ -4,6 +4,11 @@ Passed whole to each route group, which names the few it needs at the top of
 its register function. A typed record rather than a lookup table: a reader
 can see every dependency the application has, and a route group cannot
 quietly acquire one that is not declared here.
+
+The adapter registry is deliberately absent: it is replaced wholesale when a
+credential changes, so the only authoritative answer to "which registry is
+current" is application.state.adapters. Holding it here would hand out a
+snapshot that silently goes stale.
 """
 
 from __future__ import annotations
@@ -18,7 +23,6 @@ from ..cancellation import CancellationManager
 from ..capabilities import CapabilityRegistry
 from ..config import Settings
 from ..db import Database
-from ..models import AdapterRegistry
 from ..policy import RiskPolicy
 from ..project_map import ProjectScanner
 from ..provider_health import ProviderHealth
@@ -46,10 +50,6 @@ class AppServices:
     capabilities: CapabilityRegistry
     tools: ToolRegistry
     secrets: SecretStore
-    # The registry built at startup. Routes that must see a rebuild read
-    # application.state.adapters instead; this is the same object the old
-    # closure captured, and the distinction is preserved deliberately.
-    adapters: AdapterRegistry
     provider_health: ProviderHealth
     router: ModelRouter
     agent: AgentService

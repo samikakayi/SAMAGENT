@@ -117,3 +117,94 @@ def test_a_settings_change_invalidates_the_health_the_resolution_endpoint_reads(
     with TestClient(app) as client:
         assert client.put("/api/settings", json={"default_model": "something-else"}).status_code == 200
     assert health.cached("ollama", "stale-model") is None, "the endpoint reached the shared cache"
+
+
+# -- one live adapter registry --------------------------------------------
+
+def registry_identities(app) -> dict[str, int]:
+    """Who each consumer would reach for an adapter, by object identity."""
+    state = app.state
+    return {
+        "app.state": id(state.adapters),
+        "router": id(state.router.adapters),
+        "agent": id(state.agent.adapters),
+        "agent_api": id(state.agent_api._adapters()),
+        "orchestrator": id(state.orchestrator.router.adapters),
+    }
+
+
+def test_every_adapter_consumer_tracks_a_runtime_rebuild(tmp_path):
+    """A new credential rebuilds the registry; nothing may keep the old one.
+
+    A consumer left on the startup registry would report on adapters built
+    before the key existed -- the model list and the routing status would
+    disagree with what a run actually uses, with no error to show for it.
+    """
+    from fastapi.testclient import TestClient
+
+    root = tmp_path
+    app = create_app(Settings(
+        project_root=root, workspace_root=root / "workspace", data_dir=root / "data",
+        default_provider="ollama", default_model="fake",
+    ))
+    before = registry_identities(app)
+    assert len(set(before.values())) == 1, f"consumers disagree before any rebuild: {before}"
+    original = next(iter(before.values()))
+
+    with TestClient(app) as client:
+        stored = client.post("/api/providers/credentials", json={
+            "name": "openrouter_api_key", "value": "sk-or-v1-REBUILD-TEST-SENTINEL-0123456789",
+        })
+        assert stored.status_code == 200, stored.text
+
+        after = registry_identities(app)
+        assert len(set(after.values())) == 1, f"consumers split after the rebuild: {after}"
+        assert next(iter(after.values())) != original, "the rebuild really did replace the registry"
+
+        # Identity alone would not have caught the real defect: two routes
+        # held the startup registry in a closure. Mark the registry the app
+        # now considers current and check the endpoints actually report on it.
+        class MarkerAdapter:
+            async def list_models(self):
+                return [{"id": "FROM-THE-CURRENT-REGISTRY", "name": "marker"}]
+
+        current = app.state.adapters
+        for provider in current.providers:
+            current.adapters[provider] = MarkerAdapter()
+
+        listed = client.get("/api/models").json()["providers"]
+        seen = {item.get("id") for items in listed.values() for item in items}
+        assert seen == {"FROM-THE-CURRENT-REGISTRY"}, f"/api/models read a stale registry: {seen}"
+
+        # These two disagreed before the fix: one read the startup registry,
+        # the other application.state, in the same moment.
+        status = client.get("/api/router/status").json()["configured"]
+        probed = client.get("/api/providers/status").json()
+        assert status["litellm"] is True
+        assert probed["litellm"]["status"] == "CONNECTED", "status routes must agree with discovery"
+
+
+def test_a_failed_rebuild_leaves_every_consumer_on_the_working_registry(tmp_path, monkeypatch):
+    """A bad credential update must not strand half the app on a new object."""
+    from fastapi.testclient import TestClient
+    import sam_backend.app as app_module
+
+    root = tmp_path
+    app = create_app(Settings(
+        project_root=root, workspace_root=root / "workspace", data_dir=root / "data",
+        default_provider="ollama", default_model="fake",
+    ))
+    before = registry_identities(app)
+
+    def refuse(_settings):
+        raise RuntimeError("adapter construction failed")
+
+    monkeypatch.setattr(app_module, "AdapterRegistry", refuse)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post("/api/providers/credentials", json={
+            "name": "openrouter_api_key", "value": "sk-or-v1-FAILED-REBUILD-SENTINEL-0123456789",
+        })
+
+    after = registry_identities(app)
+    assert after == before, f"a failed rebuild split ownership: {before} -> {after}"
+    assert len(set(after.values())) == 1
