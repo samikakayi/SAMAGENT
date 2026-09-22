@@ -559,3 +559,73 @@ def test_a_sensitive_tool_result_never_enters_the_timeline_or_context(tmp_path: 
     assert any("sensitive" in observation for observation in task.observations)
     # Nothing that reached the model on later turns may carry it either.
     assert all(secret_value not in prompt for prompt in router.prompts)
+
+
+# -- what the model is told about a tool result ----------------------------
+# The agent acts on nothing else, and a wrong answer here is silent: the run
+# continues, having been told something useless. This seam shipped a real
+# defect once, when a file read was summarised down to its path.
+
+class FakeResult:
+    def __init__(self, output, error=None):
+        self.output, self.error = output, error
+
+    def model_text(self):
+        return str(self.output)
+
+
+class FakeOutcome:
+    def __init__(self, name, output, error=None, sensitive=False):
+        self.call = type("Call", (), {"name": name})()
+        self.result = FakeResult(output, error)
+        self.sensitive = sensitive
+
+
+@pytest.mark.parametrize("name, output, expected", [
+    ("read_file", {"path": "a.py", "content": "print(1)"}, "a.py:\nprint(1)"),
+    ("run_tests", {"summary": "3 passed"}, "3 passed"),
+    ("run_tests", {}, "checks finished"),
+    ("project_map", {"file_count": 12, "commands": {}}, "12 files, commands {}"),
+    ("write_file", {"path": "b.txt", "bytes": 9}, "b.txt (9 bytes)"),
+    ("run_terminal", {"exit_code": 0}, "exit 0"),
+    ("git_log", {"commits": [1, 2]}, "2 commit(s)"),
+    ("git_status", {"changed": ["x"], "branch": "main"}, "1 changed path(s) on main"),
+    ("anything", "plain text", "plain text"),
+    ("anything", "", "done"),
+])
+def test_a_tool_result_is_described_by_what_the_model_needs_from_it(name, output, expected):
+    from sam_backend.autonomy.observations import summarise_result
+
+    assert summarise_result(name, FakeResult(output)) == expected
+
+
+def test_a_file_read_carries_its_text_but_cannot_swamp_the_prompt():
+    """The defect this seam exists to prevent, and the bound that limits it."""
+    from sam_backend.autonomy.observations import OBSERVATION_CONTENT_LIMIT, summarise_result
+
+    summary = summarise_result("read_file", FakeResult({"path": "big.py", "content": "x" * 10_000}))
+
+    assert summary.startswith("big.py:\n"), "the model must know which file it is reading"
+    assert "x" * 100 in summary, "the text itself is the point of a read"
+    assert len(summary) <= OBSERVATION_CONTENT_LIMIT + len("big.py:\n")
+
+
+@pytest.mark.parametrize("sensitive, output, error, describes", [
+    (True, {"content": "sk-or-v1-OBSERVATION-SENTINEL-0123456789"}, None, "success"),
+    (True, None, "sk-or-v1-OBSERVATION-SENTINEL-0123456789", "failure"),
+])
+def test_a_sensitive_result_never_reaches_the_model(sensitive, output, error, describes):
+    from sam_backend.autonomy.observations import describe_failure, describe_success
+
+    outcome = FakeOutcome("read_file", output, error, sensitive=sensitive)
+    told = describe_success(outcome) if describes == "success" else describe_failure(outcome)
+
+    assert "sk-or-v1-OBSERVATION-SENTINEL-0123456789" not in told
+    assert "withheld" in told
+
+
+def test_a_failure_without_a_message_still_says_something():
+    from sam_backend.autonomy.observations import describe_failure
+
+    assert describe_failure(FakeOutcome("run_terminal", None, error=None)) == \
+        "The tool reported a failure without a message."

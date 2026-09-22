@@ -41,10 +41,7 @@ from ..tools import ToolRegistry
 from ..ui_review import review_screenshot
 from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
 from .checkpoints import MODIFYING_TOOLS, WorkspaceCheckpoints
-
-# How much of a file's text an observation may carry back to the model. Large
-# enough to act on, small enough that one read cannot swamp the next prompt.
-OBSERVATION_CONTENT_LIMIT = 4000
+from .observations import describe_failure, describe_success
 
 EXECUTOR_SYSTEM_PROMPT = """You are SAM, an autonomous software engineering agent executing one step of an approved plan.
 
@@ -575,15 +572,8 @@ class AutonomousOrchestrator:
         self._record_files(task, call, result)
 
         if result.ok:
-            # A sensitive result (an approved credential-file read, a
-            # screenshot, the clipboard) must never enter the timeline, the
-            # persisted observations, or the next prompt. The agent is told
-            # the call succeeded and nothing more.
             sensitive = outcome.sensitive
-            summary = (
-                f"succeeded; its output is sensitive and was withheld from context"
-                if sensitive else self._summarise_result(call.name, result)
-            )
+            summary = describe_success(outcome)
             task.observations.append(f"{call.name}: {summary}")
             await self._emit(
                 task, "result", f"{call.name}: {summary}", tool=call.name, ok=True, sensitive=sensitive,
@@ -597,9 +587,7 @@ class AutonomousOrchestrator:
             await self._transition(task, TaskState.EXECUTING, "Continuing")
             return None
 
-        error = result.error or "The tool reported a failure without a message."
-        if outcome.sensitive:
-            error = "the call failed; its details are sensitive and were withheld"
+        error = describe_failure(outcome)
         task.errors.append(f"{call.name}: {error}")
         await self._emit(task, "error", f"{call.name} failed: {error[:300]}", tool=call.name, ok=False)
         if call.name == "run_tests" and isinstance(result.output, dict):
@@ -842,34 +830,9 @@ class AutonomousOrchestrator:
 
     # -- small helpers -----------------------------------------------------
     def _record_files(self, task: AgentTask, call: ToolCall, result: Any) -> None:
-        if call.name not in {"write_file", "replace_text", "delete_path"}:
+        if call.name not in MODIFYING_TOOLS:
             return
         output = result.output if isinstance(result.output, dict) else {}
         path = str(output.get("path") or call.arguments.get("path") or "").strip()
         if path:
             self.store.note_files(task, [path])
-
-    @staticmethod
-    def _summarise_result(name: str, result: Any) -> str:
-        output = result.output
-        if isinstance(output, dict):
-            if name == "run_tests":
-                return str(output.get("summary") or "checks finished")[:400]
-            if name == "project_map":
-                return f"{output.get('file_count', '?')} files, commands {output.get('commands', {})}"
-            if "content" in output:
-                # The point of reading a file is the text inside it. Summarising
-                # to a path told the model nothing and left it re-reading the
-                # same file instead of acting on what it had asked for.
-                content = str(output.get("content") or "")
-                return f"{output.get('path')}:\n{content[:OBSERVATION_CONTENT_LIMIT]}"
-            if "path" in output:
-                return f"{output.get('path')} ({output.get('bytes', '?')} bytes)"
-            if "exit_code" in output:
-                return f"exit {output.get('exit_code')}"
-            if "commits" in output:
-                return f"{len(output['commits'])} commit(s)"
-            if "changed" in output:
-                return f"{len(output['changed'])} changed path(s) on {output.get('branch', '?')}"
-        text = result.model_text() if hasattr(result, "model_text") else str(output)
-        return text.strip()[:400] or "done"
