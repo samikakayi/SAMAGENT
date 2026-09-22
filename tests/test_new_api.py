@@ -710,3 +710,63 @@ def test_a_refresh_inside_the_timeout_window_reuses_the_pending_request(tmp_path
     assert result["maxInFlight"][STATUS] == 1, result["maxInFlight"]
     assert result["requested"].count(STATUS) == 1, "each early refresh opened its own request"
     assert result["requested"].count(STATE) == 3, "the observation itself must still refresh"
+
+
+# --- One owner for the broker-status request ------------------------------------
+# Page load runs refreshTradingView and loadToolStatus together. Both need a
+# slice of /api/trading/status; they must share one request, not race two.
+
+PAGE_LOAD = ["tradingView", "toolStatus"]
+TOOL_PAGES = {
+    "/api/tools/manifests": {"body": {"tools": [{"name": "read_file"}, {"name": "write_file"}, {"name": "analyze_market"}]}},
+    "/api/health": {"body": {"computer_control": True}},
+    "/api/desktop/status": {"body": {"tradingview": {"interactive": True, "running": True}}},
+}
+
+
+def full_status(mt5_state="AVAILABLE", calibrated=True):
+    return {"body": {"market_data": {"metatrader5": {"state": mt5_state}},
+                     "drawing": {"calibrated": calibrated, "verified_price_drawing": calibrated}}}
+
+
+def test_page_load_asks_the_broker_once_for_both_the_badge_and_the_verdict(tmp_path):
+    responses = {**TOOL_PAGES, STATE: observation(1.0), STATUS: full_status()}
+
+    result = poll_panel(tmp_path, [{"responses": responses, "fire": PAGE_LOAD}])
+
+    assert result["requested"].count(STATUS) == 1, result["requested"]
+    assert result["maxInFlight"][STATUS] == 1
+    # Both consumers were fed from that one answer.
+    assert result["rendered"]["tool-status-mt5"] == "● Connected read-only"
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE
+    # The tool badges that never needed the broker rendered from their own sources.
+    assert result["rendered"]["tool-status-files"] == "● Available"
+
+
+def test_a_hung_broker_at_page_load_still_yields_one_request_and_honest_rows(tmp_path):
+    hung = {**TOOL_PAGES, STATE: observation(1.0), STATUS: {"hang": True}}
+    polls = [{"responses": hung, "fire": PAGE_LOAD}, {"responses": hung}, {"responses": hung}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["maxInFlight"][STATUS] == 1, result["maxInFlight"]
+    assert result["requested"].count(STATUS) == 3, "one request per tick, including the load"
+    assert result["rendered"][DRAWING_ROW] == UNREACHABLE
+    assert result["rendered"]["tool-status-mt5"] == "Unknown", "a badge claimed a broker state it never received"
+    assert result["rendered"]["tool-status-files"] == "● Available", "an unreachable broker blanked unrelated badges"
+    assert result["errors"] == []
+
+
+def test_a_broker_that_recovers_after_load_updates_the_polled_row(tmp_path):
+    """Only the card is on the interval; the tool badges are drawn once, at load."""
+    hung = {**TOOL_PAGES, STATE: observation(1.0), STATUS: {"hang": True}}
+    polls = [{"responses": hung, "fire": PAGE_LOAD},
+             {"responses": {**TOOL_PAGES, STATE: observation(2.0), STATUS: full_status()}}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["requested"].count(STATUS) == 2
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE
+    assert result["inFlight"].get(STATUS, 0) == 0
+    # The load-time badge is not re-polled, so it keeps the honest answer it got.
+    assert result["rendered"]["tool-status-mt5"] == "Unknown"

@@ -5,9 +5,11 @@
 //
 // Two scenario shapes:
 //   one `/api/trading/status` payload           -> a single refresh, real timers
-//   { polls: [{responses, advanceMs}, ...] }    -> several refreshes on a virtual
-//     clock, each poll fired like the page's interval would, without waiting
-//     the real seconds between them.
+//   { polls: [{responses, advanceMs, fire}, ...] } -> several refreshes on a
+//     virtual clock, each poll fired like the page's interval would, without
+//     waiting the real seconds between them. `fire` lists the SAMTrading entry
+//     points to run in that poll (default ["tradingView"]); page load runs
+//     ["tradingView", "toolStatus"] together.
 // A scripted response may be {body, status}, {hang: true} or {delayMs, body}.
 const fs = require("node:fs");
 const vm = require("node:vm");
@@ -132,7 +134,9 @@ function snapshot(from) {
   for (const poll of payload.polls) {
     if (poll.responses) responses = poll.responses;
     const from = requested.length;
-    context.window.SAMTrading.tradingView().catch((error) => errors.push(String(error)));
+    for (const entry of poll.fire || ["tradingView"]) {
+      context.window.SAMTrading[entry]().catch((error) => errors.push(String(error)));
+    }
     await flush();
     const fired = snapshot(from);
     await clock.advance(poll.advanceMs ?? 10_000);
