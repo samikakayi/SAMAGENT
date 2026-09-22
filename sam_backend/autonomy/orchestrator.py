@@ -39,7 +39,7 @@ from ..tasks import VERIFIED_STATUS, AgentTask, TaskState, TaskStep, TaskStore
 from ..tools import ToolRegistry
 from ..ui_review import review_screenshot
 from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
-from .checkpoints import MODIFYING_TOOLS, WorkspaceCheckpoints
+from .checkpoints import MODIFYING_TOOLS, CheckpointUnavailable, WorkspaceCheckpoints
 from .control import RunControl, TaskAlreadyRunning
 from .observations import describe_failure, describe_success
 
@@ -734,7 +734,12 @@ class AutonomousOrchestrator:
             return {"rolled_back": False, "task_id": task_id, "reason": "Stop the task before rolling it back."}
         if task.rolled_back:
             return {"rolled_back": False, "task_id": task_id, "reason": "This run was already rolled back."}
-        restored = await asyncio.to_thread(self._checkpoints_for(task).restore, task.checkpoints)
+        try:
+            restored = await asyncio.to_thread(self._checkpoints_for(task).restore, task.checkpoints)
+        except CheckpointUnavailable as exc:
+            # Nothing was written, so the run is not rolled back and must not
+            # be recorded as though it were.
+            return {"rolled_back": False, "task_id": task_id, "reason": str(exc)}
         task.rolled_back = True
         await self._emit(task, "fix", f"Rolled back {len(restored)} file(s) to their checkpoints", files=restored)
         self.store.save(task)
