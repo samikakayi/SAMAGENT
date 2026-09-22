@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -41,6 +40,7 @@ from ..tools import ToolRegistry
 from ..ui_review import review_screenshot
 from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
 from .checkpoints import MODIFYING_TOOLS, WorkspaceCheckpoints
+from .control import RunControl, TaskAlreadyRunning
 from .observations import describe_failure, describe_success
 
 EXECUTOR_SYSTEM_PROMPT = """You are SAM, an autonomous software engineering agent executing one step of an approved plan.
@@ -55,15 +55,6 @@ Rules:
 - When the current step is genuinely finished and nothing further is needed, reply with a short plain-text summary and no tool call.
 - Never print, copy or store credentials."""
 
-
-
-class TaskAlreadyRunning(RuntimeError):
-    """Raised when a second driver tries to take a task that is already running.
-
-    Two drivers on one task would each hold their own copy loaded from the
-    database and overwrite each other's progress, so the second caller is
-    refused rather than queued.
-    """
 
 
 class AutonomousOrchestrator:
@@ -94,7 +85,7 @@ class AutonomousOrchestrator:
         self.scanner = scanner or tools.scanner
         self.verifier = verifier or tools.verifier
         self.capabilities = capabilities or tools.capabilities
-        self.cancellation = cancellation
+        self.control = RunControl(cancellation)
         self.executor = ToolExecutor(settings, database, tools, policy)
         self.health = health or ProviderHealth(settings)
         # The model this run resolved to. None until preflight has run; every
@@ -109,10 +100,6 @@ class AutonomousOrchestrator:
         self.max_steps = max(4, int(getattr(settings, "max_tool_iterations", 8)) * 3)
         self.max_retries = 3
         self.max_replans = 2
-        # Exactly one driver per task id. The set is the authority; the lock
-        # only keeps check-and-claim atomic.
-        self._driving: set[str] = set()
-        self._guard = asyncio.Lock()
 
     # -- helpers -----------------------------------------------------------
     @property
@@ -142,44 +129,8 @@ class AutonomousOrchestrator:
             "message": message or state.value,
         })
 
-    @asynccontextmanager
-    async def _exclusive(self, task_id: str):
-        """Claim sole ownership of driving one task, or refuse."""
-        async with self._guard:
-            if task_id in self._driving:
-                raise TaskAlreadyRunning(f"{task_id} is already running")
-            self._driving.add(task_id)
-        try:
-            yield
-        finally:
-            async with self._guard:
-                self._driving.discard(task_id)
-
     def driving(self, task_id: str) -> bool:
-        return task_id in self._driving
-
-    def _register_token(self, task: AgentTask) -> None:
-        """Publish the task to the cancellation manager so Stop can reach it.
-
-        Without this the shared /api/tasks/{id}/cancel endpoint has no token
-        to cancel and an autonomous run cannot be stopped at all.
-        """
-        if self.cancellation is not None and self.cancellation.get(task.id) is None:
-            self.cancellation.create(task.id)
-
-    def _release_token(self, task: AgentTask) -> None:
-        """Drop the token once the run is over.
-
-        A paused run keeps its token: waiting for approval is still stoppable.
-        """
-        if self.cancellation is not None and task.terminal:
-            self.cancellation.complete(task.id)
-
-    def _cancelled(self, task: AgentTask) -> bool:
-        if self.cancellation is None:
-            return False
-        token = self.cancellation.get(task.id)
-        return token is not None and token.cancelled
+        return self.control.driving(task_id)
 
     async def _finish_cancelled(self, task: AgentTask) -> AgentTask:
         await self._transition(task, TaskState.CANCELLED, "Stopped at your request")
@@ -191,7 +142,7 @@ class AutonomousOrchestrator:
         )
         await self._emit(task, "error", "Run stopped at your request")
         self.store.save(task)
-        self._release_token(task)
+        self.control.release(task)
         return task
 
     # -- public API --------------------------------------------------------
@@ -211,11 +162,9 @@ class AutonomousOrchestrator:
         if task.terminal:
             return {"cancelled": False, "task_id": task_id, "state": task.state.value,
                     "reason": "The task is no longer running."}
-        if self.cancellation is not None:
-            self._register_token(task)
-            self.cancellation.cancel(task_id, "user")
+        self.control.request_stop(task)
         try:
-            async with self._exclusive(task_id):
+            async with self.control.exclusive(task_id):
                 await self._finish_cancelled(task)
         except TaskAlreadyRunning:
             # A driver holds the task; it will read the cancelled token at
@@ -235,12 +184,12 @@ class AutonomousOrchestrator:
 
     async def run(self, task: AgentTask) -> AgentTask:
         """Drive the task to a terminal state, or to an approval pause."""
-        async with self._exclusive(task.id):
-            self._register_token(task)
+        async with self.control.exclusive(task.id):
+            self.control.arm(task)
             try:
                 return await self._run_unguarded(task)
             finally:
-                self._release_token(task)
+                self.control.release(task)
 
     async def _run_unguarded(self, task: AgentTask) -> AgentTask:
         try:
@@ -269,14 +218,14 @@ class AutonomousOrchestrator:
         task = self.store.get(task_id)
         if task is None or task.terminal:
             return task
-        async with self._exclusive(task_id):
-            self._register_token(task)
+        async with self.control.exclusive(task_id):
+            self.control.arm(task)
             try:
                 if task.state is TaskState.WAITING_FOR_APPROVAL:
                     await self._transition(task, TaskState.EXECUTING, "Resuming")
                 return await self._drive(task)
             finally:
-                self._release_token(task)
+                self.control.release(task)
 
     async def resolve_approval(self, task_id: str, approval_id: str, decision: str, note: str = "") -> AgentTask | None:
         """Apply the user's decision, then carry on.
@@ -292,12 +241,12 @@ class AutonomousOrchestrator:
         if task.terminal:
             return task
 
-        async with self._exclusive(task_id):
-            self._register_token(task)
+        async with self.control.exclusive(task_id):
+            self.control.arm(task)
             try:
                 return await self._apply_approval(task, approval_id, decision, note)
             finally:
-                self._release_token(task)
+                self.control.release(task)
 
     async def _apply_approval(
         self, task: AgentTask, approval_id: str, decision: str, note: str,
@@ -445,7 +394,7 @@ class AutonomousOrchestrator:
             # transition out of a terminal state.
             if task.terminal:
                 return self.store.save(task)
-            if self._cancelled(task):
+            if self.control.cancelled(task):
                 return await self._finish_cancelled(task)
 
             step = task.current_step
@@ -514,7 +463,7 @@ class AutonomousOrchestrator:
 
         # A model call can take a while; a Stop pressed during it should not
         # be spent on another tool. The drive loop finalises the cancellation.
-        if self._cancelled(task):
+        if self.control.cancelled(task):
             return None
 
         calls = turn.tool_calls[:1]
@@ -559,7 +508,7 @@ class AutonomousOrchestrator:
             )
             return gated.approval_id
 
-        if self._cancelled(task):
+        if self.control.cancelled(task):
             return None
         await self._checkpoint(task, call)
         outcome = await self.executor.execute(gated, conversation_id=task.conversation_id, task_id=task.id)

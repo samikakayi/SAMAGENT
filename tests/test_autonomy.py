@@ -629,3 +629,78 @@ def test_a_failure_without_a_message_still_says_something():
 
     assert describe_failure(FakeOutcome("run_terminal", None, error=None)) == \
         "The tool reported a failure without a message."
+
+
+# -- who is driving, and has it been told to stop --------------------------
+# Leaf mechanics: the orchestrator asks these and draws its own conclusions.
+# Tested directly because the exclusivity contract is subtle and the token
+# lifetime has a deliberate exception for a paused run.
+
+def test_only_one_driver_may_hold_a_task_and_the_claim_is_released():
+    from sam_backend.autonomy.control import RunControl, TaskAlreadyRunning
+
+    control = RunControl()
+
+    async def scenario():
+        async with control.exclusive("t1"):
+            assert control.driving("t1")
+            with pytest.raises(TaskAlreadyRunning, match="already running"):
+                async with control.exclusive("t1"):
+                    pass
+            # A different task is unaffected by the claim on this one.
+            async with control.exclusive("t2"):
+                assert control.driving("t2")
+        assert not control.driving("t1") and not control.driving("t2")
+
+    asyncio.run(scenario())
+
+
+def test_a_claim_is_released_even_when_the_run_raises():
+    from sam_backend.autonomy.control import RunControl
+
+    control = RunControl()
+
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            async with control.exclusive("t1"):
+                raise RuntimeError("the run blew up")
+        assert not control.driving("t1"), "a crashed driver must not hold the task forever"
+
+    asyncio.run(scenario())
+
+
+def test_the_stop_token_outlives_a_pause_but_not_a_finished_run(settings: Settings):
+    from sam_backend.cancellation import CancellationManager
+    from sam_backend.autonomy.control import RunControl
+
+    manager = CancellationManager()
+    control = RunControl(manager)
+    store = TaskStore(Database(settings.database_path))
+    task = store.create("Stoppable")
+
+    control.arm(task)
+    assert manager.get(task.id) is not None and not control.cancelled(task)
+
+    # Paused, not finished: Stop must still have something to flip.
+    control.release(task)
+    assert manager.get(task.id) is not None, "a waiting run stays stoppable"
+
+    control.request_stop(task)
+    assert control.cancelled(task)
+
+    task.state = TaskState.COMPLETED
+    control.release(task)
+    assert manager.get(task.id) is None, "a finished run drops its token"
+
+
+def test_without_a_cancellation_manager_nothing_is_ever_cancelled(settings: Settings):
+    """The orchestrator is constructed without one in some tests; it must not crash."""
+    from sam_backend.autonomy.control import RunControl
+
+    control = RunControl(None)
+    task = TaskStore(Database(settings.database_path)).create("No manager")
+
+    control.arm(task)
+    control.request_stop(task)
+    control.release(task)
+    assert control.cancelled(task) is False
