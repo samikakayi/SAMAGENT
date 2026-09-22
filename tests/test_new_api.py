@@ -288,3 +288,72 @@ def test_the_page_makes_no_third_party_requests():
 def test_the_font_stack_has_local_fallbacks():
     styles = (PROJECT_ROOT / "frontend" / "styles.css").read_text(encoding="utf-8")
     assert "Segoe UI" in styles or "system-ui" in styles or "ui-sans-serif" in styles
+
+
+def test_the_manual_calibrate_endpoint_feeds_the_store_drawing_reads(tmp_path: Path):
+    """End to end through the unchanged route: POST anchors, then drawing is unblocked.
+
+    The endpoint, its method and its response keys are exactly as before; only
+    where the values land has changed.
+    """
+    from fastapi.testclient import TestClient
+
+    from sam_backend.app import create_app
+    from sam_backend.config import Settings
+    from sam_backend.trading.calibration import geometry_hash
+
+    geometry = {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+
+    class Window:
+        window_handle = 7
+        symbol = "XAUUSD"
+        timeframe = "M15"
+        client_geometry = geometry
+        window_geometry = geometry
+        active = True
+        title = "TradingView"
+        current_price = 2500.0
+
+        def as_dict(self):
+            return {"symbol": self.symbol, "timeframe": self.timeframe}
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "workspace",
+                        data_dir=tmp_path / "data", default_provider="ollama", default_model="fake")
+    app = create_app(settings)
+    trading = app.state.trading
+    # The engine is handed its observer at construction, so that is where a
+    # stand-in window goes; patching the controller afterwards would not reach it.
+    trading.drawing._observe = lambda: Window()
+
+    with TestClient(app) as client:
+        response = client.post("/api/tradingview/action", json={
+            "action": "calibrate", "price_a": 3000.0, "y_a": 100.0, "price_b": 2000.0, "y_b": 600.0,
+        })
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verified"] is True
+    assert {"window_handle", "slope", "intercept"} <= set(body["data"]), "response shape preserved"
+    assert body["data"]["slope"] == pytest.approx(-2.0)
+
+    # The calibration the drawing engine consults is now present.
+    calibration, failure = trading.drawing.active_calibration(Window())
+    assert failure is None and calibration.verified
+    assert calibration.price_at(350.0) == pytest.approx(2500.0)
+    stored = trading.database.get_chart_calibration(
+        window_handle=7, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(geometry))
+    assert stored["method"] == "manual_anchors"
+
+
+def test_the_manual_calibrate_endpoint_still_validates_its_anchors(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    from sam_backend.app import create_app
+    from sam_backend.config import Settings
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "workspace",
+                        data_dir=tmp_path / "data", default_provider="ollama", default_model="fake")
+    with TestClient(create_app(settings)) as client:
+        missing = client.post("/api/tradingview/action", json={"action": "calibrate", "price_a": 3000.0})
+
+    assert missing.status_code == 400 and "required" in missing.json()["detail"]

@@ -652,6 +652,56 @@ class DrawingEngine:
             )
         return calibration, None
 
+    def calibrate_from_anchors(
+        self, price_a: float, y_a: float, price_b: float, y_b: float
+    ) -> StandardResult:
+        """Persist a mapping the user supplied by naming two prices and their rows.
+
+        The same fact as an OCR calibration, arrived at differently, so it lands
+        in the same store under the same viewport key. A mapping that only the
+        chart controller knew about was a mapping no drawing could ever use.
+
+        Only the price axis is fitted: two anchors say nothing about time, so
+        two-anchor objects still need the axis read.
+        """
+        started = time.perf_counter()
+        anchors = (price_a, y_a, price_b, y_b)
+        if not all(isinstance(value, (int, float)) for value in anchors) or y_a == y_b or price_a == price_b:
+            return StandardResult.failure(
+                "Two distinct price/Y anchors are required", error_code="INVALID_CALIBRATION", started_at=started
+            )
+        state = self._observe()
+        geometry = self.chart_geometry(state)
+        if not state.window_handle or not geometry:
+            return StandardResult.failure(
+                "TradingView window was not found", error_code="WINDOW_NOT_FOUND", started_at=started
+            )
+        from .calibration import geometry_hash
+
+        slope = (price_b - price_a) / (y_b - y_a)
+        intercept = price_a - slope * y_a
+        verified = (
+            abs((slope * y_a + intercept) - price_a) < 1e-9
+            and abs((slope * y_b + intercept) - price_b) < 1e-9
+        )
+        self.database.save_chart_calibration(
+            window_handle=state.window_handle,
+            symbol=(state.symbol or "UNKNOWN").upper(),
+            timeframe=state.timeframe or "UNKNOWN",
+            geometry_hash=geometry_hash(geometry),
+            slope=slope,
+            intercept=intercept,
+            method="manual_anchors",
+            anchors=[{"y": y_a, "price": price_a}, {"y": y_b, "price": price_b}],
+            verified=verified,
+        )
+        return StandardResult.success(
+            {"window_handle": state.window_handle, "slope": slope, "intercept": intercept},
+            verified=verified,
+            started_at=started,
+            observations=["Only the price axis was fitted; two-anchor objects still need Calibrate."],
+        )
+
     def calibrate(self) -> StandardResult:
         """Read the price axis and persist a verified mapping for this viewport."""
         started = time.perf_counter()

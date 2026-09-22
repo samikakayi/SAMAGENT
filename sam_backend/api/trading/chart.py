@@ -46,7 +46,7 @@ def register_chart_routes(application: FastAPI, sv: AppServices) -> None:
             anchors = (payload.price_a, payload.y_a, payload.price_b, payload.y_b)
             if any(value is None for value in anchors):
                 raise HTTPException(400, "price_a, y_a, price_b, and y_b are required")
-            result = trading.tradingview.calibrate(*anchors)  # type: ignore[arg-type]
+            result = trading.drawing.calibrate_from_anchors(*anchors)  # type: ignore[arg-type]
         database.add_audit("tradingview", result.status.value.lower(), f"TradingView {payload.action}", actor="user", details={"verified": result.verified, "error_code": result.error_code})
         return result.as_dict()
     @application.get("/api/tradingview/drawings")

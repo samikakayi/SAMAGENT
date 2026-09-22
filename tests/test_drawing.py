@@ -1240,3 +1240,135 @@ def test_clear_tries_every_adjacent_row_before_giving_up_on_an_object(chart):
     assert offsets == list(DrawingEngine.SELECT_OFFSETS), "each adjacent row is tried exactly once, in order"
     assert result.data["skipped"][0]["reason"].startswith("The chart did not change")
     assert chart.list_owned().data["count"] == 1, "an unconfirmed deletion keeps the ownership record"
+
+
+# -- one calibration truth ------------------------------------------------------------
+# Manual calibration used to write a dict on the chart controller that no
+# drawing ever read, so a user could calibrate by hand, be told it worked, and
+# still be refused with CALIBRATION_REQUIRED. Both paths now write the store
+# active_calibration consults.
+
+def test_manual_calibration_lets_the_very_next_drawing_through(chart, database):
+    """The defect, stated as behaviour: calibrate by hand, then draw."""
+    database.invalidate_chart_calibration(window_handle=7)
+    assert chart.draw(DrawRequest(annotation="support", price=2500.0)).error_code == "CALIBRATION_REQUIRED"
+
+    # Two anchors the user picked off the axis, describing the same mapping.
+    manual = chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    assert manual.verified and manual.data["slope"] == pytest.approx(SLOPE)
+    assert manual.data["intercept"] == pytest.approx(INTERCEPT)
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+
+    drawn = chart.draw(DrawRequest(annotation="support", price=2500.0))
+
+    assert drawn.verified, drawn.error
+    assert drawn.data["drawing"]["payload"]["geometry_hash"] == geometry_hash(GEOMETRY)
+
+
+def test_manual_calibration_is_stored_where_drawing_looks_and_nowhere_else(chart, database):
+    database.invalidate_chart_calibration(window_handle=7)
+
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    row = database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                         geometry_hash=geometry_hash(GEOMETRY))
+    assert row is not None and row["verified"] and row["method"] == "manual_anchors"
+    assert row["anchors"] == [{"y": 100.0, "price": 3000.0}, {"y": 600.0, "price": 2000.0}]
+    # The controller no longer keeps a calibration of its own to disagree with it.
+    assert not hasattr(chart._observe(), "_calibration")
+    from sam_backend.trading.tradingview import TradingViewController
+    assert not hasattr(TradingViewController, "calibrate"), "one writer, not two"
+    assert not hasattr(TradingViewController, "price_to_screen")
+
+
+def test_manual_calibration_is_scoped_to_this_symbol_timeframe_and_viewport(chart, database):
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    # The same window showing something else is not calibrated by that act.
+    chart.window.timeframe = "H4"
+    assert chart.capability()["calibrated"] is False
+    chart.window.timeframe = "M15"
+    chart.window.symbol = "EURUSD"
+    assert chart.capability()["calibrated"] is False
+    chart.window.symbol = "XAUUSD"
+    assert chart.capability()["calibrated"] is True
+
+
+def test_a_manually_calibrated_chart_still_needs_the_axis_read_for_two_anchor_objects(chart, database):
+    """Two price anchors say nothing about time; the limitation is stated, not hidden."""
+    database.invalidate_chart_calibration(window_handle=7)
+
+    manual = chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    assert any("still need" in note for note in manual.observations)
+    assert chart.capability()["time_calibrated"] is False
+    assert chart.draw_two_anchor(
+        TwoAnchorRequest("trendline", 2500.0, 100.0, 2600.0, 400.0)
+    ).error_code == "TIME_CALIBRATION_REQUIRED"
+
+
+@pytest.mark.parametrize("anchors, why", [
+    ((3000.0, 100.0, 2000.0, 100.0), "two rows the same"),
+    ((3000.0, 100.0, 3000.0, 600.0), "two prices the same"),
+    ((None, 100.0, 2000.0, 600.0), "a missing price"),
+])
+def test_manual_calibration_refuses_anchors_that_describe_no_mapping(chart, database, anchors, why):
+    database.invalidate_chart_calibration(window_handle=7)
+
+    result = chart.calibrate_from_anchors(*anchors)
+
+    assert result.error_code == "INVALID_CALIBRATION", why
+    assert database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                          geometry_hash=geometry_hash(GEOMETRY)) is None
+
+
+def test_manual_calibration_needs_a_chart_window(chart, database):
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.window.window_handle = None
+
+    assert chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0).error_code == "WINDOW_NOT_FOUND"
+
+
+def test_a_manual_calibration_is_invalidated_by_a_pan_like_any_other(chart, database, monkeypatch):
+    """The manual path must not become a way around viewport invalidation."""
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+    monkeypatch.setattr(chart.calibrator, "verify",
+                        lambda calibration, **kw: StandardResult.failure("axis moved", error_code="CALIBRATION_DRIFTED"))
+
+    assert chart.verify_calibration().error_code == "CALIBRATION_DRIFTED"
+    assert chart.draw(DrawRequest(annotation="support", price=2500.0)).error_code == "CALIBRATION_REQUIRED"
+
+
+def test_manual_calibration_survives_a_reload_because_it_is_persisted(chart, database, tmp_path):
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    # A second reader of the same store, as a restarted process would be.
+    reopened = Database(database.path)
+    row = reopened.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                         geometry_hash=geometry_hash(GEOMETRY))
+
+    assert row is not None and row["slope"] == pytest.approx(SLOPE)
+
+
+def test_auto_calibration_still_owns_the_same_store_and_wins_when_it_runs_later(chart, database, monkeypatch):
+    """Both writers, one record: the most recent calibration is the one in force."""
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+    monkeypatch.setattr(chart.calibrator, "calibrate", lambda **kw: StandardResult.success({
+        "slope": -1.0, "intercept": 3100.0, "method": "ocr", "geometry_hash": geometry_hash(GEOMETRY),
+        "axis_x": AXIS_X,
+    }, verified=True))
+    monkeypatch.setattr(chart.calibrator, "calibrate_time_axis", lambda geometry, axis_x: StandardResult.success(
+        {"minutes_per_pixel": 1.0, "time_intercept": 0.0, "time_axis_y": 780.0, "minutes_span": [0.0, 1440.0]}, verified=True))
+
+    chart.calibrate()
+
+    row = database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                         geometry_hash=geometry_hash(GEOMETRY))
+    assert row["method"] == "ocr" and row["slope"] == pytest.approx(-1.0)
+    assert chart.capability()["time_calibrated"] is True
