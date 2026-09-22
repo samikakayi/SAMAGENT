@@ -251,6 +251,53 @@ adapter -- not before.
 verification invariant existed still say `completed_verified` with no evidence.
 They load, they serve, and they can be rolled back; they are not rewritten.
 
+## What rollback guarantees
+
+Rollback restores files from copies saved before the run touched them. The
+copies live outside the workspace and can go missing independently of the task
+record -- a tidied data directory, a pruned backup, a half-copied profile --
+so the record can outlive the evidence it refers to.
+
+**Guaranteed.** Every entry is checked before anything is written. A file the
+run created needs no saved copy, because undoing it means deleting it; a file
+that already existed needs its copy still present and still openable. If any
+required copy is missing, unreadable, or recorded as `existed` with no copy at
+all, the whole rollback is refused and *no file is touched* -- not even the
+ones that could still be restored. The refusal names the workspace file, never
+the internal copy's path, and reaches the caller as the same
+`{"rolled_back": false, "reason": ...}` shape used for "stop the run first".
+A refused rollback writes no event, no audit entry and no `rolled_back` flag,
+so nothing in the record claims it happened. The diff view applies the same
+rule: a file whose original is gone reports `original_available: false` and an
+empty diff rather than diffing against nothing, which would paint every line
+as something the run added.
+
+**Not guaranteed.** This is not a filesystem transaction. Preflight rules out
+what is knowable in advance; it cannot rule out a failure that begins after the
+checks pass. If the disk fills, a file is locked, or permissions change between
+the check and the write, the restore stops partway: files already written stay
+written, and because `shutil.copyfile` truncates its target before copying, the
+file being written when the failure hits can be left truncated. The caller is
+told the rollback failed, but not which files reached which state.
+
+That residual case is reliability debt, not a security or data-integrity
+boundary. It needs a filesystem to fail in the window between a successful
+check and the write that follows; every path involved is a local file under the
+user's own account, nothing is remote or concurrent, and the failure is loud --
+an OS error, not silent corruption. There is no evidence it has occurred here.
+
+Closing it properly means choosing a guarantee and building for it. Staging
+each replacement to a temporary file and finishing with `os.replace` makes any
+*single* file's swap atomic, which removes the truncated-file case but still
+leaves a multi-file restore able to stop halfway. Making the whole set
+all-or-nothing needs more: keeping the pre-restore contents so a failure can be
+compensated back, or staging every file in memory first, which only works while
+the files are small enough to hold. A journal with compensating undo is the
+general answer and the heaviest. The honest label for the first two is
+*best-effort compensated multi-file rollback*; only the last earns the word
+*transactional*, and none of it should be built before something demonstrates
+the current behaviour is actually costing someone a file.
+
 ## Known debt
 
 Real, none blocking. Each is here because it is worth knowing, not because it
@@ -274,3 +321,9 @@ is scheduled.
 6. **A few unused imports** in `trading/analysis.py`, `trading/replay.py`,
    `windows_control.py`, `tools/registry.py` and `api/desktop.py`. Inert; left
    alone rather than swept up in a stabilisation pass.
+7. **Rollback is preflighted, not transactional.** An unexpected I/O failure
+   during the write phase -- disk full, a lock taken after the check, a
+   permission change -- can still leave a partial restore, and the file being
+   written at the time can be left truncated. Known-invalid checkpoint
+   evidence is caught before any mutation; an unpredictable filesystem is not.
+   See the section above for what a future fix would have to promise.
