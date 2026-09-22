@@ -498,3 +498,120 @@ def test_the_observed_state_declares_no_chart_geometry_of_its_own():
     names = {field.name for field in dataclasses.fields(TradingViewState)}
     assert "chart_geometry" not in names
     assert "client_geometry" in names, "the geometry observe() does populate stays"
+
+
+# --- The card must not depend on the broker feed ------------------------------
+#
+# The drawing row reads /api/trading/status, which also reaches MetaTrader5.
+# A chart verdict must not be decided, delayed, or erased by an unrelated broker.
+
+UNREACHABLE = "Unavailable; the drawing engine could not be reached"
+
+
+def calibrated_service(tmp_path):
+    """A real TradingService over a calibrated fake window, MT5 untouched."""
+    from sam_backend.cancellation import CancellationManager
+    from sam_backend.config import Settings
+    from sam_backend.db import Database
+    from sam_backend.trading.calibration import geometry_hash
+    from sam_backend.trading.service import TradingService
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "workspace",
+                        data_dir=tmp_path / "data")
+    settings.prepare()
+    database = Database(settings.database_path)
+    trading = TradingService(settings, database, CancellationManager())
+
+    state = observed_state()
+    trading.tradingview.observe = lambda: state
+    trading.drawing._observe = lambda: state
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    database.save_chart_calibration(
+        window_handle=state.window_handle, symbol="XAUUSD", timeframe="M15",
+        geometry_hash=geometry_hash(PANEL_GEOMETRY), slope=-0.2556, intercept=4485.04,
+        method="price_axis_ocr", verified=True, axis_x=1100.0,
+    )
+    return trading
+
+
+def test_a_broken_metatrader_does_not_erase_the_chart_verdict(tmp_path):
+    """MT5 failing is reported as data; the drawing engine still answers."""
+    from sam_backend.trading.market_data import MarketDataError
+
+    trading = calibrated_service(tmp_path)
+    provider = trading.market_data.providers["metatrader5"]
+
+    def dead(*args, **kwargs):
+        # What the provider raises when the terminal is absent or unreachable.
+        raise MarketDataError("MetaTrader 5 terminal is not running")
+
+    provider.fetch = dead
+    provider._module = dead
+
+    payload = trading.status()
+
+    assert payload["market_data"]["metatrader5"]["state"] == "UNAVAILABLE"
+    assert payload["capabilities"]["state"] == "UNAVAILABLE"
+    assert "not running" in payload["capabilities"]["error"]
+    # The part the panel needs survived untouched.
+    assert payload["drawing"]["calibrated"] is True
+    assert payload["drawing"]["verified_price_drawing"] is True
+
+    shown = render_panel(tmp_path, json.loads(json.dumps(payload, default=str)))["rendered"]
+    assert shown[DRAWING_ROW] == "Verified price drawing available"
+    assert shown["tv-observed-symbol"] == "XAUUSD"
+
+
+def test_a_failing_status_endpoint_does_not_claim_the_chart_is_uncalibrated(tmp_path):
+    """Not being able to ask is not the same answer as "not calibrated"."""
+    scenario = {"responses": {
+        "/api/tradingview/state": {"body": observed_state().as_dict()},
+        "/api/trading/status": {"status": 500, "body": {"detail": "market data blew up"}},
+    }}
+
+    shown = render_panel(tmp_path, scenario)["rendered"]
+
+    assert shown[DRAWING_ROW] != UNAVAILABLE, "claimed a calibration verdict it never received"
+    assert "available" not in shown[DRAWING_ROW].lower() or "Unavailable" in shown[DRAWING_ROW]
+    # The window observation needs no broker, so it must still be shown.
+    assert shown["tv-observed-symbol"] == "XAUUSD"
+    assert shown["tradingview-status"] == "RUNNING"
+
+
+def test_a_status_payload_without_a_drawing_verdict_invents_none(tmp_path):
+    scenario = {"responses": {
+        "/api/tradingview/state": {"body": observed_state().as_dict()},
+        "/api/trading/status": {"body": {"tradingview": observed_state().as_dict()}},
+    }}
+
+    shown = render_panel(tmp_path, scenario)["rendered"]
+
+    assert shown[DRAWING_ROW] == UNREACHABLE
+    assert shown["tv-observed-symbol"] == "XAUUSD"
+
+
+def test_a_stalled_broker_does_not_freeze_the_rest_of_the_card(tmp_path):
+    """A hung MetaTrader5 call holds /api/trading/status open indefinitely."""
+    scenario = {"responses": {
+        "/api/tradingview/state": {"body": observed_state().as_dict()},
+        "/api/trading/status": {"hang": True},
+    }}
+
+    shown = render_panel(tmp_path, scenario)["rendered"]
+
+    assert shown["tv-observed-symbol"] == "XAUUSD", "the observation waited on the broker"
+    assert shown["tv-observed-price"] == "4310.55"
+    assert shown["tradingview-status"] == "RUNNING"
+
+
+def test_losing_the_chart_observation_retires_the_previous_verdict(tmp_path):
+    """A verdict from an earlier tick describes a chart no longer being observed."""
+    scenario = {"responses": {
+        "/api/tradingview/state": {"status": 500, "body": {"detail": "window gone"}},
+        "/api/trading/status": {"body": {"drawing": {"calibrated": True, "verified_price_drawing": True}}},
+    }}
+
+    shown = render_panel(tmp_path, scenario)["rendered"]
+
+    assert shown["tradingview-status"] == "UNAVAILABLE"
+    assert shown[DRAWING_ROW] == UNREACHABLE, "left a stale availability claim standing"

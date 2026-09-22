@@ -28,20 +28,31 @@ const document = {
 const requested = [];
 async function fetch(path) {
   requested.push(path);
-  // /api/trading/status carries the same observation under `tradingview`, so
-  // whichever endpoint the panel chooses is answered with the same truth.
+  // A scenario file may script each endpoint separately, including failures.
+  if (payload.responses) {
+    const reply = payload.responses[path];
+    if (!reply) return { ok: false, status: 503, json: async () => ({ detail: `no stub for ${path}` }) };
+    if (reply.hang) return new Promise(() => {});  // a stalled broker never answers
+    const status = reply.status || 200;
+    return { ok: status < 400, status, json: async () => reply.body };
+  }
+  // Otherwise the file is one `/api/trading/status` payload, which carries the
+  // same observation under `tradingview`, so either endpoint answers truthfully.
   const body = path === "/api/tradingview/state" ? payload.tradingview : payload;
   return { ok: true, status: 200, json: async () => body };
 }
 
-const context = { document, fetch, console, setInterval: () => {}, setTimeout: () => {} };
+const context = { document, fetch, console, setInterval: () => {}, setTimeout };
 context.window = context;
 context.globalThis = context;
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(panelPath, "utf-8"), context);
 
 (async () => {
-  await context.window.SAMTrading.tradingView();
+  await Promise.race([
+    context.window.SAMTrading.tradingView(),
+    new Promise((resolve) => setTimeout(resolve, Number(process.env.PANEL_TIMEOUT_MS || 1500))),
+  ]);
   const rendered = {};
   for (const [id, node] of nodes) rendered[id] = node.textContent;
   console.log(JSON.stringify({ requested, rendered }));
