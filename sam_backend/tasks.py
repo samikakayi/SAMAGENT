@@ -139,10 +139,6 @@ class AgentTask:
     # The agent's own diff is always reported separately from these.
     preexisting_changes: list[str] = field(default_factory=list)
     rolled_back: bool = False
-    # Set only when a row was read back already claiming verification it
-    # cannot show. Such a record stays writable -- rolling one back must not
-    # fail because of history -- but nothing new may enter that state.
-    legacy_unverified_claim: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -158,9 +154,6 @@ class AgentTask:
         payload = asdict(self)
         payload["state"] = self.state.value
         payload["terminal"] = self.terminal
-        # An in-process detail about where this record came from, not part of
-        # the task; it must never be persisted or served.
-        payload.pop("legacy_unverified_claim", None)
         return payload
 
     def public_dict(self, *, event_limit: int = 200) -> dict[str, Any]:
@@ -173,6 +166,11 @@ class AgentTask:
 
 
 VERIFIED_STATUS = "completed_verified"
+
+
+def _unevidenced_claim(completion_status: Any, verification: Any) -> bool:
+    """A record asserting it was verified with nothing to show for it."""
+    return completion_status == VERIFIED_STATUS and verification is None
 
 
 class TaskStore:
@@ -217,16 +215,26 @@ class TaskStore:
         return task
 
     def save(self, task: AgentTask) -> AgentTask:
-        # The one authoritative rule: a run may not claim it was verified
-        # without the report that says so. Reads stay permissive so older
-        # records remain usable; only entering the state is refused.
-        if task.completion_status == VERIFIED_STATUS and task.verification is None and not task.legacy_unverified_claim:
-            raise ValueError(
-                f"{task.id} cannot be saved as {VERIFIED_STATUS} without the verification report that earned it"
-            )
-        task.updated_at = time.time()
-        payload = json.dumps(task.as_dict())
         with self.database.write() as connection:
+            # The one authoritative rule: a run may not claim it was verified
+            # without the report that says so. The sole exception is a row
+            # that already made that claim before the rule existed -- it has
+            # to stay writable or rolling it back would fail -- and whether
+            # that applies is read from the stored row, never from the
+            # caller, so no field on the task in hand can grant it. Repairing
+            # such a row therefore ends the exemption by itself.
+            if _unevidenced_claim(task.completion_status, task.verification):
+                row = connection.execute(
+                    "SELECT payload_json FROM agent_tasks WHERE id = ?", (task.id,)
+                ).fetchone()
+                stored = json.loads(row["payload_json"]) if row else {}
+                if not _unevidenced_claim(stored.get("completion_status"), stored.get("verification")):
+                    raise ValueError(
+                        f"{task.id} cannot be saved as {VERIFIED_STATUS} "
+                        "without the verification report that earned it"
+                    )
+            task.updated_at = time.time()
+            payload = json.dumps(task.as_dict())
             connection.execute(
                 """
                 INSERT INTO agent_tasks (id, conversation_id, goal, state, payload_json, created_at, updated_at)
@@ -344,9 +352,6 @@ def _from_payload(payload: str) -> AgentTask:
         checkpoints=list(data.get("checkpoints") or []),
         preexisting_changes=list(data.get("preexisting_changes") or []),
         rolled_back=bool(data.get("rolled_back", False)),
-        legacy_unverified_claim=(
-            data.get("completion_status") == VERIFIED_STATUS and data.get("verification") is None
-        ),
         created_at=float(data.get("created_at") or time.time()),
         updated_at=float(data.get("updated_at") or time.time()),
     )

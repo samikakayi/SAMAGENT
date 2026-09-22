@@ -8,6 +8,7 @@ self-correction, and must refuse to call itself done when it is not.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -205,31 +206,73 @@ def test_the_store_refuses_a_verified_claim_without_its_evidence(settings: Setti
             store.save(task)
 
 
+def seed_legacy_row(store: "TaskStore", goal: str = "Old run") -> str:
+    """A row of the shape written before the rule existed."""
+    task = store.create(goal)
+    stale = task.as_dict() | {"completion_status": "completed_verified", "verification": None}
+    with store.database.write() as connection:
+        connection.execute("UPDATE agent_tasks SET payload_json=? WHERE id=?", (json.dumps(stale), task.id))
+    return task.id
+
+
 def test_a_legacy_verified_row_keeps_working_without_being_rewritten(settings: Settings):
     """Records written before the rule stay readable, and still writable:
     rolling one back must not fail because of history."""
-    database = Database(settings.database_path)
-    store = TaskStore(database)
-    task = store.create("Old run")
-    stale = task.as_dict() | {"completion_status": "completed_verified", "verification": None}
-    with database.write() as connection:
-        connection.execute("UPDATE agent_tasks SET payload_json=? WHERE id=?", (json.dumps(stale), task.id))
+    store = TaskStore(Database(settings.database_path))
+    task_id = seed_legacy_row(store)
 
-    loaded = store.get(task.id)
+    loaded = store.get(task_id)
     assert loaded.completion_status == "completed_verified"
     assert loaded.verification is None, "nothing is invented on read"
-    # The exemption is an in-process detail, never part of the record.
+    # Reading must not smuggle exemption state onto the object or the record.
     assert "legacy_unverified_claim" not in loaded.as_dict()
+    assert not hasattr(loaded, "legacy_unverified_claim"), "no caller-settable bypass exists"
 
+    # The resave a rollback performs: unrelated metadata, same inconsistency.
     loaded.rolled_back = True
     store.save(loaded)
-    assert store.get(task.id).rolled_back is True
+    assert store.get(task_id).rolled_back is True
 
-    # And it does not travel: a new task cannot make the same claim.
+    # And it does not travel: a new task cannot make the same claim, even
+    # with every field a caller can reach set to imitate the legacy row.
     fresh = store.create("New run")
     fresh.completion_status = "completed_verified"
+    for spec in dataclasses.fields(loaded):
+        if spec.name not in {"id", "goal", "created_at"}:
+            setattr(fresh, spec.name, getattr(loaded, spec.name))
     with pytest.raises(ValueError):
         store.save(fresh)
+
+
+def test_repairing_a_legacy_row_ends_its_exemption(settings: Settings):
+    """The pass is granted by the stored row, so fixing it withdraws the pass."""
+    store = TaskStore(Database(settings.database_path))
+    task_id = seed_legacy_row(store, "Row to repair")
+
+    repaired = store.get(task_id)
+    repaired.verification = {"verified": True, "checks": []}
+    store.save(repaired)
+    assert store.get(task_id).verification == {"verified": True, "checks": []}
+
+    # Now that the stored row is sound, it cannot regress to the old shape.
+    regressed = store.get(task_id)
+    regressed.verification = None
+    with pytest.raises(ValueError, match="without the verification report"):
+        store.save(regressed)
+    assert store.get(task_id).verification is not None, "the sound row is untouched"
+
+
+def test_rollback_resaves_a_legacy_row_without_tripping_the_rule(settings: Settings, workspace: Path):
+    """The real hazard: rollback writes back whatever task it restored."""
+    store = TaskStore(Database(settings.database_path))
+    orchestrator = build_orchestrator(settings, ScriptedRouter([]))
+    orchestrator.store = store
+    task_id = seed_legacy_row(store, "Legacy run to roll back")
+
+    outcome = asyncio.run(orchestrator.rollback(task_id))
+
+    assert outcome["rolled_back"] is True
+    assert store.get(task_id).rolled_back is True
 
 
 def test_the_whole_run_is_persisted_and_replayable(settings: Settings, workspace: Path):
