@@ -1,0 +1,376 @@
+"""Hands-free, in one breath: "Hey SAM, open Gold" without waiting to be asked.
+
+The wake listener used to examine an utterance, confirm the phrase, and only
+then open a new capture for the command -- so whatever followed the phrase in
+the same breath had already been spent on wake detection and was gone. These
+tests pin the fix: the words after the phrase belong to the command, they are
+carried forward on the stream that heard them, and they go to the configured
+command recogniser -- never the English wake transcript, and never anything
+from before the phrase.
+
+Synthetic audio makes the boundary exact: silence before, the phrase at one
+level, the command at another. Whatever reaches the command recogniser can be
+checked sample by sample for what it should and should not contain.
+"""
+
+from __future__ import annotations
+
+import time
+
+import numpy
+import pytest
+
+from sam_backend.wake import (
+    WakeDetection,
+    phrase_end,
+    phrase_heard,
+)
+from tests.test_hands_free_voice import (
+    FRAME,
+    FakeVoice,
+    ScriptedDetector,
+    ScriptedStream,
+    controller,
+    frames_of,
+    quiet,
+)
+
+PHRASE_LEVEL = 0.2   # "Hey SAM"
+COMMAND_LEVEL = 0.3  # whatever follows it
+
+
+def phrase(seconds: float = 0.6) -> list:
+    return frames_of(PHRASE_LEVEL, seconds)
+
+
+def command(seconds: float) -> list:
+    return frames_of(COMMAND_LEVEL, seconds)
+
+
+def wait_for(predicate, seconds: float = 5.0) -> bool:
+    limit = time.monotonic() + seconds
+    while time.monotonic() < limit:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class LocatingDetector(ScriptedDetector):
+    """Finds the phrase the way the real detector does: by where it ends.
+
+    The phrase is the first loud sound in the window and lasts
+    `phrase_seconds`; the answer is that moment, in seconds into the window.
+    """
+
+    def __init__(self, phrase_seconds: float = 0.6, heard: bool = True):
+        super().__init__([])
+        self.phrase_seconds = phrase_seconds
+        self.heard = heard
+        self.windows: list[float] = []
+
+    def locate(self, audio, wake_phrase):
+        self.examined += 1
+        self.windows.append(len(audio) / 16_000)
+        if not self.heard:
+            return None
+        loud = numpy.flatnonzero(numpy.abs(audio) > 0.1)
+        if not len(loud):
+            return None
+        return loud[0] / 16_000 + self.phrase_seconds
+
+    def detect(self, audio, wake_phrase):
+        return self.locate(audio, wake_phrase) is not None
+
+
+class OneBreathVoice(FakeVoice):
+    """FakeVoice that can also transcribe audio it did not capture itself."""
+
+    def __init__(self, utterances=None, transcripts=None):
+        super().__init__(utterances)
+        self._transcripts = list(transcripts or ["open gold"])
+        self.transcribed: list[dict] = []
+
+    def transcribe_captured(self, audio, language=None):
+        self.transcribed.append({"audio": numpy.asarray(audio), "language": language})
+        item = self._transcripts.pop(0) if self._transcripts else ""
+        if isinstance(item, dict):
+            return {"captured": True, **item}
+        return {"captured": True, "text": item, "seconds": len(audio) / 16_000}
+
+
+def run(stream_frames, *, voice=None, detector=None, language="ckb-IQ", continuation=0.0,
+        replies=None):
+    voice = voice or OneBreathVoice()
+    session = controller(stream=ScriptedStream(stream_frames), voice=voice,
+                         detector=detector or LocatingDetector(), continuation=continuation,
+                         replies=replies or ["Gold is trading quietly."])
+    session.settings.voice_language = language
+    states: list[str] = []
+    session.subscribe(lambda status: states.append(status.state.value))
+    session.start()
+    return session, voice, states
+
+
+def finish(session, voice, *, spoken: int = 1, seconds: float = 6.0):
+    try:
+        assert wait_for(lambda: len(voice.spoken) >= spoken, seconds), (
+            f"SAM never answered; states={session.status.state.value}, "
+            f"error={session.status.last_error!r}")
+        assert wait_for(lambda: not session._busy.is_set(), seconds)
+    finally:
+        session.stop()
+
+
+def levels(audio) -> set[float]:
+    return {round(float(x), 2) for x in numpy.unique(numpy.round(audio, 2))}
+
+
+# --- 1 / 7. the phrase alone: the two-step flow still works ---------------------
+
+
+def test_the_phrase_alone_still_waits_for_the_command():
+    session, voice, states = run([quiet(0.3), phrase(), quiet(4.0)],
+                                 voice=OneBreathVoice(["what is gold doing"]))
+    finish(session, voice)
+
+    assert voice.transcribed == [], "silence after the phrase was sent to be transcribed"
+    assert voice.listen_calls == 1, "nothing followed the phrase, so SAM must ask for the command"
+    assert session.transcripts == ["what is gold doing"]
+
+
+def test_nothing_after_the_phrase_takes_the_listening_path():
+    session, voice, states = run([quiet(0.3), phrase(), quiet(4.0)],
+                                 voice=OneBreathVoice(["open gold"]))
+    finish(session, voice)
+
+    assert "WAKE_DETECTED" in states and "LISTENING" in states
+    assert states.index("WAKE_DETECTED") < states.index("LISTENING")
+
+
+# --- 2 / 3. the words after the phrase are the command --------------------------
+
+
+def test_the_command_in_the_same_breath_is_kept():
+    session, voice, states = run([quiet(0.3), phrase(), command(0.9), quiet(1.5)],
+                                 voice=OneBreathVoice(transcripts=["open gold"]))
+    finish(session, voice)
+
+    assert voice.listen_calls == 0, "the command was already spoken; asking again loses it"
+    assert len(voice.transcribed) == 1
+    heard = voice.transcribed[0]["audio"]
+    assert COMMAND_LEVEL in levels(heard), "the command itself never reached the recogniser"
+    assert PHRASE_LEVEL not in levels(heard), "the wake phrase was sent as part of the command"
+    assert sum(numpy.isclose(heard, COMMAND_LEVEL)) / 16_000 >= 0.89, "the command was cut short"
+    assert session.transcripts == ["open gold"]
+    assert "TRANSCRIBING" in states and "THINKING" in states and "SPEAKING" in states
+
+
+def test_a_sorani_command_after_an_english_phrase_goes_to_the_command_recogniser():
+    """English wake, Sorani command, one breath.
+
+    The wake recogniser only ever hears English; what it made of the Sorani is
+    irrelevant. The command audio goes to whatever the configured language
+    uses -- for this user, the Sorani provider -- and its transcript is what
+    SAM answers.
+    """
+    sorani = "ئێستا گۆڵد چۆنە؟"
+    session, voice, _ = run([quiet(0.3), phrase(), command(1.2), quiet(1.5)],
+                            voice=OneBreathVoice(transcripts=[sorani]), language="ckb-IQ")
+    finish(session, voice)
+
+    assert voice.transcribed[0]["language"] == "ckb-IQ"
+    assert session.transcripts == [sorani]
+    assert session.status.last_transcript == sorani
+
+
+def test_captured_audio_is_transcribed_by_the_configured_language(monkeypatch):
+    """At the voice service: Sorani goes to the Sorani path, English to Whisper."""
+    from sam_backend.config import Settings
+    from sam_backend.voice import VoiceService
+
+    service = VoiceService(Settings.from_env())
+    routes: list[str] = []
+    monkeypatch.setattr(service, "_transcribe_sorani",
+                        lambda audio, seconds: routes.append("sorani") or {"text": "سڵاو"})
+    monkeypatch.setattr(service.stt, "transcribe",
+                        lambda audio, language=None: routes.append(f"whisper:{language}") or {"text": "hello"})
+    audio = numpy.full(16_000, 0.3, dtype="float32")
+
+    assert service.transcribe_captured(audio, language="ckb-IQ")["text"] == "سڵاو"
+    assert service.transcribe_captured(audio, language="en-US")["text"] == "hello"
+    assert routes == ["sorani", "whisper:en-US"]
+
+
+# --- 4 / 15. finding where the phrase ends --------------------------------------
+
+
+@pytest.mark.parametrize("words, expected", [
+    # at the start
+    ([(" Hey,", 0.1, 0.6), (" SAM", 0.7, 0.9), (" open", 1.0, 1.2), (" Gold.", 1.2, 1.5)], 0.9),
+    # an initialism split into pieces, as a real transcript returned it
+    ([(" Hey", 0.1, 0.6), (" S", 0.6, 0.8), (".A", 0.8, 0.9), (".M", 0.9, 1.1), (" tell", 1.1, 1.3)], 1.1),
+    ([(" Hey,", 0.1, 0.6), (" SA", 0.7, 0.9), ("-M", 0.9, 1.0), (" Open,", 1.0, 1.3)], 1.0),
+    ([(" Hey,", 0.1, 0.6), (" S.A.M.,", 0.7, 1.0), (" tell", 1.1, 1.3)], 1.0),
+    # in the middle
+    ([(" Okay,", 0.1, 0.5), (" hey,", 0.6, 0.8), (" Sam", 0.9, 1.1), (" status.", 1.2, 1.6)], 1.1),
+    # at the very end: nothing follows it
+    ([(" So", 0.1, 0.3), (" hey", 0.4, 0.6), (" Sam.", 0.7, 0.9)], 0.9),
+    # not the phrase at all
+    ([(" open", 0.1, 0.3), (" gold", 0.3, 0.6), (" hey", 0.7, 0.8), (" same", 0.8, 1.0)], None),
+    ([(" they", 0.1, 0.3), (" sampled", 0.3, 0.8)], None),
+    ([(" Hey,", 0.1, 0.6), (" Sammy", 0.7, 1.0)], None),
+])
+def test_the_end_of_the_phrase_is_found_in_the_words(words, expected):
+    assert phrase_end(words, "Hey SAM") == expected
+
+
+# --- 5 / 6. short and long commands ---------------------------------------------
+
+
+def test_a_one_word_command_is_enough():
+    """ "Hey SAM, gold." is a whole request; it must not be mistaken for silence."""
+    session, voice, _ = run([quiet(0.3), phrase(), command(0.2), quiet(1.5)],
+                            voice=OneBreathVoice(transcripts=["gold"]))
+    finish(session, voice)
+
+    assert voice.listen_calls == 0
+    assert session.transcripts == ["gold"]
+
+
+def test_a_long_command_is_not_cut_off_by_the_wake_window():
+    """Longer than the wake buffer holds, and nothing may be lost from either end.
+
+    The listener used to wait for the end of an utterance before examining
+    it; a sentence longer than the buffer had lost its own beginning -- the
+    phrase -- by then, and never woke SAM at all.
+    """
+    session, voice, _ = run([quiet(0.3), phrase(), command(6.4), quiet(1.5)],
+                            voice=OneBreathVoice(transcripts=["open gold and analyse the chart"]))
+    finish(session, voice, seconds=10.0)
+
+    heard = voice.transcribed[0]["audio"]
+    kept = sum(numpy.isclose(heard, COMMAND_LEVEL)) / 16_000
+    assert kept >= 6.35, f"only {kept:.2f}s of a 6.4s command survived"
+    assert PHRASE_LEVEL not in levels(heard)
+
+
+# --- 8. when the command cannot be read -----------------------------------------
+
+
+def test_a_command_that_cannot_be_transcribed_gets_a_second_chance():
+    voice = OneBreathVoice(["open gold"], transcripts=[{"text": "", "error": "KurdishTTS: 503"}])
+    session, voice, states = run([quiet(0.3), phrase(), command(0.8), quiet(1.5)], voice=voice)
+    finish(session, voice)
+
+    assert voice.listen_calls == 1, "the session was dropped instead of asking again"
+    assert "KurdishTTS: 503" in session.status.last_error, "the provider's error was swallowed"
+    assert session.transcripts[-1] == "open gold"
+
+
+# --- 9. what must not wake it ---------------------------------------------------
+
+
+@pytest.mark.parametrize("heard", [
+    "hey same here", "hey sammy", "they sampled it", "an essay about gold", "I am here",
+    "hey some", "say ham",
+])
+def test_near_misses_do_not_wake_it(heard):
+    assert phrase_heard(heard, "Hey SAM") is False
+
+
+@pytest.mark.parametrize("heard", ["Hey SAM", "Hey, SAM!", "Hey S.A.M.", "hey sam", "Hey SA-M, open"])
+def test_the_phrase_in_its_usual_spellings_still_wakes_it(heard):
+    assert phrase_heard(heard, "Hey SAM") is True
+
+
+def test_speech_without_the_phrase_starts_nothing():
+    detector = LocatingDetector(heard=False)
+    session, voice, _ = run([quiet(0.3), command(1.0), quiet(1.5)], detector=detector)
+    try:
+        assert wait_for(lambda: detector.examined >= 1)
+        time.sleep(0.2)
+        assert voice.transcribed == [] and voice.listen_calls == 0
+        assert session.status.state.value == "WAKE_LISTENING"
+    finally:
+        session.stop()
+
+
+# --- 10. SAM's own voice --------------------------------------------------------
+
+
+def test_a_suppressed_listener_hands_nothing_on():
+    """What SAM says is dropped before examination, so it cannot become a command."""
+    voice = OneBreathVoice()
+    detector = LocatingDetector()
+    session = controller(stream=ScriptedStream([quiet(0.3), phrase(), command(1.0), quiet(1.5)]),
+                         voice=voice, detector=detector)
+    session.wake.suppress()
+    session.start()
+    try:
+        time.sleep(0.5)
+        assert detector.examined == 0
+        assert session.wake.take_detection() is None
+        assert voice.transcribed == []
+    finally:
+        session.stop()
+
+
+# --- 11. the follow-up window ---------------------------------------------------
+
+
+def test_the_follow_up_window_still_needs_no_phrase():
+    voice = OneBreathVoice(["and silver?"], transcripts=["open gold"])
+    session, voice, _ = run([quiet(0.3), phrase(), command(0.8), quiet(1.5)], voice=voice,
+                            continuation=5.0, replies=["Gold is quiet.", "Silver too."])
+    finish(session, voice, spoken=2)
+
+    assert session.transcripts[:2] == ["open gold", "and silver?"]
+    assert voice.listen_calls >= 1, "the follow-up is captured the ordinary way"
+
+
+# --- 12. privacy ----------------------------------------------------------------
+
+
+def test_nothing_from_before_the_phrase_reaches_the_command_recogniser():
+    """Only what follows the phrase may leave the machine, and only after it."""
+    before = frames_of(0.05, 0.9)  # somebody talking before they addressed SAM
+    session, voice, _ = run([before, quiet(0.7), phrase(), command(0.9), quiet(1.5)])
+    finish(session, voice)
+
+    heard = voice.transcribed[0]["audio"]
+    assert 0.05 not in levels(heard), "speech from before the phrase was sent on"
+    assert PHRASE_LEVEL not in levels(heard)
+
+
+def test_a_detection_hands_over_only_what_followed():
+    detection = WakeDetection(phrase_end=0.9)
+    assert detection.speech is False and detection.audio is None
+    assert detection.wait(0.01) is False, "an unfinished capture must not look finished"
+
+
+# --- 13 / 14. one microphone, and a listener that keeps going -------------------
+
+
+def test_one_breath_uses_the_stream_that_heard_it():
+    stream = ScriptedStream([quiet(0.3), phrase(), command(0.9), quiet(1.5)])
+    voice = OneBreathVoice()
+    session = controller(stream=stream, voice=voice, detector=LocatingDetector())
+    session.start()
+    finish(session, voice)
+
+    assert stream.opened == 1, "a second microphone stream was opened"
+    assert voice.listen_calls == 0
+
+
+def test_the_listener_survives_utterance_after_utterance():
+    detector = LocatingDetector(heard=False)
+    script = []
+    for _ in range(4):
+        script += [command(0.8), quiet(0.9)]
+    session, voice, _ = run(script, detector=detector)
+    try:
+        assert wait_for(lambda: detector.examined >= 4)
+        assert session.wake.running, "the listener died between utterances"
+    finally:
+        session.stop()
