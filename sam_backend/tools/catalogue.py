@@ -57,6 +57,29 @@ def tool_specs(registry: Any) -> list[dict[str, Any]]:
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
         }, ["code"])),
         ("open_url", "Open an http(s) URL in the user's default browser.", _schema({"url": {"type": "string"}}, ["url"])),
+        ("workflow_search", "Search the public n8n automation library by goal, service or category. Returns a handful of summaries, never whole workflows.", _schema({
+            "query": {"type": "string"},
+            "category": {"type": "string"}, "service": {"type": "string"},
+            "trigger": {"type": "string", "enum": ["scheduled", "triggered", "webhook", "manual"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+        }, ["query"])),
+        ("workflow_inspect", "Statically analyse one library workflow: nodes, integrations, credentials, triggers and risk. Never executes any part of it.", _schema({
+            "workflow_id": {"type": "string"},
+        }, ["workflow_id"])),
+        ("workflow_prepare", "Build an importable artifact from a workflow: validated, risk-classified, diffed, and hashed. Creates nothing in n8n.", _schema({
+            "workflow_id": {"type": "string"},
+            "name": {"type": "string"},
+            "credential_mapping": {"type": "object"},
+        }, ["workflow_id"])),
+        ("workflow_import", "Create a prepared workflow in the configured n8n instance, inactive. Requires approval and the exact artifact hash.", _schema({
+            "workflow_sha256": {"type": "string"},
+        }, ["workflow_sha256"])),
+        ("workflow_activate", "Activate or deactivate a workflow already in n8n. Activation starts schedules and exposes webhooks, so it is approved separately from import.", _schema({
+            "workflow_id": {"type": "string"}, "active": {"type": "boolean"},
+        }, ["workflow_id", "active"])),
+        ("workflow_run_status", "Read recent n8n execution results for a workflow: status, duration, failed node and a bounded output preview.", _schema({
+            "workflow_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        })),
         ("web_search", "Search the public web and return titles, URLs and snippets. Read-only: it fetches results, it does not open pages or run anything.", _schema({
             "query": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 10},
@@ -225,6 +248,11 @@ def tool_manifests(registry: Any) -> list[dict[str, Any]]:
         # Reading search results is a network read, not browser control: it
         # opens nothing and runs nothing on the machine.
         "web_search": "network",
+        # Reading the library and analysing JSON are network/local reads.
+        # Creating or activating something in n8n changes a live system.
+        "workflow_search": "network", "workflow_inspect": "network",
+        "workflow_prepare": "network", "workflow_run_status": "network",
+        "workflow_import": "destructive_actions", "workflow_activate": "destructive_actions",
         "market_snapshot": "network", "analyze_market": "network", "get_tradingview_state": "desktop",
         "focus_tradingview": "desktop", "set_tradingview_symbol": "desktop", "set_tradingview_timeframe": "desktop",
         "list_processes": "applications", "process_info": "applications", "stop_process": "destructive_actions",

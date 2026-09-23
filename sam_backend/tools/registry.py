@@ -61,6 +61,7 @@ class ToolRegistry:
         verifier: VerificationEngine | None = None,
         capabilities: CapabilityRegistry | None = None,
         search: Any = None,
+        workflows: Any = None,
     ):
         self.settings = settings
         self.database = database
@@ -68,6 +69,8 @@ class ToolRegistry:
         # Injected in tests so the suite never reaches the network; built on
         # first use otherwise, because most runs never search.
         self.search = search
+        # Built on first use: most runs never touch a workflow library.
+        self._workflows = workflows
         self.windows = windows
         self.cancellation = cancellation
         self.workspace = settings.workspace_root.resolve()
@@ -87,6 +90,12 @@ class ToolRegistry:
             "run_python": self._run_python,
             "open_url": self._open_url,
             "web_search": self._web_search,
+            "workflow_search": self._workflow_search,
+            "workflow_inspect": self._workflow_inspect,
+            "workflow_prepare": self._workflow_prepare,
+            "workflow_import": self._workflow_import,
+            "workflow_activate": self._workflow_activate,
+            "workflow_run_status": self._workflow_run_status,
             "browser_automate": self._browser_automate,
             "launch_app": self._launch_app,
             "remember": self._remember,
@@ -432,6 +441,60 @@ class ToolRegistry:
             "count": len(found),
             "results": [item.as_dict() for item in found],
         })
+
+    # -- workflow intelligence ---------------------------------------------
+    @property
+    def workflows(self):
+        if self._workflows is None:
+            from ..workflows import WorkflowIntelligence
+
+            self._workflows = WorkflowIntelligence(self.settings)
+        return self._workflows
+
+    def _workflow_call(self, action) -> ToolResult:
+        """Every workflow tool answers with SAM's own error vocabulary."""
+        from ..workflows import WorkflowError
+
+        try:
+            return ToolResult(True, action())
+        except WorkflowError as exc:
+            return ToolResult(False, None, str(exc), )
+
+    def _workflow_search(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        return self._workflow_call(lambda: self.workflows.search(
+            str(arguments.get("query", "")),
+            category=str(arguments.get("category", "")), service=str(arguments.get("service", "")),
+            trigger=str(arguments.get("trigger", "")), limit=int(arguments.get("limit") or 5),
+        ))
+
+    def _workflow_inspect(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        return self._workflow_call(
+            lambda: self.workflows.inspect_workflow(str(arguments.get("workflow_id", ""))))
+
+    def _workflow_prepare(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        mapping = arguments.get("credential_mapping")
+        return self._workflow_call(lambda: self.workflows.prepare_workflow(
+            str(arguments.get("workflow_id", "")), name=str(arguments.get("name", "")),
+            credential_mapping=mapping if isinstance(mapping, dict) else None,
+        ))
+
+    def _workflow_import(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        # The approval was granted for one artifact hash; the hash is what is
+        # presented here, and the bytes it names never passed through a model.
+        if not approved:
+            return ToolResult(False, None, "Importing a workflow into n8n requires approval.")
+        return self._workflow_call(
+            lambda: self.workflows.import_workflow(str(arguments.get("workflow_sha256", ""))))
+
+    def _workflow_activate(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        if not approved:
+            return ToolResult(False, None, "Changing a workflow's active state requires approval.")
+        return self._workflow_call(lambda: self.workflows.set_active(
+            str(arguments.get("workflow_id", "")), bool(arguments.get("active"))))
+
+    def _workflow_run_status(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        return self._workflow_call(lambda: self.workflows.run_status(
+            str(arguments.get("workflow_id", "")), int(arguments.get("limit") or 5)))
 
     def _browser_automate(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
         try:

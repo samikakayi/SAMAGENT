@@ -21,6 +21,7 @@ from .api import (
     register_system_routes,
     register_trading_routes,
     register_voice_routes,
+    register_workflow_routes,
 )
 from .autonomy import AutonomousOrchestrator
 from .cancellation import CancellationManager
@@ -41,6 +42,7 @@ from .trading.replay import BarReplayResearch
 from .trading.service import TradingService
 from .verification import VerificationEngine
 from .voice import VoiceService
+from .workflows import WorkflowIntelligence
 from .windows_control import WindowsController
 
 
@@ -86,6 +88,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
             ("litellm_api_key", "litellm_api_key"),
             ("groq_api_key", "groq_api_key"),
             ("gemini_api_key", "gemini_api_key"),
+            ("n8n_api_key", "n8n_api_key"),
         ):
             value, _ = resolve_credential(name, secret_store)
             setattr(settings, attribute, value)
@@ -110,6 +113,8 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     # them from the store on use rather than at construction.
     voice = VoiceService(settings, secret_store)
     replay = BarReplayResearch(trading.market_data, trading.tradingview)
+    # Workflow Intelligence: SAM reasons and gates, n8n executes.
+    workflow_intelligence = WorkflowIntelligence(settings)
 
     def rebuild_adapters() -> None:
         """Pick up a new credential without restarting the process."""
@@ -168,6 +173,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     application.state.agent = agent
     application.state.router = router
     application.state.trading = trading
+    application.state.workflows = workflow_intelligence
     application.state.windows = windows
     application.state.cancellation = cancellation
     application.state.voice = voice
@@ -199,12 +205,14 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         task_store=task_store, orchestrator=orchestrator, agent_api=agent_api,
         voice=voice, replay=replay,
         apply_stored_credentials=apply_stored_credentials,
+        workflows=workflow_intelligence,
         rebuild_adapters=rebuild_adapters,
     )
     register_system_routes(application, services)
     register_conversation_routes(application, services)
     register_oversight_routes(application, services)
     register_settings_routes(application, services)
+    register_workflow_routes(application, services)
     register_provider_routes(application, services)
     register_trading_routes(application, services)
     register_voice_routes(application, services)

@@ -77,6 +77,8 @@ KEY_PATTERNS: dict[str, re.Pattern[str]] = {
     # ones. Shapes only -- enough to catch a paste error before a network call.
     "groq_api_key": re.compile(r"^gsk_[A-Za-z0-9._\-]{20,200}$"),
     "gemini_api_key": re.compile(r"^AIza[A-Za-z0-9._\-]{20,200}$"),
+    # n8n issues long JWT-shaped personal API keys.
+    "n8n_api_key": re.compile(r"^[A-Za-z0-9._\-]{20,600}$"),
     # KurdishTTS issues separate hex keys for speech-to-text and text-to-speech.
     "kurdishtts_stt_api_key": re.compile(r"^[A-Za-z0-9._\-]{16,200}$"),
     "kurdishtts_tts_api_key": re.compile(r"^[A-Za-z0-9._\-]{16,200}$"),
