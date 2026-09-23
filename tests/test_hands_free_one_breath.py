@@ -99,12 +99,15 @@ class OneBreathVoice(FakeVoice):
 
 
 def run(stream_frames, *, voice=None, detector=None, language="ckb-IQ", continuation=0.0,
-        replies=None):
+        replies=None, stream=None, onset_seconds=1.0):
     voice = voice or OneBreathVoice()
-    session = controller(stream=ScriptedStream(stream_frames), voice=voice,
+    session = controller(stream=stream or ScriptedStream(stream_frames), voice=voice,
                          detector=detector or LocatingDetector(), continuation=continuation,
                          replies=replies or ["Gold is trading quietly."])
     session.settings.voice_language = language
+    # Shorter than production so a wake-only test does not sit out five
+    # seconds; the tests about waiting set it back.
+    session.wake.onset_seconds = onset_seconds
     states: list[str] = []
     session.subscribe(lambda status: states.append(status.state.value))
     session.start()
@@ -119,6 +122,16 @@ def finish(session, voice, *, spoken: int = 1, seconds: float = 6.0):
         assert wait_for(lambda: not session._busy.is_set(), seconds)
     finally:
         session.stop()
+
+
+def kept_of(audio) -> int:
+    """How many command samples reached the recogniser."""
+    return int(numpy.isclose(audio, COMMAND_LEVEL).sum())
+
+
+def full(frames) -> int:
+    """How many samples a run of frames holds -- all of it must arrive."""
+    return sum(len(frame) for frame in frames)
 
 
 def levels(audio) -> set[float]:
@@ -218,6 +231,12 @@ def test_captured_audio_is_transcribed_by_the_configured_language(monkeypatch):
     ([(" Okay,", 0.1, 0.5), (" hey,", 0.6, 0.8), (" Sam", 0.9, 1.1), (" status.", 1.2, 1.6)], 1.1),
     # at the very end: nothing follows it
     ([(" So", 0.1, 0.3), (" hey", 0.4, 0.6), (" Sam.", 0.7, 0.9)], 0.9),
+    # a following word glued on without a space must not be eaten by the cut
+    ([(" Hey", 0.1, 0.5), (" Sam", 0.6, 0.9), (",what", 0.9, 1.2)], 0.9),
+    ([("Hey", 0.1, 0.5), ("Sam", 0.6, 0.9)], 0.9),
+    # broken times only ever move the cut later, never before earlier words
+    ([(" okay", 0.1, 1.4), (" hey", 0.5, 0.8), (" Sam", 0.9, 1.1), (" gold", 1.4, 1.6)], 1.4),
+    ([(" okay", 0.0, 0.0), (" hey", 0.0, 0.0), (" Sam", 0.0, 0.0)], 0.0),
     # not the phrase at all
     ([(" open", 0.1, 0.3), (" gold", 0.3, 0.6), (" hey", 0.7, 0.8), (" same", 0.8, 1.0)], None),
     ([(" they", 0.1, 0.3), (" sampled", 0.3, 0.8)], None),
@@ -448,5 +467,204 @@ def test_hands_free_asks_for_the_room_threshold_and_a_syllable():
 
     session._capture()
 
-    assert captured[0]["threshold"] == session.wake.threshold
+    assert captured[0]["threshold"] == session.wake.command_threshold
     assert captured[0]["min_speech_frames"] >= 5
+
+
+# --- what an independent review found -----------------------------------------
+
+
+class TimedStream:
+    """A microphone with a past and a present.
+
+    `queued` arrives at once, as frames buffered during an examination do;
+    `live` arrives at a pace, as the room does; after that it is quiet. With
+    `report_queue`, it can say how much is still waiting, as MicrophoneStream
+    does.
+    """
+
+    def __init__(self, queued, live=(), *, pace: float = 0.005, report_queue: bool = False,
+                 queued_pace: float = 0.0):
+        self._queued = [frame for group in queued for frame in group]
+        self._live = [frame for group in live for frame in group]
+        self._pace = pace
+        self._queued_pace = queued_pace
+        self._left = len(self._queued)
+        if report_queue:
+            self.pending = lambda: self._left
+        self.opened = 0
+
+    def __enter__(self):
+        self.opened += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def frames(self, timeout: float = 0.4):
+        while self._queued:
+            frame = self._queued.pop(0)
+            self._left = len(self._queued)
+            if self._queued_pace:
+                time.sleep(self._queued_pace)
+            yield frame
+        while self._live:
+            time.sleep(self._pace)
+            yield self._live.pop(0)
+        while True:
+            time.sleep(self._pace)
+            yield numpy.zeros(len(quiet(0.03)[0]), dtype="float32")
+
+
+def test_a_command_started_after_the_cue_keeps_its_first_syllable():
+    """The review's HIGH finding.
+
+    After catching up with the room, the listener used to wait one second for
+    the command and then hand over to a second capture -- right when people
+    answer a "Listening..." cue, so "what is gold doing" arrived as "...is gold
+    doing". It now waits on the same stream, and never counts while voice is
+    arriving.
+    """
+    stream = TimedStream(queued=[quiet(0.3), phrase(), quiet(0.7)],
+                         live=[quiet(1.2), command(0.8), quiet(1.2)], pace=0.005)
+    session, voice, _ = run([], stream=stream, onset_seconds=5.0,
+                            voice=OneBreathVoice(transcripts=["what is gold doing"]))
+    finish(session, voice, seconds=10.0)
+
+    assert voice.listen_calls == 0, "the command was handed to a second capture and clipped"
+    heard = voice.transcribed[0]["audio"]
+    assert kept_of(heard) == full(command(0.8)), "the start of the command was lost"
+
+
+def test_clicks_after_the_phrase_do_not_add_up_to_a_command():
+    """Review finding M2: five scattered loud frames were enough to finish.
+
+    Three clicks, a gap, two more clicks used to be sent as a command, and the
+    real command after them was never read. Each run of sound now has to be a
+    syllable on its own.
+    """
+    click_level = 0.15
+    session, voice, _ = run([quiet(0.3), phrase(), quiet(0.2),
+                             frames_of(click_level, 0.09), quiet(0.9),
+                             frames_of(click_level, 0.06), quiet(0.9),
+                             command(0.8), quiet(1.5)],
+                            voice=OneBreathVoice(transcripts=["open gold"]))
+    finish(session, voice)
+
+    heard = voice.transcribed[0]["audio"]
+    assert click_level not in levels(heard), "the clicks were sent as part of the command"
+    assert kept_of(heard) == full(command(0.8))
+
+
+def test_a_command_already_queued_is_not_lost_to_a_slow_read():
+    """Review finding M3: slow reads could look like having caught up.
+
+    Two queued frames arriving a few milliseconds late started the wait for a
+    command against audio that was still in the queue, and a command recorded
+    during the examination was thrown away. The microphone now says how much
+    it is holding.
+    """
+    stream = TimedStream(queued=[quiet(0.3), phrase(), quiet(0.7), quiet(1.5), command(0.8), quiet(1.2)],
+                         report_queue=True, queued_pace=0.006)
+    session, voice, _ = run([], stream=stream, onset_seconds=0.2,
+                            voice=OneBreathVoice(transcripts=["open gold"]))
+    finish(session, voice, seconds=10.0)
+
+    assert voice.listen_calls == 0
+    assert kept_of(voice.transcribed[0]["audio"]) == full(command(0.8))
+
+
+def test_switching_off_mid_command_acts_on_nothing():
+    """Review finding M4: half a command is not a smaller request.
+
+    Stopping part-way used to transcribe and submit what had been heard so far
+    -- "close all positions" without "except gold". Now nothing is sent, and
+    the panel says hands-free is off.
+    """
+    stream = TimedStream(queued=[quiet(0.3), phrase()], live=[command(6.0), quiet(1.5)], pace=0.01)
+    session, voice, states = run([], stream=stream)
+    try:
+        assert wait_for(lambda: "LISTENING" in states, 5.0)
+        time.sleep(0.4)
+    finally:
+        session.stop()
+    assert wait_for(lambda: not session._busy.is_set(), 5.0)
+
+    assert voice.transcribed == [], "a cut-off command was sent to be transcribed"
+    assert voice.spoken == [] and session.transcripts == []
+    assert session.status.state.value == "OFF"
+
+
+def test_a_silent_microphone_does_not_hold_the_session_hostage():
+    """Review finding L1: a stalled device kept the loop waiting ~38 seconds.
+
+    With no frames arriving at all, the capture could not notice time passing.
+    It now does, and SAM asks for the command the ordinary way.
+    """
+
+    class Stalled:
+        def __init__(self, script):
+            self._script = [frame for group in script for frame in group]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def frames(self, timeout: float = 0.4):
+            while self._script:
+                yield self._script.pop(0)
+            time.sleep(0.05)  # the queue stays empty: frames() gives up, as the real one does
+
+    started = time.monotonic()
+    session, voice, _ = run([], stream=Stalled([quiet(0.3), phrase(), quiet(0.7)]), onset_seconds=0.5,
+                            voice=OneBreathVoice(["open gold"]))
+    finish(session, voice, seconds=8.0)
+
+    assert voice.listen_calls == 1
+    assert time.monotonic() - started < 6.0
+
+
+class FakeTimedModel:
+    """A speech model that answers with the timed words it is given."""
+
+    def __init__(self, words):
+        self._words = words
+
+    def transcribe(self, audio, **kwargs):
+        from types import SimpleNamespace
+
+        assert kwargs.get("word_timestamps") is True
+        pieces = [SimpleNamespace(word=w, start=s, end=e) for w, s, e in self._words]
+        return [SimpleNamespace(words=pieces)], None
+
+
+class FakeShared:
+    def __init__(self, words):
+        self._model = FakeTimedModel(words)
+
+    def available(self):
+        return True
+
+    def load(self):
+        return self._model
+
+
+@pytest.mark.parametrize("words, expected", [
+    # words follow the phrase: cut right after it
+    ([(" Hey,", 0.1, 0.5), (" Sam", 0.6, 0.9), (" open", 1.0, 1.2), (" gold", 1.2, 1.5)], 0.9),
+    # nothing recognisable follows: the tail of "SAM" and the room are not a
+    # command, so nothing in this window is carried forward (review M2)
+    ([(" Hey,", 0.1, 0.5), (" Sam.", 0.6, 0.9)], 3.0),
+    # times collapsed to zero: cutting at 0 would send what came before the
+    # phrase to the cloud, so nothing is carried forward (review M1)
+    ([(" okay", 0.0, 0.0), (" hey", 0.0, 0.0), (" Sam", 0.0, 0.0), (" gold", 0.0, 0.0)], 3.0),
+    # not the phrase
+    ([(" hey", 0.1, 0.5), (" same", 0.6, 0.9), (" here", 1.0, 1.2)], None),
+])
+def test_the_real_detector_only_carries_forward_what_it_heard(words, expected):
+    from sam_backend.wake import LocalPhraseDetector
+
+    detector = LocalPhraseDetector(shared=FakeShared(words))
+    assert detector.locate(numpy.zeros(48_000, dtype="float32"), "Hey SAM") == expected

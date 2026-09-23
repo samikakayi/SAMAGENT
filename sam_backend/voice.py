@@ -504,6 +504,10 @@ class MicrophoneStream:
             self._stream.close()
             self._stream = None
 
+    def pending(self) -> int:
+        """Frames captured but not yet read: zero means the reader has caught up."""
+        return self._queue.qsize()
+
     def frames(self, timeout: float = 0.5) -> Iterator[Any]:
         while True:
             try:

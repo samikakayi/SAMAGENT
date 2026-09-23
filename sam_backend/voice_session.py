@@ -166,14 +166,21 @@ class VoiceConversationController:
                 if not outcome.get("captured"):
                     break
                 deadline = time.monotonic() + self.continuation_seconds
-            self._set(VoiceState.WAKE_LISTENING, f"Waiting for {self.wake.phrase}…",
-                      continuation_active=False)
+            if self.wake.stopped:
+                # Switched off while this session was running: say so, rather
+                # than claiming to wait for a phrase nobody is listening for.
+                self._set(VoiceState.OFF, "Hands-free voice is switched off.", continuation_active=False)
+            else:
+                self._set(VoiceState.WAKE_LISTENING, f"Waiting for {self.wake.phrase}…",
+                          continuation_active=False)
             return self.describe()
         finally:
             self._busy.clear()
 
     def _turn(self, *, follow_up: bool = False, detection: WakeDetection | None = None) -> dict[str, Any]:
         heard = self._after_phrase(detection) if detection is not None else None
+        if heard is not None and heard.get("abandoned"):
+            return {"captured": False, "spoke": False}
         if heard is None:
             if not follow_up and detection is None:
                 self._set(VoiceState.LISTENING, "Listening…")
@@ -216,7 +223,15 @@ class VoiceConversationController:
         gets a second chance rather than a session that silently vanishes.
         """
         self._set(VoiceState.LISTENING, "Listening…")
-        if not detection.wait(POST_WAKE_WAIT_SECONDS) or not detection.speech:
+        if not detection.wait(POST_WAKE_WAIT_SECONDS):
+            return None
+        if detection.interrupted or self.wake.stopped:
+            # Switched off, or silenced, part-way through the command. Half a
+            # sentence is not a smaller request, it can be a different one, so
+            # nothing is transcribed and nothing is asked.
+            detection.release()
+            return {"captured": False, "abandoned": True}
+        if not detection.speech:
             return None
         audio = detection.audio
         # Transcribed once, then gone: the loop keeps text, never audio.
@@ -254,7 +269,7 @@ class VoiceConversationController:
                 # The same bar the wake listener uses for this room, and a
                 # syllable of voice, so a click after an answer is not sent to
                 # be transcribed into a question nobody asked.
-                threshold=self.wake.threshold,
+                threshold=self.wake.command_threshold,
                 min_speech_frames=POST_WAKE_MIN_SPEECH_FRAMES,
             )
         except Exception as exc:  # noqa: BLE001 - a lost device is a state

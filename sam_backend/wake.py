@@ -87,13 +87,20 @@ EARLY_EXAMINE_FRAMES = int(4.0 * 1000 / FRAME_MS)
 # After the phrase, on the same stream: what counts as a command, and how long
 # to keep listening for one. "Gold" and "stop" are commands, so the bar is a
 # syllable, not a sentence.
-POST_WAKE_MIN_SPEECH_FRAMES = 5                          # ~150 ms of voice
-POST_WAKE_GRACE_FRAMES = int(1.0 * 1000 / FRAME_MS)      # once caught up with the room
-POST_WAKE_ONSET_CAP_FRAMES = int(8.0 * 1000 / FRAME_MS)  # never wait longer than this
-POST_WAKE_MAX_FRAMES = int(20.0 * 1000 / FRAME_MS)       # the same bound as any command
-# A frame that takes this long to arrive was not queued: the listener has
-# caught up with real time. Queued frames arrive in microseconds.
+POST_WAKE_MIN_SPEECH_FRAMES = 5                           # ~150 ms of voice in one run
+# Once the listener has caught up with the room, how long it waits for a
+# command to begin on the same stream. Never counted while somebody is
+# talking. Long enough that nobody replying to "Listening..." is cut off by a
+# hand-off to a second capture; after it, SAM asks the ordinary way.
+POST_WAKE_ONSET_SECONDS = 5.0
+POST_WAKE_ONSET_CAP_FRAMES = int(10.0 * 1000 / FRAME_MS)  # never wait longer than this
+POST_WAKE_MAX_FRAMES = int(20.0 * 1000 / FRAME_MS)        # the same bound as any command
+# When the microphone cannot say how much is queued, a frame that takes this
+# long to arrive was not queued. Queued frames arrive in microseconds.
 REALTIME_GAP_SECONDS = 0.004
+# The quietest a command may be, before the room's own noise raises the bar.
+# The same floor push-to-talk has always used.
+COMMAND_GATE = 0.006
 
 
 class VoiceState(StrEnum):
@@ -147,64 +154,83 @@ def normalise(text: str) -> str:
     # the match failed on the full stops alone. Those are one word to a
     # listener, so join them before the rest of the punctuation goes.
     lowered = re.sub(r"\b(?:[a-z]\.){2,}", lambda m: m.group(0).replace(".", ""), lowered)
-    # The same name split by a hyphen: "SA-M" came back from a real room. Only
-    # a trailing single letter is rejoined, so "hey-sam" stays two words.
-    lowered = re.sub(r"(?<=[a-z])-(?=[a-z](?![a-z]))", "", lowered)
     return re.sub(r"[^a-z0-9؀-ۿ]+", " ", lowered).strip()
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str] | None:
+    """The wake phrase as a pattern over raw recogniser text.
+
+    Every word of the phrase must appear whole. Inside a word, letters may be
+    separated by the stops or hyphens a recogniser writes into an initialism --
+    "S.A.M.", "S-A-M" and "SA-M" all came back from real rooms -- and between
+    words anything that is not a letter may appear. Whole words is the point:
+    a plain substring test woke on "hey same here" and "they sampled".
+
+    One pattern serves both questions -- was it said, and where does it end --
+    so the two answers cannot disagree.
+    """
+    words = normalise(phrase).split()
+    if not words:
+        return None
+
+    def word(letters: str) -> str:
+        return r"[.\-]?".join(re.escape(letter) for letter in letters)
+
+    return re.compile(r"(?<!\w)" + r"\W*".join(word(w) for w in words) + r"(?!\w)")
 
 
 def phrase_heard(text: str, phrase: str) -> bool:
     """Whether a transcript contains the wake phrase, allowing for mishearing.
 
     A small model writes "hey Sam", "hey, Sam!", "Hey sam." and sometimes
-    "hey some". The first three must all count, so the comparison happens on
-    normalised words rather than the raw string. The last must not: a wake word
+    "hey some". The first three must all count; the last must not: a wake word
     that fires on a near-rhyme is worse than one that occasionally misses.
+    Sorani speakers say the name with the English greeting, which matches the
+    same way.
     """
-    spoken = normalise(text)
-    wanted = normalise(phrase)
-    if not spoken or not wanted:
-        return False
-    # Whole words only. A plain substring test woke on "hey same here" and
-    # "they sampled", because both contain the letters "hey sam".
-    # "Hey SAM" also arrives as "hey sam" split across segments, and Sorani
-    # speakers say the name with the English greeting; both reduce to the same
-    # word sequence once punctuation is gone.
-    words = wanted.split()
-    if len(words) > 1:
-        return re.search(r"\b" + r"\W*".join(re.escape(word) for word in words) + r"\b", spoken) is not None
-    return re.search(r"\b" + re.escape(wanted) + r"\b", spoken) is not None
+    pattern = _phrase_pattern(phrase)
+    return bool(pattern and text and pattern.search(str(text).lower()))
+
+
+def _phrase_span(words: list[tuple[str, float, float]], phrase: str) -> tuple[float, bool] | None:
+    """(where the phrase ends, whether any words follow it), or None if absent.
+
+    The cut is the latest end among the phrase and every word before it, never
+    just the phrase's own last timestamp: if the recogniser ever returns
+    collapsed or out-of-order times, the cut moves later, never earlier, so
+    nothing said before the phrase can slip into the command.
+    """
+    pattern = _phrase_pattern(phrase)
+    if pattern is None or not words:
+        return None
+    text = ""
+    owner: list[int] = []
+    for index, (piece, _start, _end) in enumerate(words):
+        lowered = str(piece or "").lower()
+        text += lowered
+        owner.extend([index] * len(lowered))
+    match = pattern.search(text)
+    if match is None:
+        return None
+    last = owner[match.end() - 1]
+    cut = max(float(end) for _piece, _start, end in words[:last + 1])
+    followed = any(re.search(r"\w", str(piece or "")) for piece, _start, _end in words[last + 1:])
+    return cut, followed
 
 
 def phrase_end(words: list[tuple[str, float, float]], phrase: str) -> float | None:
     """Where the wake phrase ends, in seconds, from a recogniser's timed words.
 
-    `words` are (text, start, end) pieces as faster-whisper returns them. A
-    piece that does not begin with a space continues the word before it -- a
-    real room returned "S.A.M." as " S", ".A", ".M" -- so pieces are joined
-    into words before matching. Words are compared exactly as `phrase_heard`
-    compares them, so the two cannot disagree about whether it was said.
+    `words` are (text, start, end) pieces as faster-whisper returns them;
+    a word may arrive in several pieces (" S", ".A", ".M"). None when the
+    phrase is not there.
 
     Measured on real microphone audio, the end of the phrase is a clean cut:
     "Okay hey SAM tell me the current status" cut there left exactly "tell me
     the current status." for the command.
     """
-    wanted = normalise(phrase).split()
-    if not wanted:
-        return None
-    joined: list[list[Any]] = []
-    for text, _start, end in words:
-        text = str(text or "")
-        if joined and text and not text[0].isspace():
-            joined[-1][0] += text
-            joined[-1][1] = end
-        else:
-            joined.append([text, end])
-    tokens = [(token, end) for text, end in joined for token in normalise(text).split()]
-    for index in range(len(tokens) - len(wanted) + 1):
-        if [token for token, _ in tokens[index:index + len(wanted)]] == wanted:
-            return float(tokens[index + len(wanted) - 1][1])
-    return None
+    span = _phrase_span(words, phrase)
+    return None if span is None else span[0]
 
 
 class WakeDetection:
@@ -220,11 +246,16 @@ class WakeDetection:
         self.phrase_end = phrase_end
         self.audio: Any = None
         self.speech = False
+        # Stopped or silenced part-way: whatever was heard is incomplete, and
+        # half a command -- "close all positions" without "except gold" -- must
+        # not be acted on.
+        self.interrupted = False
         self._done = threading.Event()
 
-    def finish(self, audio: Any = None, *, speech: bool = False) -> None:
-        self.audio = audio if speech else None
-        self.speech = bool(speech)
+    def finish(self, audio: Any = None, *, speech: bool = False, interrupted: bool = False) -> None:
+        self.interrupted = bool(interrupted)
+        self.speech = bool(speech) and not self.interrupted
+        self.audio = audio if self.speech else None
         self._done.set()
 
     def wait(self, timeout: float) -> bool:
@@ -375,7 +406,19 @@ class LocalPhraseDetector(WakeDetector):
         to the recogniser the user configured.
         """
         words = self._timed_words(audio)
-        return phrase_end(words, phrase) if words else None
+        span = _phrase_span(words, phrase) if words else None
+        if span is None:
+            return None
+        cut, followed = span
+        window_end = len(audio) / SAMPLE_RATE
+        if cut <= 0 or not followed:
+            # Nothing recognised after the phrase -- only the tail of "SAM", a
+            # breath, the room -- or times too broken to cut by. Either way
+            # nothing in this window is carried forward: the command is
+            # whatever is said next, and nothing from before the phrase can
+            # ride along on a bad timestamp.
+            return window_end
+        return min(cut, window_end)
 
     def _timed_words(self, audio: Any) -> list[tuple[str, float, float]]:
         try:
@@ -428,6 +471,9 @@ class WakeWordService:
         self._noise_floor = 0.0
         self._on_wake: Callable[[], None] | None = None
         self._pending: WakeDetection | None = None
+        # How many frames the microphone is holding, when it can say.
+        self._queued: Callable[[], int] | None = None
+        self.onset_seconds = POST_WAKE_ONSET_SECONDS
         self.error = ""
 
     # -- configuration ------------------------------------------------------
@@ -472,8 +518,18 @@ class WakeWordService:
             self._noise_floor = NOISE_FALL * self._noise_floor + (1 - NOISE_FALL) * energy
 
     @property
+    def command_threshold(self) -> float:
+        """The bar for a command: push-to-talk's floor, raised by a noisy room."""
+        return max(COMMAND_GATE, self._noise_floor * NOISE_MARGIN)
+
+    @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def stopped(self) -> bool:
+        """Switched off, as opposed to merely never started."""
+        return self._stop.is_set()
 
     # -- lifecycle ----------------------------------------------------------
     def start(self, on_wake: Callable[[], None]) -> bool:
@@ -555,9 +611,14 @@ class WakeWordService:
         in the room, not a lost device -- so it is simply asked again. The wake
         loop and the capture after the phrase pull from this same iterator,
         which is what keeps a one-breath command on the stream that heard it.
+
+        Between those runs it yields None: a stalled or unplugged microphone
+        must still let its readers notice being stopped or silenced, rather
+        than blocking inside `next()` until frames return.
         """
         while not self._stop.is_set():
             yield from microphone.frames(timeout=0.4)
+            yield None
 
     def _listen(self) -> None:
         from .voice import rms_energy
@@ -569,10 +630,13 @@ class WakeWordService:
         self._noise_floor = 0.0
         try:
             with self._open_stream() as microphone:
+                self._queued = getattr(microphone, "pending", None)
                 frames = self._frames(microphone)
                 for frame in frames:
                     if self._stop.is_set():
                         return
+                    if frame is None:
+                        continue
                     if self._suppressed.is_set():
                         # Deliberately drop the frame rather than buffer it:
                         # what SAM is saying must not survive to be examined.
@@ -647,7 +711,11 @@ class WakeWordService:
             return True
         # Everything after the phrase, and nothing before it.
         cut = min(len(window), max(0, int(round(end * SAMPLE_RATE))))
-        self._follow_phrase(window[cut:], frames, detection)
+        # A copy, and the window let go: what came before the phrase is not
+        # kept alive for the length of the command.
+        remainder = window[cut:].copy()
+        window = None
+        self._follow_phrase(remainder, frames, detection)
         self._last_detection = time.monotonic()
         self._buffer.clear()
         return True
@@ -692,67 +760,107 @@ class WakeWordService:
         `remainder` is the part of the examined utterance after the phrase;
         the frames queued while it was being examined come next; then the room
         in real time. A command already spoken is kept whole, one still being
-        spoken is followed to its end, and one that starts a moment after the
-        phrase is caught too. If nothing is said, nothing is kept, and the
-        conversation loop asks for the command the ordinary way.
+        spoken is followed to its end, and one that starts after a pause is
+        caught too -- all without a second capture, so nothing falls into a
+        gap between two streams.
+
+        Speech is judged a run at a time, the way push-to-talk judges it: a
+        run is voice up to a silence long enough to end a sentence, and one
+        with less than a syllable in it -- a click, a breath, the tail of
+        "SAM" -- is dropped rather than added to the next. Waiting for a
+        command to begin is measured in real time once the listener has caught
+        up with the room, and never while somebody is talking. If nothing
+        comes, nothing is kept, and the loop asks the ordinary way.
         """
         import numpy
 
         from .voice import rms_energy
 
-        collected: list[Any] = []
-        voiced_total = 0
+        preroll: deque = deque(maxlen=PRE_ROLL_FRAMES)
+        command: list[Any] = []
+        run_voiced = 0
         silence = 0
-        first_voice: int | None = None
+        waited = 0
         slow_reads = 0
-        caught_up = False
-        grace = POST_WAKE_GRACE_FRAMES
+        onset_deadline: float | None = None
         enough_silence = self._command_silence_frames()
+        deadline = time.monotonic() + (POST_WAKE_ONSET_CAP_FRAMES + POST_WAKE_MAX_FRAMES) * FRAME_MS / 1000
+        queued = self._queued
 
-        def take(frame: Any) -> bool:
-            nonlocal voiced_total, silence, first_voice, grace
-            collected.append(frame)
+        def take(frame: Any) -> bool | None:
+            """True: a command is complete. False: none is coming. None: go on."""
+            nonlocal run_voiced, silence, waited
             energy = rms_energy(frame)
             voiced = energy >= self.threshold
             self._track_noise(energy, voiced)
+            if command:
+                command.append(frame)
+                if voiced:
+                    run_voiced += 1
+                    silence = 0
+                else:
+                    silence += 1
+                if silence >= enough_silence:
+                    if run_voiced >= POST_WAKE_MIN_SPEECH_FRAMES:
+                        return True
+                    # A click, a breath, the tail of the phrase: not a command.
+                    preroll.clear()
+                    preroll.extend(command[-PRE_ROLL_FRAMES:])
+                    command.clear()
+                    run_voiced = silence = 0
+                    return None
+                if len(command) >= POST_WAKE_MAX_FRAMES:
+                    return run_voiced >= POST_WAKE_MIN_SPEECH_FRAMES
+                return None
             if voiced:
-                voiced_total += 1
-                silence = 0
-                if first_voice is None:
-                    first_voice = len(collected) - 1
-            else:
-                silence += 1
-            if voiced_total >= POST_WAKE_MIN_SPEECH_FRAMES:
-                return silence >= enough_silence or len(collected) >= POST_WAKE_MAX_FRAMES
-            if len(collected) >= POST_WAKE_ONSET_CAP_FRAMES:
-                return True
-            if caught_up:
-                grace -= 1
-                return grace <= 0
-            return False
+                command.extend(preroll)
+                command.append(frame)
+                run_voiced, silence = 1, 0
+                return None
+            preroll.append(frame)
+            waited += 1
+            if waited >= POST_WAKE_ONSET_CAP_FRAMES:
+                return False
+            if onset_deadline is not None and time.monotonic() >= onset_deadline:
+                return False
+            return None
 
+        outcome: bool | None = None
+        interrupted = False
         try:
-            finished = False
             for offset in range(0, len(remainder), FRAME_SAMPLES):
-                if take(remainder[offset:offset + FRAME_SAMPLES]):
-                    finished = True
+                outcome = take(remainder[offset:offset + FRAME_SAMPLES])
+                if outcome is not None:
                     break
-            while not finished and not self._stop.is_set() and not self._suppressed.is_set():
+            remainder = None
+            while outcome is None:
+                if self._stop.is_set() or self._suppressed.is_set():
+                    interrupted = True
+                    break
+                if time.monotonic() > deadline:
+                    break
                 started = time.perf_counter()
                 frame = next(frames, None)
+                caught_up = frame is None
+                if frame is not None:
+                    if callable(queued):
+                        caught_up = queued() == 0
+                    else:
+                        slow_reads = slow_reads + 1 if time.perf_counter() - started >= REALTIME_GAP_SECONDS else 0
+                        caught_up = slow_reads >= 2
+                if caught_up and onset_deadline is None:
+                    onset_deadline = time.monotonic() + self.onset_seconds
                 if frame is None:
-                    break
-                slow_reads = slow_reads + 1 if time.perf_counter() - started >= REALTIME_GAP_SECONDS else 0
-                caught_up = caught_up or slow_reads >= 2
-                finished = take(frame)
+                    if not command and onset_deadline is not None and time.monotonic() >= onset_deadline:
+                        outcome = False
+                    continue
+                outcome = take(frame)
         finally:
-            speech = voiced_total >= POST_WAKE_MIN_SPEECH_FRAMES and first_voice is not None
-            audio = None
-            if speech:
-                start = max(0, first_voice - PRE_ROLL_FRAMES)
-                audio = numpy.concatenate(collected[start:]).astype("float32")
-            collected.clear()
-            detection.finish(audio, speech=speech)
+            speech = outcome is True and not interrupted
+            audio = numpy.concatenate(command).astype("float32") if speech and command else None
+            command.clear()
+            preroll.clear()
+            detection.finish(audio, speech=speech and audio is not None, interrupted=interrupted)
 
     def describe(self) -> dict[str, Any]:
         return {
