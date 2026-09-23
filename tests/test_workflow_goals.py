@@ -654,3 +654,14 @@ def test_a_plan_stays_small_however_big_the_library_is(tmp_path):
 
     assert len(plan.candidates) <= 5, "only a shortlist is ever returned"
     assert len(payload) < 60_000, f"a plan over 200 workflows serialised to {len(payload)} bytes"
+
+
+def test_a_secret_pasted_into_the_goal_is_refused_not_carried_into_n8n(tmp_path):
+    """Refused rather than redacted: a key in a goal is a mistake to fix at the source."""
+    goal = "start manually and set token=sk-GOALPASTESENTINELabcdefghij0123456789"
+
+    plan = plan_goal(goal, intelligence(tmp_path, Library({}), FakeN8n()))
+
+    assert plan.artifact.validation.ok is False
+    assert any("secret-shaped" in error for error in plan.artifact.validation.errors)
+    assert plan.next_action == "fix_validation", "it never reaches an approval"
