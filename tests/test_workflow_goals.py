@@ -636,3 +636,21 @@ def test_a_tie_is_described_as_a_tie_not_as_winning(tmp_path):
     assert plan.candidates[0].score == plan.candidates[1].score
     assert "level with" in plan.selection_reason
     assert "ahead of" not in plan.selection_reason
+
+
+def test_a_plan_stays_small_however_big_the_library_is(tmp_path):
+    """The whole point of shortlisting is that this number does not grow."""
+    import json
+
+    big = workflow(GMAIL_TRIGGER, *[
+        node(f"Step {index}", "n8n-nodes-base.set") for index in range(30)])
+    entries = {
+        f"wf{index}": (summary(f"wf{index}", f"Gmail invoices to Drive {index}", ("gmail", "drive")), big)
+        for index in range(200)
+    }
+
+    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()))
+    payload = json.dumps(plan.as_dict())
+
+    assert len(plan.candidates) <= 5, "only a shortlist is ever returned"
+    assert len(payload) < 60_000, f"a plan over 200 workflows serialised to {len(payload)} bytes"
