@@ -176,7 +176,9 @@ def _phrase_pattern(phrase: str) -> re.Pattern[str] | None:
     def word(letters: str) -> str:
         return r"[.\-]?".join(re.escape(letter) for letter in letters)
 
-    return re.compile(r"(?<!\w)" + r"\W*".join(word(w) for w in words) + r"(?!\w)")
+    # After the last letter: not another letter, and not a hyphen or a stop
+    # that carries the word on -- "sam-sung" and "s.a.m.e." are other words.
+    return re.compile(r"(?<!\w)" + r"\W*".join(word(w) for w in words) + r"(?![\w\-]|\.\w)")
 
 
 def phrase_heard(text: str, phrase: str) -> bool:
@@ -280,7 +282,7 @@ class WakeDetector:
     def detect(self, audio: Any, phrase: str) -> bool:  # pragma: no cover - protocol
         raise NotImplementedError
 
-    def locate(self, audio: Any, phrase: str) -> float | None:  # pragma: no cover - protocol
+    def locate(self, audio: Any, phrase: str, *, complete: bool = True) -> float | None:  # pragma: no cover
         return len(audio) / SAMPLE_RATE if self.detect(audio, phrase) else None
 
     @property
@@ -396,8 +398,14 @@ class LocalPhraseDetector(WakeDetector):
             self._error = f"{type(exc).__name__}: {exc}"
             return ""
 
-    def locate(self, audio: Any, phrase: str) -> float | None:
+    def locate(self, audio: Any, phrase: str, *, complete: bool = True) -> float | None:
         """Where the phrase ends in `audio`, in seconds, or None if it is not there.
+
+        `complete` says whether the speaker has finished. Mid-utterance -- a
+        long sentence examined early -- words after the phrase may simply not
+        be transcribed yet, so the cut is always right after the phrase:
+        discarding what follows there would act on the tail of a command whose
+        start was thrown away.
 
         One local pass with word timestamps answers both questions at once:
         whether the phrase was said, and where the words after it begin. The
@@ -411,12 +419,17 @@ class LocalPhraseDetector(WakeDetector):
             return None
         cut, followed = span
         window_end = len(audio) / SAMPLE_RATE
-        if cut <= 0 or not followed:
-            # Nothing recognised after the phrase -- only the tail of "SAM", a
-            # breath, the room -- or times too broken to cut by. Either way
-            # nothing in this window is carried forward: the command is
-            # whatever is said next, and nothing from before the phrase can
-            # ride along on a bad timestamp.
+        if cut <= 0:
+            # Times too broken to cut by. When the speaker has finished,
+            # nothing in this window is carried forward and the command is
+            # whatever is said next. Mid-sentence, that would drop the start
+            # of the command and keep its end, so this is not a wake at all:
+            # the utterance is examined again once it ends.
+            return window_end if complete else None
+        if complete and not followed:
+            # They stopped, and nothing recognisable followed the phrase --
+            # only the tail of "SAM", a breath, the room. None of it is a
+            # command; the command is whatever is said next.
             return window_end
         return min(cut, window_end)
 
@@ -657,7 +670,7 @@ class WakeWordService:
                             # while the start of the sentence is still in it.
                             examined_early = True
                             span = min(len(self._buffer), spoken + PRE_ROLL_FRAMES)
-                            if self._consider(span, frames):
+                            if self._consider(span, frames, complete=False):
                                 voiced = silence = spoken = 0
                         continue
                     if voiced < MIN_SPEECH_FRAMES:
@@ -675,13 +688,13 @@ class WakeWordService:
                     # a long sentence.
                     span = min(len(self._buffer), spoken + PRE_ROLL_FRAMES)
                     voiced = silence = spoken = 0
-                    self._consider(span, frames)
+                    self._consider(span, frames, complete=True)
         except Exception as exc:  # noqa: BLE001 - a lost device ends the loop, not SAM
             self.error = f"{type(exc).__name__}: {exc}"
         finally:
             self._buffer.clear()
 
-    def _consider(self, span: int, frames: Iterator[Any]) -> bool:
+    def _consider(self, span: int, frames: Iterator[Any], *, complete: bool) -> bool:
         """Examine one utterance; on the phrase, report it and keep what follows."""
         if time.monotonic() - self._last_detection < WAKE_DEBOUNCE_SECONDS:
             return False
@@ -693,7 +706,7 @@ class WakeWordService:
         window = self._window(span)
         if window is None:
             return False
-        end = self._locate(window)
+        end = self._locate(window, complete=complete)
         if end is None:
             return False
         self._last_detection = time.monotonic()
@@ -733,7 +746,7 @@ class WakeWordService:
         except Exception:  # noqa: BLE001
             return None
 
-    def _locate(self, window: Any) -> float | None:
+    def _locate(self, window: Any, *, complete: bool = True) -> float | None:
         """Seconds into `window` where the phrase ends; None if it was not said.
 
         A detector that can only say yes or no is treated as if the phrase
@@ -742,7 +755,7 @@ class WakeWordService:
         """
         locate = getattr(self.detector, "locate", None)
         if callable(locate):
-            end = locate(window, self.phrase)
+            end = locate(window, self.phrase, complete=complete)
             return None if end is None else float(end)
         return len(window) / SAMPLE_RATE if self.detector.detect(window, self.phrase) else None
 

@@ -157,7 +157,8 @@ class VoiceConversationController:
             self._set(VoiceState.WAKE_DETECTED, "Yes?")
             outcome = self._turn(detection=detection)
             deadline = time.monotonic() + self.continuation_seconds
-            while outcome.get("spoke") and self.continuation_seconds > 0 and time.monotonic() < deadline:
+            while (outcome.get("spoke") and self.continuation_seconds > 0 and time.monotonic() < deadline
+                   and not self.wake.stopped):
                 # A follow-up needs no wake phrase, but it does need speech:
                 # silence simply lets the window close.
                 self._set(VoiceState.LISTENING, "Listening for a follow-up…",
@@ -182,6 +183,9 @@ class VoiceConversationController:
         if heard is not None and heard.get("abandoned"):
             return {"captured": False, "spoke": False}
         if heard is None:
+            if self.wake.stopped:
+                # Switched off: no new capture, not even a follow-up.
+                return {"captured": False, "spoke": False}
             if not follow_up and detection is None:
                 self._set(VoiceState.LISTENING, "Listening…")
             heard = self._capture()

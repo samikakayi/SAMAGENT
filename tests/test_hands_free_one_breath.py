@@ -68,7 +68,7 @@ class LocatingDetector(ScriptedDetector):
         self.heard = heard
         self.windows: list[float] = []
 
-    def locate(self, audio, wake_phrase):
+    def locate(self, audio, wake_phrase, *, complete=True):
         self.examined += 1
         self.windows.append(len(audio) / 16_000)
         if not self.heard:
@@ -294,7 +294,7 @@ def test_a_command_that_cannot_be_transcribed_gets_a_second_chance():
 
 @pytest.mark.parametrize("heard", [
     "hey same here", "hey sammy", "they sampled it", "an essay about gold", "I am here",
-    "hey some", "say ham",
+    "hey some", "say ham", "hey sam-sung", "hey s.a.m.e.",
 ])
 def test_near_misses_do_not_wake_it(heard):
     assert phrase_heard(heard, "Hey SAM") is False
@@ -651,20 +651,70 @@ class FakeShared:
         return self._model
 
 
-@pytest.mark.parametrize("words, expected", [
+@pytest.mark.parametrize("words, complete, expected", [
     # words follow the phrase: cut right after it
-    ([(" Hey,", 0.1, 0.5), (" Sam", 0.6, 0.9), (" open", 1.0, 1.2), (" gold", 1.2, 1.5)], 0.9),
-    # nothing recognisable follows: the tail of "SAM" and the room are not a
-    # command, so nothing in this window is carried forward (review M2)
-    ([(" Hey,", 0.1, 0.5), (" Sam.", 0.6, 0.9)], 3.0),
+    ([(" Hey,", 0.1, 0.5), (" Sam", 0.6, 0.9), (" open", 1.0, 1.2), (" gold", 1.2, 1.5)], True, 0.9),
+    # finished, and nothing recognisable followed: the tail of "SAM" and the
+    # room are not a command, so nothing here is carried forward (review M2)
+    ([(" Hey,", 0.1, 0.5), (" Sam.", 0.6, 0.9)], True, 3.0),
+    # ...but mid-sentence the words after it may just not be transcribed yet:
+    # cut after the phrase, never drop what follows (re-review N1)
+    ([(" Hey,", 0.1, 0.5), (" Sam.", 0.6, 0.9)], False, 0.9),
     # times collapsed to zero: cutting at 0 would send what came before the
-    # phrase to the cloud, so nothing is carried forward (review M1)
-    ([(" okay", 0.0, 0.0), (" hey", 0.0, 0.0), (" Sam", 0.0, 0.0), (" gold", 0.0, 0.0)], 3.0),
+    # phrase to the cloud (review M1). Finished: carry nothing forward.
+    ([(" okay", 0.0, 0.0), (" hey", 0.0, 0.0), (" Sam", 0.0, 0.0), (" gold", 0.0, 0.0)], True, 3.0),
+    # Mid-sentence: not a wake yet; look again when it ends (re-review N1).
+    ([(" okay", 0.0, 0.0), (" hey", 0.0, 0.0), (" Sam", 0.0, 0.0), (" gold", 0.0, 0.0)], False, None),
     # not the phrase
-    ([(" hey", 0.1, 0.5), (" same", 0.6, 0.9), (" here", 1.0, 1.2)], None),
+    ([(" hey", 0.1, 0.5), (" same", 0.6, 0.9), (" here", 1.0, 1.2)], True, None),
 ])
-def test_the_real_detector_only_carries_forward_what_it_heard(words, expected):
+def test_the_real_detector_only_carries_forward_what_it_heard(words, complete, expected):
     from sam_backend.wake import LocalPhraseDetector
 
     detector = LocalPhraseDetector(shared=FakeShared(words))
-    assert detector.locate(numpy.zeros(48_000, dtype="float32"), "Hey SAM") == expected
+    assert detector.locate(numpy.zeros(48_000, dtype="float32"), "Hey SAM", complete=complete) == expected
+
+
+def test_a_long_command_examined_early_keeps_its_start():
+    """Re-review N1: the fix for M2 must not drop the start of a long command.
+
+    A long sentence is examined before it ends. At that moment the English
+    pass may have transcribed nothing after the phrase yet -- a Sorani command,
+    or a word cut off by the edge of the window -- and treating that as "no
+    command followed" threw the first seconds away and submitted the rest.
+    """
+    from sam_backend.wake import LocalPhraseDetector
+
+    # The real detector, hearing only the phrase: nothing after it transcribed.
+    detector = LocalPhraseDetector(shared=FakeShared([(" Hey,", 0.3, 0.6), (" Sam", 0.6, 0.9)]))
+    session, voice, _ = run([quiet(0.3), phrase(), command(5.5), quiet(1.5)], detector=detector,
+                            voice=OneBreathVoice(transcripts=["open gold and analyse the chart"]))
+    finish(session, voice, seconds=10.0)
+
+    heard = voice.transcribed[0]["audio"]
+    assert kept_of(heard) == full(command(5.5)), "the start of a long command was thrown away"
+    assert PHRASE_LEVEL not in levels(heard)
+
+
+def test_switching_off_ends_the_follow_up_window_too():
+    """Re-review N2: stop() used to leave the follow-up window listening.
+
+    After an answer, SAM kept opening the microphone for follow-ups --
+    transcribing, answering and speaking -- after the user had switched
+    hands-free off.
+    """
+    voice = OneBreathVoice(["open gold", "and silver?"])
+    session = controller(voice=voice, continuation=10.0, replies=["Gold is quiet.", "Silver too."])
+    original_speak = voice.speak
+
+    def speak_then_switch_off(text, language=None):
+        result = original_speak(text, language=language)
+        session.stop()  # the user switches hands-free off while SAM answers
+        return result
+
+    voice.speak = speak_then_switch_off
+    session.run_session()
+
+    assert voice.listen_calls == 1, "a follow-up was captured after switching off"
+    assert voice.spoken == ["Gold is quiet."]
+    assert session.status.state.value == "OFF"
