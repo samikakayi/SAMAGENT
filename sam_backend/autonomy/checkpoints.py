@@ -23,6 +23,16 @@ from typing import Any
 MODIFYING_TOOLS = {"write_file", "replace_text", "delete_path"}
 
 
+class CheckpointUnavailable(RuntimeError):
+    """The evidence a rollback needs is no longer on disk.
+
+    Raised before anything is written, because a rollback that discovers a
+    missing snapshot halfway through has already left the workspace in a
+    state that never existed -- some files back at their originals, the rest
+    still carrying the run's changes.
+    """
+
+
 class WorkspaceCheckpoints:
     """Snapshot, diff and restore files inside one workspace."""
 
@@ -66,6 +76,21 @@ class WorkspaceCheckpoints:
             entry["snapshot"] = str(destination)
         return entry
 
+    @staticmethod
+    def readable_snapshot(entry: dict[str, Any]) -> Path | None:
+        """The entry's saved copy, if it is still there and still readable."""
+        snapshot = entry.get("snapshot")
+        if not snapshot:
+            return None
+        path = Path(snapshot)
+        if not path.is_file():
+            return None
+        try:
+            with open(path, "rb"):
+                return path
+        except OSError:
+            return None
+
     # -- reporting ---------------------------------------------------------
     def diff(self, checkpoints: list[dict[str, Any]], preexisting: list[str]) -> list[dict[str, Any]]:
         """Per-file unified diffs of this run's own changes.
@@ -77,10 +102,15 @@ class WorkspaceCheckpoints:
         files: list[dict[str, Any]] = []
         for entry in checkpoints:
             target = Path(entry["path"])
-            before = Path(entry["snapshot"]).read_bytes() if entry.get("snapshot") else b""
+            saved = self.readable_snapshot(entry)
+            # A file that existed and whose saved copy is gone cannot be
+            # diffed. Showing it against nothing would render every line as
+            # something this run added, which it did not.
+            lost = bool(entry.get("existed")) and saved is None
+            before = saved.read_bytes() if saved else b""
             after = target.read_bytes() if target.is_file() else b""
             relative = self.relative(entry["path"])
-            unified = "".join(difflib.unified_diff(
+            unified = "" if lost else "".join(difflib.unified_diff(
                 before.decode("utf-8", "replace").splitlines(keepends=True),
                 after.decode("utf-8", "replace").splitlines(keepends=True),
                 fromfile=f"a/{relative}" if entry["existed"] else "/dev/null",
@@ -96,13 +126,39 @@ class WorkspaceCheckpoints:
                 "path": relative,
                 "status": status,
                 "diff": unified,
+                "original_available": not lost,
                 "had_user_changes": relative in already_dirty,
             })
         return files
 
     # -- undoing -----------------------------------------------------------
+    def unusable(self, checkpoints: list[dict[str, Any]]) -> list[str]:
+        """Files this checkpoint can no longer restore, workspace-relative.
+
+        A file the run *created* needs no snapshot: undoing it means deleting
+        it. A file that already existed needs its snapshot to still be there
+        and still be readable, or its original contents are simply gone.
+        """
+        return [
+            self.relative(entry["path"])
+            for entry in checkpoints
+            if entry.get("existed") and self.readable_snapshot(entry) is None
+        ]
+
     def restore(self, checkpoints: list[dict[str, Any]]) -> list[str]:
-        """Put every snapshotted file back, and remove files the run created."""
+        """Put every snapshotted file back, and remove files the run created.
+
+        Every entry is checked first: one missing snapshot cancels the whole
+        rollback rather than applying the half of it that still can be.
+        """
+        lost = self.unusable(checkpoints)
+        if lost:
+            raise CheckpointUnavailable(
+                "Rollback cannot be completed because the saved copy of "
+                + ", ".join(lost[:5])
+                + (f" and {len(lost) - 5} more file(s)" if len(lost) > 5 else "")
+                + " is missing. Nothing was changed."
+            )
         restored: list[str] = []
         for entry in checkpoints:
             target = Path(entry["path"])

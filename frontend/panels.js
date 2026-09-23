@@ -53,14 +53,14 @@
   async function loadToolStatus() {
     try {
       const [manifestPayload, health, desktop, trading] = await Promise.all([
-        json("/api/tools/manifests"), json("/api/health"), json("/api/desktop/status"), json("/api/trading/status"),
+        json("/api/tools/manifests"), json("/api/health"), json("/api/desktop/status"), requestBrokerStatus(),
       ]);
       const names = new Set((manifestPayload.tools || []).map((item) => item.name));
       toolStatus("tool-status-files", names.has("read_file") && names.has("write_file") ? "● Available" : "Unavailable", names.has("read_file"));
       toolStatus("tool-status-terminal", names.has("run_terminal") ? "● Guarded" : "Unavailable", names.has("run_terminal"));
       toolStatus("tool-status-python", names.has("run_python") ? "● Approval-gated" : "Unavailable", names.has("run_python"));
       toolStatus("tool-status-browser", names.has("browser_automate") ? "● Approval-gated" : "Unavailable", names.has("browser_automate"));
-      const mt5State = trading.market_data?.metatrader5?.state;
+      const mt5State = trading?.market_data?.metatrader5?.state;  // null when the broker did not answer
       toolStatus("tool-status-mt5", mt5State === "AVAILABLE" ? "● Connected read-only" : title(mt5State), mt5State === "AVAILABLE");
       toolStatus("tool-status-tradingview", desktop.tradingview?.interactive ? "● Interactive window" : desktop.tradingview?.running ? "Process only" : "Offline", Boolean(desktop.tradingview?.interactive));
       toolStatus("tool-status-desktop", health.computer_control ? "● Control ON" : "Control OFF", Boolean(health.computer_control));
@@ -283,7 +283,35 @@
     if (!Object.keys(theories).length) root.appendChild(element("p", "compatibility-note", "No theory output."));
   }
 
+  function drawingAvailability(drawing) {
+    // The drawing engine decides this; the panel only reports its answer, and
+    // says so plainly when it never received one rather than inventing a verdict.
+    if (!drawing) return "Unavailable; the drawing engine could not be reached";
+    if (drawing.verified_price_drawing) return "Verified price drawing available";
+    if (drawing.calibrated) return "Chart calibrated; desktop control permission still required";
+    return "Unavailable until verified chart calibration";
+  }
+
+  // /api/trading/status reaches the broker feed. Every reader of it on this page
+  // goes through here: one request at a time, shared while pending, given up
+  // before the next tick. A stalled broker never accumulates unanswered requests,
+  // an old answer never lands late, and it cannot stall or erase the TradingView
+  // observation, which needs no broker and is asked for on its own.
+  const BROKER_TIMEOUT_MS = 8_000;
+  let brokerStatus = null;
+
+  function requestBrokerStatus() {
+    if (brokerStatus) return brokerStatus;
+    const abort = new AbortController();
+    const timer = window.setTimeout(() => abort.abort(), BROKER_TIMEOUT_MS);
+    brokerStatus = json("/api/trading/status", { signal: abort.signal })
+      .catch(() => null)  // timeout or error: no answer, no claim
+      .finally(() => { window.clearTimeout(timer); brokerStatus = null; });
+    return brokerStatus;
+  }
+
   async function refreshTradingView() {
+    const status = requestBrokerStatus();
     try {
       const state = await json("/api/tradingview/state");
       setStatus("tradingview-status", state.running ? "RUNNING" : "OFFLINE");
@@ -291,11 +319,15 @@
       text("tv-observed-symbol", state.symbol || "Not exposed by title");
       text("tv-observed-price", fmt(state.current_price));
       text("tv-capture-state", state.interactive ? "Interactive session detected; permission still required" : "No interactive window");
-      text("tv-drawing-state", state.chart_geometry ? "Chart geometry observed; price calibration still required" : "Unavailable until verified chart calibration");
       text("tv-disclosure", (state.observations || []).join(" ") || "TradingView state observed from the native Windows window.");
+      // Last, so nothing above it waits on the broker.
+      text("tv-drawing-state", drawingAvailability((await status)?.drawing));
     } catch (error) {
       setStatus("tradingview-status", "UNAVAILABLE");
       text("tv-process-state", error.message);
+      // Without an observation, a verdict from a previous tick is no longer about
+      // any chart we can see; it must not be left standing.
+      text("tv-drawing-state", drawingAvailability(null));
     }
   }
 
@@ -785,5 +817,6 @@
   });
 
   window.SAMTrading = { refresh: loadMarketSnapshot, analyze: analyzeMarket, tradingViewAction, latest: () => latestAnalysis,
+    tradingView: refreshTradingView, toolStatus: loadToolStatus,
     providers: loadProviders, triggers: loadTriggers, backtest: runBacktest, strategies: loadStrategies, journal: loadJournal };
 })();

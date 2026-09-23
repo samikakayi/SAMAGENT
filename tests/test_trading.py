@@ -41,7 +41,7 @@ from sam_backend.trading.indicators import (
 from sam_backend.trading.market_data import MarketDataService, MetaTrader5Provider
 from sam_backend.trading.registry import TradingKnowledgeRegistry, build_skill_registry
 from sam_backend.trading.service import TradingService
-from sam_backend.trading.types import Candle, Direction, MarketDataBatch, SetupDecision, normalize_timeframe
+from sam_backend.trading.types import Candle, Direction, MarketDataBatch, SetupDecision, SetupState, normalize_timeframe
 
 
 BASE = datetime(2025, 1, 6, 0, 0, tzinfo=UTC)
@@ -273,3 +273,599 @@ def test_market_data_unknown_provider_fails_closed():
 
 def test_metatrader_symbol_ranking_prefers_exact_visible_name():
     assert MetaTrader5Provider._candidate_score("XAUUSD", "XAUUSD", True) < MetaTrader5Provider._candidate_score("XAUUSD.a", "XAUUSD", True)
+
+
+# --- a MetaTrader5 package that cannot be loaded ---------------------------------
+# `import MetaTrader5` reads MetaTrader5/__init__.py and then loads the _core
+# extension. A missing package or a failed DLL load arrives as ImportError; a
+# package file the process cannot read arrives as a raw OSError, because the
+# import system does not wrap I/O failures. Both mean the same thing here: the
+# broker is unavailable. Neither is a reason for a 500, and neither should put
+# a filesystem path into an API payload.
+
+UNREADABLE_PACKAGE = r"C:\Users\someone\site-packages\MetaTrader5\__init__.py"
+
+
+class UnreadableMetaTrader5:
+    """A finder/loader pair whose package file raises on read."""
+
+    def find_spec(self, name, path=None, target=None):
+        import importlib.util
+
+        if name == "MetaTrader5":
+            return importlib.util.spec_from_loader(name, self)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise PermissionError(13, "Access is denied", UNREADABLE_PACKAGE)
+
+
+@pytest.fixture()
+def unreadable_metatrader(monkeypatch):
+    import sys
+
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [UnreadableMetaTrader5(), *sys.meta_path])
+
+
+def test_an_unreadable_metatrader_package_is_an_unavailable_provider(unreadable_metatrader):
+    health = MetaTrader5Provider().health()
+
+    assert health["state"] == "UNAVAILABLE"
+    assert "could not be loaded" in health["error"]
+    assert "site-packages" not in health["error"] and "someone" not in health["error"]
+
+
+def test_an_unreadable_metatrader_package_leaks_no_path_through_capabilities(unreadable_metatrader):
+    report = MetaTrader5Provider().capabilities("XAUUSD")
+
+    assert report["state"] == "UNAVAILABLE"
+    assert "someone" not in report["error"] and "__init__" not in report["error"]
+
+
+def test_a_missing_metatrader_package_still_reads_as_not_installed(monkeypatch):
+    import sys
+
+    class Absent:
+        def find_spec(self, name, path=None, target=None):
+            if name == "MetaTrader5":
+                raise ImportError("No module named 'MetaTrader5'")
+            return None
+
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Absent(), *sys.meta_path])
+
+    assert "not installed" in MetaTrader5Provider().health()["error"]
+
+
+def test_a_corrupt_metatrader_package_is_not_silently_called_unavailable(monkeypatch):
+    """A programmer-class failure inside the package must still surface."""
+    import sys
+
+    class Corrupt(UnreadableMetaTrader5):
+        def exec_module(self, module):
+            raise SyntaxError("invalid syntax")
+
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Corrupt(), *sys.meta_path])
+
+    with pytest.raises(SyntaxError):
+        MetaTrader5Provider().health()
+
+
+# --- one owner for the latest report -------------------------------------------
+# The chart draws from the latest analysis and a monitored setup is created
+# from it. Both must read the same object from the one place that writes it.
+
+def fresh_service(settings) -> TradingService:
+    settings.prepare()
+    return TradingService(settings, Database(settings.database_path), CancellationManager())
+
+
+REPORT = {
+    "symbol": "XAUUSD", "feed": "test", "setup_state": "NO_SETUP", "theories": {"default": {}},
+    "long_scenario": {"direction": "BULLISH"}, "entry": 100.0, "stop": 99.0, "tp1": 101.0,
+    "rr": 1.0, "invalidation": "x", "confidence": 0.5, "support": [], "resistance": [],
+}
+
+
+def test_the_facade_reads_the_latest_report_from_its_owner(settings):
+    service = fresh_service(settings)
+    assert service.analyst.latest is None
+
+    service.analyst.latest = REPORT
+    setup = service.create_setup_from_last_analysis("default")
+
+    assert setup["symbol"] == "XAUUSD" and setup["theory"] == "default"
+    assert not hasattr(service, "_last_report"), "the facade keeps no copy of its own"
+
+
+def test_a_failed_fetch_does_not_replace_the_latest_report(settings, monkeypatch):
+    """An analysis that cannot start leaves the last good view of the market."""
+    from sam_backend.trading.market_data import MarketDataError
+
+    service = fresh_service(settings)
+    service.analyst.latest = REPORT
+
+    def refuse(*args, **kwargs):
+        raise MarketDataError("feed is down")
+
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch", refuse)
+    result = service.analyze("XAUUSD", ["M15"])
+
+    assert not result.verified
+    assert service.analyst.latest is REPORT, "a hard failure must not clobber the last report"
+
+
+def test_analysis_public_surface_is_unchanged():
+    """Callers of TradingService keep working; the pipeline moved, the API did not."""
+    import inspect
+
+    methods = {name for name, _ in inspect.getmembers(TradingService, inspect.isfunction) if not name.startswith("_")}
+    assert {
+        "analyze", "market_snapshot", "route_natural_intent", "create_setup_from_last_analysis",
+        "create_setup_from_analysis", "draw_analysis", "draw_annotation", "draw_two_anchor",
+        "backtest", "list_entry_triggers", "poll_monitors", "status", "refresh_permissions",
+        "gann_analysis", "pitchfork_analysis", "draw_gann_fan", "draw_pitchfork",
+        "list_drawings", "clear_drawings", "set_layer_visibility", "calibrate_chart",
+        "verify_calibration", "validate_custom_theory", "save_custom_theory",
+    } <= methods
+    # The defaults callers relied on survive the delegation.
+    assert inspect.signature(TradingService.analyze).parameters["symbol"].default == "XAUUSD"
+    assert inspect.signature(TradingService.market_snapshot).parameters["symbol"].default == "XAUUSD"
+
+
+def test_a_full_analysis_builds_a_report_and_becomes_the_latest(settings, monkeypatch):
+    """The whole pipeline on synthetic candles, through the public facade.
+
+    This is the path that had no test when the pipeline moved, and the one a
+    stale reference inside it would only have broken at runtime against a
+    live feed. It also proves the analysis -> setup chain end to end.
+    """
+    service = fresh_service(settings)
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch",
+                        lambda symbol, timeframe, count: batch(timeframe=timeframe))
+
+    result = service.analyze("XAUUSD", ["M15", "M5"], ["default"])
+
+    assert result.executed, result.error
+    report = service.analyst.latest
+    assert report is not None and report is result.data, "the report the caller got is the one that is kept"
+    assert report["symbol"] == "XAUUSD" and "confidence" in report and "spoken_summary_ckb" in report
+
+    # The record group reads the same object the analysis wrote.
+    setup = service.create_setup_from_last_analysis("default")
+    assert setup["symbol"] == "XAUUSD"
+    # And the chart's source for drawing is that report too.
+    assert service.draw_analysis().error_code != "NO_ANALYSIS"
+
+
+# --- the analysis pipeline, branch by branch ---------------------------------
+# The pipeline moved into MarketAnalyst with four defects that only surfaced
+# late, because most of its branches were reached by nothing. Each moved
+# method is driven here through the public facade on synthetic candles, and
+# every assertion is on a field the chart or setup code actually reads.
+
+def analysing_service(settings, monkeypatch, *, verified: bool = False) -> TradingService:
+    """A service whose only feed is the synthetic one; verified flips the
+    quote-timestamp check that decides SUCCESS versus PARTIAL."""
+    service = fresh_service(settings)
+
+    def fetch(symbol, timeframe, count):
+        result = batch(timeframe=timeframe)
+        result.quote_timestamp_verified = verified
+        return result
+
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch", fetch)
+    return service
+
+
+@pytest.mark.parametrize("theory, field, inner", [
+    ("snr", "levels", None),                       # _execute_theory: snr branch
+    ("smc", "imbalances", None),                   # smc/ict/liquidity branch
+    ("ict", "session", None),                      # ict adds the session
+    ("wyckoff", "wyckoff", "phase_candidate"),     # _wyckoff
+    ("volume_profile", "profiles", None),
+    ("vwap", "vwap", None),
+    ("price_action", "patterns", None),
+    ("order_blocks", "order_blocks", None),
+    ("fibonacci", "fibonacci", None),
+    ("harmonic", "patterns", None),                # _harmonics -> _candles_for
+    ("elliott", "counts", None),                   # _elliott -> _candles_for
+    ("sessions", "opening_ranges", None),          # _opening_ranges -> _candles_for
+])
+def test_each_theory_branch_adds_its_own_evidence_to_the_report(settings, monkeypatch, theory, field, inner):
+    service = analysing_service(settings, monkeypatch)
+
+    result = service.analyze("XAUUSD", ["H1", "M15"], [theory])
+
+    assert result.executed, result.error
+    output = result.data["theories"][theory]
+    assert field in output, f"{theory} produced no {field!r}; keys: {sorted(output)}"
+    assert output["interpretation"]["direction"] in {"BULLISH", "BEARISH", "NEUTRAL"}
+    if inner:
+        assert inner in output[field]
+    # Every per-timeframe branch answers for each timeframe it was asked about.
+    if theory == "ict":
+        assert {"active", "sessions", "london_new_york_overlap"} <= set(output[field])
+    elif isinstance(output[field], dict) and theory not in {"wyckoff", "sessions"}:
+        assert set(output[field]) == {"H1", "M15"}
+
+
+def test_wyckoff_names_a_phase_and_refuses_to_confirm_it(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+
+    wyckoff = service.analyze("XAUUSD", ["H1"], ["wyckoff"]).data["theories"]["wyckoff"]["wyckoff"]
+
+    assert wyckoff["timeframe"] == "H1"
+    assert len(wyckoff["alternate_interpretations"]) >= 1
+    assert wyckoff["phase_candidate"].endswith("UNCONFIRMED")
+    assert 0 < wyckoff["confidence"] < 0.5, "an unconfirmed phase must not read as confident"
+
+
+def test_the_session_study_covers_both_sessions_per_timeframe(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+
+    ranges = service.analyze("XAUUSD", ["M15"], ["sessions"]).data["theories"]["sessions"]["opening_ranges"]
+
+    assert set(ranges) == {"M15"} and set(ranges["M15"]) == {"london", "new_york"}
+
+
+def test_a_custom_theory_is_evaluated_and_unsupported_predicates_are_not_guessed(settings, monkeypatch):
+    """_execute_custom_theory: supported predicates run; unknown ones are named, never executed.
+
+    save_custom_theory refuses an unsupported predicate outright, so the
+    runtime branch exists for a row that reached the table some other way;
+    it is written straight to the store here to prove the guard holds.
+    """
+    service = analysing_service(settings, monkeypatch)
+    saved = service.database.save_custom_theory("Trend Check", {
+        "name": "Trend Check", "description": "d",
+        "conditions": [
+            {"predicate": "trend_is", "timeframe": "M15", "value": "BULLISH"},
+            {"predicate": "rsi_above", "timeframe": "M15", "value": 0},
+            {"predicate": "launch_missiles", "timeframe": "M15"},
+        ],
+        "invalidation": "x", "targets": ["y"],
+    })
+
+    output = service.analyze("XAUUSD", ["M15"], ["Trend Check"]).data["theories"]["custom:Trend Check"]
+
+    assert output["theory"]["custom"] is True and output["theory"]["version"] == saved["version"]
+    statuses = [item["status"] for item in output["evaluated_conditions"]]
+    assert statuses == ["EVALUATED", "EVALUATED", "UNSUPPORTED_PREDICATE"]
+    assert output["evaluated_conditions"][1]["passed"] is True, "rsi is always above zero"
+    assert output["status"] == "PARTIALLY_AVAILABLE" and "not guessed" in output["warning"]
+    assert output["setup_match"] is False, "one unknown predicate means no match is claimed"
+
+
+def test_a_custom_theory_asking_for_a_missing_timeframe_says_so(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+    service.save_custom_theory({"name": "Needs H4", "description": "d", "invalidation": "x", "targets": ["y"],
+                                "conditions": [{"predicate": "trend_is", "timeframe": "H4", "value": "BULLISH"}]})
+
+    output = service.analyze("XAUUSD", ["M15"], ["Needs H4"]).data["theories"]["custom:Needs H4"]
+
+    assert output["evaluated_conditions"][0]["status"] == "MISSING_TIMEFRAME"
+    assert output["setup_match"] is False
+
+
+def test_an_unknown_theory_is_reported_unavailable_rather_than_invented(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch)
+
+    output = service.analyze("XAUUSD", ["M15"], ["no_such_theory"]).data["theories"]["no_such_theory"]
+
+    assert output["status"] == "UNAVAILABLE" and "no_such_theory" in output["error"]
+
+
+def test_an_unverified_feed_completes_as_partial_and_still_becomes_the_latest(settings, monkeypatch):
+    """The PARTIAL path: gaps are named in the status and the report is kept."""
+    service = analysing_service(settings, monkeypatch, verified=False)
+
+    result = service.analyze("XAUUSD", ["M15"], ["default"])
+
+    assert result.status.value == "PARTIAL" and result.verified is False
+    assert result.error == "Analysis completed with verification gaps."
+    assert result.data["self_check"]["passed"] is False
+    assert service.analyst.latest is result.data
+
+
+def test_a_verified_feed_completes_as_success(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch, verified=True)
+
+    result = service.analyze("XAUUSD", ["M15"], ["default"])
+
+    assert result.status.value == "SUCCESS", result.error
+    assert result.data["self_check"]["passed"] is True
+    assert result.error is None
+
+
+def test_the_report_carries_what_the_chart_and_setup_code_read(settings, monkeypatch):
+    """_report, _confidence and _sorani_summary, on the fields downstream consumes."""
+    service = analysing_service(settings, monkeypatch)
+
+    report = service.analyze("XAUUSD", ["H1", "M15"], ["default", "snr"]).data
+
+    assert report["symbol"] == "XAUUSD" and report["requested_symbol"] == "XAUUSD"
+    assert set(report["timeframes"]) == {"H1", "M15"}
+    assert 0.0 <= report["confidence"] <= 1.0
+    assert report["setup_state"] in {state.value for state in SetupState}
+    assert isinstance(report["support"], list) and isinstance(report["resistance"], list)
+    assert set(report["theories"]) == {"default", "snr"}
+    # _sorani_summary: the spoken line carries the bias, the decision and
+    # what is still missing -- so a listener knows why there is no entry.
+    spoken = report["spoken_summary_ckb"]
+    assert spoken.startswith("HTF ") and str(report["htf_bias"]).lower() in spoken.lower()
+    assert str(report["decision"] or "WAIT") in spoken
+    for missing in (report.get("missing_confirmation") or [])[:3]:
+        assert str(missing) in spoken
+    # Pattern engines rerun on the candles the analysis kept; those must not be serialised.
+    assert "_candles" not in str(report)
+
+
+def test_market_snapshot_reports_quotes_for_each_timeframe(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch, verified=True)
+
+    result = service.market_snapshot("XAUUSD", ["M15", "M5"])
+
+    assert result.executed and result.verified is True
+    assert result.data["symbol"] == "XAUUSD" and result.data["feed"] == "Synthetic Test Feed"
+    assert result.data["spread"] == pytest.approx(0.10)
+    assert set(result.data["timeframes"]) == {"M15", "M5"}
+    m15 = result.data["timeframes"]["M15"]
+    assert {"open", "high", "low", "close", "time", "metadata"} <= set(m15)
+    assert m15["metadata"]["timeframe"] == "M15" and m15["metadata"]["bars"] == 180
+    assert result.data["errors"] == {}
+
+
+def test_an_unverified_snapshot_is_partial_and_says_why(settings, monkeypatch):
+    service = analysing_service(settings, monkeypatch, verified=False)
+
+    result = service.market_snapshot("XAUUSD", ["M15"])
+
+    assert result.executed and result.verified is False
+    assert result.status.value == "PARTIAL"
+    assert "verification gaps" in result.error
+
+
+def test_market_snapshot_fails_closed_when_no_timeframe_returns_data(settings, monkeypatch):
+    from sam_backend.trading.market_data import MarketDataError
+
+    service = fresh_service(settings)
+
+    def refuse(*args, **kwargs):
+        raise MarketDataError("feed down")
+
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch", refuse)
+    result = service.market_snapshot("XAUUSD", ["M15"])
+
+    assert not result.executed and result.error_code == "MARKET_DATA_UNAVAILABLE"
+    assert "feed down" in " ".join(result.observations)
+
+
+def test_analysis_stops_when_the_task_is_cancelled(settings, monkeypatch):
+    """_raise_if_cancelled: a cancelled token ends the run before theories execute."""
+    service = analysing_service(settings, monkeypatch)
+    service.cancellation.create("task_x")
+    service.cancellation.cancel("task_x", "test")
+
+    with pytest.raises(RuntimeError, match="cancel"):
+        service.analyze("XAUUSD", ["M15"], ["default"], task_id="task_x")
+
+
+def test_a_theory_whose_data_sam_cannot_see_says_so_instead_of_pretending(settings, monkeypatch):
+    """_execute_theory: no order-flow feed means no order-flow verdict."""
+    service = analysing_service(settings, monkeypatch)
+
+    output = service.analyze("XAUUSD", ["M15"], ["dom"]).data["theories"]["dom"]
+
+    assert output["status"] == "UNAVAILABLE"
+    assert output["interpretation"] is None and output["facts"] == []
+    assert output["reason"], "the refusal names what is missing"
+
+
+@pytest.mark.parametrize("slope, expected_candidates, expected_phase", [
+    (0.03, ["MARKUP", "REACCUMULATION"], "D_OR_E_UNCONFIRMED"),      # bullish structure
+    (-0.03, ["MARKDOWN", "REDISTRIBUTION"], "D_OR_E_UNCONFIRMED"),   # bearish structure
+])
+def test_wyckoff_reads_the_phase_from_the_structure_direction(settings, monkeypatch, slope, expected_candidates, expected_phase):
+    """_wyckoff: each structural direction maps to its own pair of readings."""
+    service = fresh_service(settings)
+    monkeypatch.setattr(service.market_data.providers["metatrader5"], "fetch",
+                        lambda symbol, timeframe, count: batch(candles(slope=slope), timeframe=timeframe))
+
+    wyckoff = service.analyze("XAUUSD", ["H1"], ["wyckoff"]).data["theories"]["wyckoff"]["wyckoff"]
+
+    assert wyckoff["alternate_interpretations"] == expected_candidates
+    assert wyckoff["phase_candidate"] == expected_phase
+
+
+def test_an_unreadable_metatrader_package_does_not_fail_the_status_endpoint(app, unreadable_metatrader):
+    from fastapi.testclient import TestClient
+
+    from sam_backend.trading.tradingview import TradingViewState
+
+    absent = TradingViewState(False, [], None, None, None, None, None, False, None, None, None, False, False)
+    app.state.trading.tradingview.observe = lambda: absent
+    app.state.trading.drawing._observe = lambda: absent
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/trading/status")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["market_data"]["metatrader5"]["state"] == "UNAVAILABLE"
+    assert payload["capabilities"]["state"] == "UNAVAILABLE"
+    assert "someone" not in response.text and "site-packages" not in response.text
+    # The rest of the payload is unaffected by the broker.
+    assert "drawing" in payload and "tradingview" in payload
+
+
+# --- one window scan per status request ------------------------------------------
+# status() observed the chart itself and then called DrawingEngine.capability(),
+# which observed again through its own injected `_observe`. One API request cost
+# two Win32 window scans, and the two halves of the response could describe two
+# different moments.
+
+
+class CountingWindow:
+    """An observation source that reports a different chart on every call."""
+
+    def __init__(self, *charts):
+        self.charts = list(charts)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return self.charts[min(self.calls - 1, len(self.charts) - 1)]
+
+
+def chart_window(handle=7, symbol="XAUUSD", timeframe="M15", geometry=None):
+    from sam_backend.trading.tradingview import TradingViewState
+
+    box = geometry or {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+    return TradingViewState(
+        running=True, process_ids=[11], window_handle=handle, title=symbol, symbol=symbol,
+        feed=None, timeframe=timeframe, timeframe_verified=True, current_price=2500.0,
+        window_geometry=box, monitor=None, active=True, interactive=True, client_geometry=box,
+    )
+
+
+def watched_service(settings, observe):
+    """A real TradingService whose chart observation is counted, MT5 stubbed out."""
+    from sam_backend.trading.market_data import MarketDataError
+
+    settings.prepare()
+    trading = TradingService(settings, Database(settings.database_path), CancellationManager())
+    trading.tradingview.observe = trading.drawing._observe = observe
+
+    def no_broker(*args, **kwargs):
+        raise MarketDataError("MetaTrader 5 terminal is not running")
+
+    provider = trading.market_data.providers["metatrader5"]
+    provider.fetch = provider._module = no_broker
+    return trading
+
+
+def test_one_status_request_scans_the_window_once(settings):
+    window = CountingWindow(chart_window())
+
+    watched_service(settings, window).status()
+
+    assert window.calls == 1, f"one request performed {window.calls} window scans"
+
+
+def test_the_status_response_describes_a_single_moment(settings):
+    """Two scans can straddle a change: the user switches chart between them."""
+    window = CountingWindow(chart_window(symbol="XAUUSD"), chart_window(handle=99, symbol="EURUSD"))
+
+    payload = watched_service(settings, window).status()
+
+    assert window.calls == 1
+    assert payload["tradingview"]["symbol"] == "XAUUSD"
+    assert payload["tradingview"]["window_handle"] == 7
+    # The drawing verdict must be about that same chart, not the one after it.
+    assert "EURUSD" not in (payload["drawing"]["calibration_error"] or "")
+
+
+def test_capability_without_a_snapshot_still_observes_for_itself(settings):
+    """Every other caller passes nothing and must keep getting a fresh look."""
+    window = CountingWindow(chart_window())
+    trading = watched_service(settings, window)
+
+    trading.drawing.capability()
+    trading.drawing.capability()
+
+    assert window.calls == 2, "the engine stopped observing for callers that supply nothing"
+
+
+def test_a_supplied_snapshot_is_not_kept_on_the_engine(settings):
+    """It decides one answer; it must not become state the next call reads."""
+    window = CountingWindow(chart_window())
+    trading = watched_service(settings, window)
+    before = set(vars(trading.drawing))
+
+    trading.drawing.capability(chart_window(handle=404, symbol="EURUSD"))
+
+    assert window.calls == 0, "a supplied snapshot must replace the scan, not add to it"
+    assert set(vars(trading.drawing)) == before, "the engine stored the caller's snapshot"
+    # The next unsupplied call observes afresh rather than reusing what it was handed.
+    assert trading.drawing.capability()["calibrated"] is False
+    assert window.calls == 1
+
+
+def calibrate_for(trading, state, geometry=None):
+    from sam_backend.trading.calibration import geometry_hash
+
+    box = geometry or {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+    trading.database.save_chart_calibration(
+        window_handle=state.window_handle, symbol=state.symbol, timeframe=state.timeframe,
+        geometry_hash=geometry_hash(box), slope=-2.0, intercept=3200.0,
+        method="test", verified=True, axis_x=1100.0,
+    )
+
+
+def test_a_supplied_snapshot_with_a_valid_calibration_stays_available(settings):
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    calibrate_for(trading, state)
+
+    assert trading.drawing.capability(state)["verified_price_drawing"] is True
+
+
+def test_a_supplied_snapshot_without_a_calibration_is_unavailable(settings):
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+
+    capability = trading.drawing.capability(state)
+
+    assert capability["calibrated"] is False
+    assert "has not been calibrated" in capability["calibration_error"]
+
+
+def test_a_supplied_snapshot_with_no_window_is_unavailable(settings):
+    trading = watched_service(settings, CountingWindow(chart_window()))
+    calibrate_for(trading, chart_window())
+
+    capability = trading.drawing.capability(chart_window(handle=None))
+
+    assert capability["calibrated"] is False
+    assert capability["verified_price_drawing"] is False
+
+
+def test_a_supplied_snapshot_of_a_moved_viewport_refuses_the_calibration(settings):
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    calibrate_for(trading, state)
+
+    moved = chart_window(geometry={"left": 0, "top": 0, "right": 1400, "bottom": 800})
+
+    assert trading.drawing.capability(moved)["calibrated"] is False
+    # The same calibration is still good for the viewport it was taken in.
+    assert trading.drawing.capability(state)["calibrated"] is True
+
+
+def test_a_partial_snapshot_fails_closed_rather_than_guessing(settings):
+    """A window with no symbol or timeframe cannot match a calibration row."""
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    calibrate_for(trading, state)
+
+    partial = chart_window(symbol=None, timeframe=None)
+
+    assert trading.drawing.capability(partial)["calibrated"] is False
+
+
+def test_status_keys_the_calibration_to_the_observed_chart(settings):
+    """The scoping dimensions are unchanged: handle, symbol, timeframe, geometry."""
+    state = chart_window()
+    trading = watched_service(settings, CountingWindow(state))
+    trading.drawing.computer_control = trading.drawing.screen_access = True
+    calibrate_for(trading, state)
+
+    assert trading.status()["drawing"]["verified_price_drawing"] is True

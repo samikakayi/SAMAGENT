@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -36,15 +35,13 @@ from ..planner import Planner
 from ..policy import RiskPolicy
 from ..project_map import ProjectScanner
 from ..provider_health import ProviderHealth
-from ..tasks import AgentTask, TaskState, TaskStep, TaskStore
+from ..tasks import VERIFIED_STATUS, AgentTask, TaskState, TaskStep, TaskStore
 from ..tools import ToolRegistry
 from ..ui_review import review_screenshot
 from ..verification import CheckOutcome, CheckResult, UiSmokeRunner, VerificationEngine, is_ui_work
-from .checkpoints import MODIFYING_TOOLS, WorkspaceCheckpoints
-
-# How much of a file's text an observation may carry back to the model. Large
-# enough to act on, small enough that one read cannot swamp the next prompt.
-OBSERVATION_CONTENT_LIMIT = 4000
+from .checkpoints import MODIFYING_TOOLS, CheckpointUnavailable, WorkspaceCheckpoints
+from .control import RunControl, TaskAlreadyRunning
+from .observations import describe_failure, describe_success
 
 EXECUTOR_SYSTEM_PROMPT = """You are SAM, an autonomous software engineering agent executing one step of an approved plan.
 
@@ -58,15 +55,6 @@ Rules:
 - When the current step is genuinely finished and nothing further is needed, reply with a short plain-text summary and no tool call.
 - Never print, copy or store credentials."""
 
-
-
-class TaskAlreadyRunning(RuntimeError):
-    """Raised when a second driver tries to take a task that is already running.
-
-    Two drivers on one task would each hold their own copy loaded from the
-    database and overwrite each other's progress, so the second caller is
-    refused rather than queued.
-    """
 
 
 class AutonomousOrchestrator:
@@ -97,7 +85,7 @@ class AutonomousOrchestrator:
         self.scanner = scanner or tools.scanner
         self.verifier = verifier or tools.verifier
         self.capabilities = capabilities or tools.capabilities
-        self.cancellation = cancellation
+        self.control = RunControl(cancellation)
         self.executor = ToolExecutor(settings, database, tools, policy)
         self.health = health or ProviderHealth(settings)
         # The model this run resolved to. None until preflight has run; every
@@ -112,10 +100,6 @@ class AutonomousOrchestrator:
         self.max_steps = max(4, int(getattr(settings, "max_tool_iterations", 8)) * 3)
         self.max_retries = 3
         self.max_replans = 2
-        # Exactly one driver per task id. The set is the authority; the lock
-        # only keeps check-and-claim atomic.
-        self._driving: set[str] = set()
-        self._guard = asyncio.Lock()
 
     # -- helpers -----------------------------------------------------------
     @property
@@ -145,44 +129,8 @@ class AutonomousOrchestrator:
             "message": message or state.value,
         })
 
-    @asynccontextmanager
-    async def _exclusive(self, task_id: str):
-        """Claim sole ownership of driving one task, or refuse."""
-        async with self._guard:
-            if task_id in self._driving:
-                raise TaskAlreadyRunning(f"{task_id} is already running")
-            self._driving.add(task_id)
-        try:
-            yield
-        finally:
-            async with self._guard:
-                self._driving.discard(task_id)
-
     def driving(self, task_id: str) -> bool:
-        return task_id in self._driving
-
-    def _register_token(self, task: AgentTask) -> None:
-        """Publish the task to the cancellation manager so Stop can reach it.
-
-        Without this the shared /api/tasks/{id}/cancel endpoint has no token
-        to cancel and an autonomous run cannot be stopped at all.
-        """
-        if self.cancellation is not None and self.cancellation.get(task.id) is None:
-            self.cancellation.create(task.id)
-
-    def _release_token(self, task: AgentTask) -> None:
-        """Drop the token once the run is over.
-
-        A paused run keeps its token: waiting for approval is still stoppable.
-        """
-        if self.cancellation is not None and task.terminal:
-            self.cancellation.complete(task.id)
-
-    def _cancelled(self, task: AgentTask) -> bool:
-        if self.cancellation is None:
-            return False
-        token = self.cancellation.get(task.id)
-        return token is not None and token.cancelled
+        return self.control.driving(task_id)
 
     async def _finish_cancelled(self, task: AgentTask) -> AgentTask:
         await self._transition(task, TaskState.CANCELLED, "Stopped at your request")
@@ -194,7 +142,7 @@ class AutonomousOrchestrator:
         )
         await self._emit(task, "error", "Run stopped at your request")
         self.store.save(task)
-        self._release_token(task)
+        self.control.release(task)
         return task
 
     # -- public API --------------------------------------------------------
@@ -214,11 +162,9 @@ class AutonomousOrchestrator:
         if task.terminal:
             return {"cancelled": False, "task_id": task_id, "state": task.state.value,
                     "reason": "The task is no longer running."}
-        if self.cancellation is not None:
-            self._register_token(task)
-            self.cancellation.cancel(task_id, "user")
+        self.control.request_stop(task)
         try:
-            async with self._exclusive(task_id):
+            async with self.control.exclusive(task_id):
                 await self._finish_cancelled(task)
         except TaskAlreadyRunning:
             # A driver holds the task; it will read the cancelled token at
@@ -238,12 +184,12 @@ class AutonomousOrchestrator:
 
     async def run(self, task: AgentTask) -> AgentTask:
         """Drive the task to a terminal state, or to an approval pause."""
-        async with self._exclusive(task.id):
-            self._register_token(task)
+        async with self.control.exclusive(task.id):
+            self.control.arm(task)
             try:
                 return await self._run_unguarded(task)
             finally:
-                self._release_token(task)
+                self.control.release(task)
 
     async def _run_unguarded(self, task: AgentTask) -> AgentTask:
         try:
@@ -272,14 +218,14 @@ class AutonomousOrchestrator:
         task = self.store.get(task_id)
         if task is None or task.terminal:
             return task
-        async with self._exclusive(task_id):
-            self._register_token(task)
+        async with self.control.exclusive(task_id):
+            self.control.arm(task)
             try:
                 if task.state is TaskState.WAITING_FOR_APPROVAL:
                     await self._transition(task, TaskState.EXECUTING, "Resuming")
                 return await self._drive(task)
             finally:
-                self._release_token(task)
+                self.control.release(task)
 
     async def resolve_approval(self, task_id: str, approval_id: str, decision: str, note: str = "") -> AgentTask | None:
         """Apply the user's decision, then carry on.
@@ -295,12 +241,12 @@ class AutonomousOrchestrator:
         if task.terminal:
             return task
 
-        async with self._exclusive(task_id):
-            self._register_token(task)
+        async with self.control.exclusive(task_id):
+            self.control.arm(task)
             try:
                 return await self._apply_approval(task, approval_id, decision, note)
             finally:
-                self._release_token(task)
+                self.control.release(task)
 
     async def _apply_approval(
         self, task: AgentTask, approval_id: str, decision: str, note: str,
@@ -448,7 +394,7 @@ class AutonomousOrchestrator:
             # transition out of a terminal state.
             if task.terminal:
                 return self.store.save(task)
-            if self._cancelled(task):
+            if self.control.cancelled(task):
                 return await self._finish_cancelled(task)
 
             step = task.current_step
@@ -517,7 +463,7 @@ class AutonomousOrchestrator:
 
         # A model call can take a while; a Stop pressed during it should not
         # be spent on another tool. The drive loop finalises the cancellation.
-        if self._cancelled(task):
+        if self.control.cancelled(task):
             return None
 
         calls = turn.tool_calls[:1]
@@ -562,7 +508,7 @@ class AutonomousOrchestrator:
             )
             return gated.approval_id
 
-        if self._cancelled(task):
+        if self.control.cancelled(task):
             return None
         await self._checkpoint(task, call)
         outcome = await self.executor.execute(gated, conversation_id=task.conversation_id, task_id=task.id)
@@ -575,15 +521,8 @@ class AutonomousOrchestrator:
         self._record_files(task, call, result)
 
         if result.ok:
-            # A sensitive result (an approved credential-file read, a
-            # screenshot, the clipboard) must never enter the timeline, the
-            # persisted observations, or the next prompt. The agent is told
-            # the call succeeded and nothing more.
             sensitive = outcome.sensitive
-            summary = (
-                f"succeeded; its output is sensitive and was withheld from context"
-                if sensitive else self._summarise_result(call.name, result)
-            )
+            summary = describe_success(outcome)
             task.observations.append(f"{call.name}: {summary}")
             await self._emit(
                 task, "result", f"{call.name}: {summary}", tool=call.name, ok=True, sensitive=sensitive,
@@ -597,9 +536,7 @@ class AutonomousOrchestrator:
             await self._transition(task, TaskState.EXECUTING, "Continuing")
             return None
 
-        error = result.error or "The tool reported a failure without a message."
-        if outcome.sensitive:
-            error = "the call failed; its details are sensitive and were withheld"
+        error = describe_failure(outcome)
         task.errors.append(f"{call.name}: {error}")
         await self._emit(task, "error", f"{call.name} failed: {error[:300]}", tool=call.name, ok=False)
         if call.name == "run_tests" and isinstance(result.output, dict):
@@ -632,7 +569,11 @@ class AutonomousOrchestrator:
         report = await asyncio.to_thread(self.verifier.verify, project_map, self.workspace)
         if is_ui_work(task.modified_files):
             await self._validate_ui(task, project_map, report)
+        # The history keeps every attempt; the verdict names the last one.
+        # Recorded here too because a run that exhausts its re-plans ends in
+        # _heal and never reaches _complete, and its refusal is evidence.
         task.test_results.append(report.as_dict())
+        task.verification = report.as_dict()
         await self._emit(
             task, "result" if report.ok else "error",
             report.summary_text()[:800], verified=report.verified, ok=report.ok,
@@ -722,7 +663,10 @@ class AutonomousOrchestrator:
     async def _complete(self, task: AgentTask, report: Any) -> AgentTask:
         verified = bool(report is not None and report.verified)
         await self._transition(task, TaskState.COMPLETED, "Task complete")
-        task.completion_status = "completed_verified" if verified else "completed_unverified"
+        # The status and the evidence are set from the same report and reach
+        # the store in one save, so the invalid pair is never persisted.
+        task.verification = report.as_dict() if report is not None else None
+        task.completion_status = VERIFIED_STATUS if verified else "completed_unverified"
         lines = [f"Goal: {task.goal}"]
         if task.modified_files:
             lines.append("Files changed: " + ", ".join(task.modified_files[:20]))
@@ -790,7 +734,12 @@ class AutonomousOrchestrator:
             return {"rolled_back": False, "task_id": task_id, "reason": "Stop the task before rolling it back."}
         if task.rolled_back:
             return {"rolled_back": False, "task_id": task_id, "reason": "This run was already rolled back."}
-        restored = await asyncio.to_thread(self._checkpoints_for(task).restore, task.checkpoints)
+        try:
+            restored = await asyncio.to_thread(self._checkpoints_for(task).restore, task.checkpoints)
+        except CheckpointUnavailable as exc:
+            # Nothing was written, so the run is not rolled back and must not
+            # be recorded as though it were.
+            return {"rolled_back": False, "task_id": task_id, "reason": str(exc)}
         task.rolled_back = True
         await self._emit(task, "fix", f"Rolled back {len(restored)} file(s) to their checkpoints", files=restored)
         self.store.save(task)
@@ -835,34 +784,9 @@ class AutonomousOrchestrator:
 
     # -- small helpers -----------------------------------------------------
     def _record_files(self, task: AgentTask, call: ToolCall, result: Any) -> None:
-        if call.name not in {"write_file", "replace_text", "delete_path"}:
+        if call.name not in MODIFYING_TOOLS:
             return
         output = result.output if isinstance(result.output, dict) else {}
         path = str(output.get("path") or call.arguments.get("path") or "").strip()
         if path:
             self.store.note_files(task, [path])
-
-    @staticmethod
-    def _summarise_result(name: str, result: Any) -> str:
-        output = result.output
-        if isinstance(output, dict):
-            if name == "run_tests":
-                return str(output.get("summary") or "checks finished")[:400]
-            if name == "project_map":
-                return f"{output.get('file_count', '?')} files, commands {output.get('commands', {})}"
-            if "content" in output:
-                # The point of reading a file is the text inside it. Summarising
-                # to a path told the model nothing and left it re-reading the
-                # same file instead of acting on what it had asked for.
-                content = str(output.get("content") or "")
-                return f"{output.get('path')}:\n{content[:OBSERVATION_CONTENT_LIMIT]}"
-            if "path" in output:
-                return f"{output.get('path')} ({output.get('bytes', '?')} bytes)"
-            if "exit_code" in output:
-                return f"exit {output.get('exit_code')}"
-            if "commits" in output:
-                return f"{len(output['commits'])} commit(s)"
-            if "changed" in output:
-                return f"{len(output['changed'])} changed path(s) on {output.get('branch', '?')}"
-        text = result.model_text() if hasattr(result, "model_text") else str(output)
-        return text.strip()[:400] or "done"

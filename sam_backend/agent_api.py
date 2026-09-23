@@ -167,7 +167,13 @@ class AgentApi:
         @router.post("/api/tasks/{task_id}/approvals")
         async def resolve_agent_task_approval(task_id: str, payload: AgentTaskApproval) -> dict[str, Any]:
             task_or_404(task_id)
-            if self.database.get_approval(payload.approval_id) is None:
+            record = self.database.get_approval(payload.approval_id)
+            # An approval is permission for one action in one run. Another
+            # task's approval is not merely the wrong argument here: routing
+            # it through this task would mark this task's step done and let a
+            # guarded run step past its own gate, while the run that actually
+            # asked waits for a decision that already went elsewhere.
+            if record is None or record.get("task_id") != task_id:
                 raise HTTPException(404, "Approval not found")
             self.schedule_approval(task_id, payload.approval_id, payload.decision, payload.note)
             return {"accepted": True, "task_id": task_id, "decision": payload.decision}

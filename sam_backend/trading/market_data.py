@@ -27,6 +27,12 @@ class MetaTrader5Provider:
             import MetaTrader5 as mt5
         except ImportError as exc:
             raise MarketDataError("The MetaTrader5 Python package is not installed") from exc
+        except OSError as exc:
+            # The import system reads MetaTrader5/__init__.py and its _core
+            # extension; a file it cannot read arrives as a raw OSError, not an
+            # ImportError. Same meaning for us: no broker. The path stays out of
+            # the message, which is returned to API clients.
+            raise MarketDataError("The MetaTrader5 Python package could not be loaded") from exc
         return mt5
 
     @staticmethod

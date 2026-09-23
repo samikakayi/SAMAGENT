@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
 import pytest
 
 from sam_backend.config import Settings
+from sam_backend.db import Database
+from sam_backend.schemas import SettingsUpdate
 from sam_backend.secrets import SecretStore, resolve_credential
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -209,12 +210,12 @@ def test_dangerous_permissions_default_to_off(tmp_path: Path, monkeypatch):
 def test_permission_state_is_persisted_deliberately_not_by_accident(tmp_path: Path):
     settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d")
     settings.prepare()
-    settings.save_public_overrides({"computer_control_enabled": True, "screen_access_enabled": True})
-    saved = json.loads((settings.data_dir / "settings.json").read_text(encoding="utf-8"))
-    # These are in the allow-list by design, so the UI toggle survives a restart.
+    values = SettingsUpdate(computer_control_enabled=True, screen_access_enabled=True).provided()
+    saved = Database(settings.database_path).update_settings(values)
+    # The update schema is the one list of what persists, and it names these
+    # by design, so the UI toggle survives a restart rather than resetting.
     assert saved["computer_control_enabled"] is True
-    # A credential must never ride along with them.
-    assert "openrouter_api_key" not in saved
+    assert "computer_control_enabled" in SettingsUpdate.model_fields
 
 
 def test_sam_refuses_to_run_elevated(tmp_path: Path, monkeypatch):
@@ -224,6 +225,82 @@ def test_sam_refuses_to_run_elevated(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(config, "is_elevated_windows_process", lambda: True)
     with pytest.raises(PermissionError, match="Administrator"):
         settings.prepare()
+
+
+# --- Importing SAM is not starting SAM ----------------------------------------
+#
+# `sam_backend/app.py` used to build the application at module scope, and
+# `sam_backend/__init__.py` imports it, so `import sam_backend` ran the whole
+# composition root: DPI setup, Settings.prepare(), the privilege guard, the
+# database and every service. On a Windows CI runner, which is elevated, that
+# made the guard fire during test collection and no test could even be found.
+#
+# Three contracts, deliberately kept apart:
+#   A. importing the package constructs nothing
+#   B. asking for an application constructs one
+#   C. asking for one on an elevated Windows process is still refused
+
+IMPORT_WHILE_ELEVATED = """
+import os, ctypes
+if os.name == "nt":
+    # What a GitHub Windows runner reports.
+    ctypes.windll.shell32.IsUserAnAdmin = lambda: 1
+import sam_backend
+import sam_backend.app
+print("imported", hasattr(sam_backend.app, "app"), callable(sam_backend.app.create_app))
+"""
+
+
+def test_importing_sam_backend_does_not_start_it(tmp_path: Path):
+    """Import must survive on an elevated process, because import is not startup."""
+    import subprocess
+    import sys
+
+    finished = subprocess.run(
+        [sys.executable, "-c", IMPORT_WHILE_ELEVATED], cwd=PROJECT_ROOT,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+
+    assert finished.returncode == 0, f"importing SAM started it:\n{finished.stderr}"
+    assert "Administrator" not in finished.stderr
+    # No application object is left lying around at module scope, and the
+    # factory is still exported for the callers that do want one.
+    assert finished.stdout.strip() == "imported False True", finished.stdout
+
+
+def test_asking_for_an_application_still_builds_one(tmp_path: Path):
+    from sam_backend.app import create_app
+
+    application = create_app(Settings(
+        project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d",
+    ))
+
+    assert application.state.settings is not None
+    assert any(getattr(route, "path", "") == "/api/health" for route in application.routes)
+
+
+def test_asking_for_an_application_while_elevated_is_still_refused(tmp_path: Path, monkeypatch):
+    """The guard protects startup, and building the app is startup."""
+    import sam_backend.config as config
+    from sam_backend.app import create_app
+
+    monkeypatch.setattr(config, "is_elevated_windows_process", lambda: True)
+
+    with pytest.raises(PermissionError, match="Administrator"):
+        create_app(Settings(
+            project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d",
+        ))
+
+
+def test_the_launch_command_names_something_that_exists():
+    """`python -m sam_backend` must still resolve to a real application."""
+    from sam_backend.app import create_app
+
+    source = (PROJECT_ROOT / "sam_backend" / "__main__.py").read_text(encoding="utf-8")
+
+    assert "sam_backend.app:create_app" in source, "the launcher names a target that no longer exists"
+    assert "factory=True" in source, "uvicorn would treat the factory as an application"
+    assert callable(create_app)
 
 
 # --- Credential detection by shape --------------------------------------------

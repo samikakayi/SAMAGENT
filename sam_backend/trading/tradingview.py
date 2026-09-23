@@ -5,13 +5,12 @@ import hashlib
 import io
 import os
 import re
-import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..contracts import CapabilityState, ExecutionStatus, StandardResult
+from ..contracts import ExecutionStatus, StandardResult
 from .types import normalize_timeframe, pick_visible_interval
 
 
@@ -34,7 +33,6 @@ class TradingViewState:
     chart_type: str | None = None
     visible_price_range: dict[str, float] | None = None
     visible_time_range: dict[str, str] | None = None
-    chart_geometry: dict[str, int] | None = None
     price_scale_geometry: dict[str, int] | None = None
     time_scale_geometry: dict[str, int] | None = None
     visible_indicators: list[str] = field(default_factory=list)
@@ -52,9 +50,7 @@ class TradingViewController:
         self.data_dir = data_dir
         self.computer_control = computer_control
         self.screen_access = screen_access
-        self._lock = threading.RLock()
         self._last_verified_timeframe: dict[int, str] = {}
-        self._calibration: dict[int, dict[str, float]] = {}
 
     @staticmethod
     def _modules():
@@ -736,42 +732,3 @@ class TradingViewController:
             )
         except Exception as exc:
             return StandardResult.failure(str(exc), executed=True, error_code="SCREEN_CAPTURE_FAILED", started_at=started)
-
-    def calibrate(self, price_a: float, y_a: float, price_b: float, y_b: float) -> StandardResult:
-        started = time.perf_counter()
-        state = self.observe()
-        if not state.window_handle:
-            return StandardResult.failure("TradingView window was not found", error_code="WINDOW_NOT_FOUND", started_at=started)
-        if not all(map(lambda value: isinstance(value, (int, float)), (price_a, y_a, price_b, y_b))) or y_a == y_b or price_a == price_b:
-            return StandardResult.failure("Two distinct price/Y anchors are required", error_code="INVALID_CALIBRATION", started_at=started)
-        slope = (price_b - price_a) / (y_b - y_a)
-        intercept = price_a - slope * y_a
-        round_trip_a = slope * y_a + intercept
-        round_trip_b = slope * y_b + intercept
-        verified = abs(round_trip_a - price_a) < 1e-9 and abs(round_trip_b - price_b) < 1e-9
-        self._calibration[state.window_handle] = {"slope": slope, "intercept": intercept, "created_at": time.time()}
-        return StandardResult.success({"window_handle": state.window_handle, "slope": slope, "intercept": intercept}, verified=verified, started_at=started)
-
-    def price_to_screen(self, price: float) -> StandardResult:
-        state = self.observe()
-        calibration = self._calibration.get(state.window_handle or -1)
-        if calibration is None:
-            return StandardResult.failure("Chart is not calibrated", error_code="CALIBRATION_REQUIRED")
-        y = (price - calibration["intercept"]) / calibration["slope"]
-        return StandardResult.success({"price": price, "y": y}, verified=math_is_finite(y))
-
-    def drawing_capability(self) -> dict[str, Any]:
-        state = self.observe()
-        calibrated = bool(state.window_handle and state.window_handle in self._calibration)
-        return {
-            "state": CapabilityState.PARTIALLY_AVAILABLE.value if state.interactive else CapabilityState.UNAVAILABLE.value,
-            "semantic_commands": ["horizontal_line", "trend_line", "vertical_line", "rectangle", "fibonacci", "undo", "redo", "save_layout", "go_to_date"],
-            "calibrated": calibrated,
-            "verified_price_drawing": calibrated and self.screen_access and self.computer_control,
-            "reason": None if calibrated else "Price-specific drawing is blocked until chart calibration is verified.",
-            "timeframe_ocr": bool(self.screen_access),
-        }
-
-
-def math_is_finite(value: float) -> bool:
-    return value == value and value not in {float("inf"), float("-inf")}

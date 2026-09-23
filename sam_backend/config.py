@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import ctypes
 import os
+import re
 import threading
 
 GLOBAL_ABORT_EVENT = threading.Event()
@@ -22,6 +22,17 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _default_project_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+# A fallback is between real providers. These words name a test double rather
+# than a model anyone can bill, so one of them reaching a live configuration
+# means an operator would be running on nothing.
+PLACEHOLDER_MODEL_WORDS = frozenset({"fake", "mock", "stub", "dummy", "scripted", "test", "noop"})
+
+
+def is_placeholder_model(model: str) -> bool:
+    """Whether a model identifier names a test double rather than a real model."""
+    return any(word in PLACEHOLDER_MODEL_WORDS for word in re.split(r"[/:._-]+", model.strip().lower()))
 
 
 def is_elevated_windows_process() -> bool:
@@ -212,16 +223,3 @@ class Settings:
         result["openrouter_configured"] = bool(self.openrouter_api_key)
         result["litellm_key_configured"] = bool(self.litellm_api_key)
         return result
-
-    def save_public_overrides(self, values: dict[str, Any]) -> None:
-        allowed = {
-            "default_provider", "default_model", "model_mode", "openai_model", "permission_mode",
-            "openrouter_fast_model", "openrouter_strong_model", "openrouter_vision_model",
-            "fallback_model", "fallback_enabled",
-            "max_tool_iterations", "command_timeout_seconds", "daily_budget_usd", "monthly_budget_usd",
-            "computer_control_enabled", "screen_access_enabled", "default_trading_theory", "minimum_rr",
-            "voice_mode", "voice_language", "voice_vad_threshold", "voice_silence_ms", "voice_wake_word",
-            "sorani_speaker_id",
-        }
-        payload = {key: value for key, value in values.items() if key in allowed}
-        (self.data_dir / "settings.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -251,8 +251,8 @@ def test_model_discovery_endpoints_bound_slow_offline_providers(client, monkeypa
                 raise
             return [{"id": "should-not-arrive"}]
 
-    app_module = importlib.import_module("sam_backend.app")
-    monkeypatch.setattr(app_module, "MODEL_DISCOVERY_TIMEOUT_SECONDS", 0.01)
+    provider_routes = importlib.import_module("sam_backend.api.providers")
+    monkeypatch.setattr(provider_routes, "MODEL_DISCOVERY_TIMEOUT_SECONDS", 0.01)
     adapter = SlowOfflineAdapter()
     client.app.state.adapters.adapter = adapter
 

@@ -288,3 +288,370 @@ def test_the_page_makes_no_third_party_requests():
 def test_the_font_stack_has_local_fallbacks():
     styles = (PROJECT_ROOT / "frontend" / "styles.css").read_text(encoding="utf-8")
     assert "Segoe UI" in styles or "system-ui" in styles or "ui-sans-serif" in styles
+
+
+def test_the_manual_calibrate_endpoint_feeds_the_store_drawing_reads(tmp_path: Path):
+    """End to end through the unchanged route: POST anchors, then drawing is unblocked.
+
+    The endpoint, its method and its response keys are exactly as before; only
+    where the values land has changed.
+    """
+    from fastapi.testclient import TestClient
+
+    from sam_backend.app import create_app
+    from sam_backend.config import Settings
+    from sam_backend.trading.calibration import geometry_hash
+
+    geometry = {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+
+    class Window:
+        window_handle = 7
+        symbol = "XAUUSD"
+        timeframe = "M15"
+        client_geometry = geometry
+        window_geometry = geometry
+        active = True
+        title = "TradingView"
+        current_price = 2500.0
+
+        def as_dict(self):
+            return {"symbol": self.symbol, "timeframe": self.timeframe}
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "workspace",
+                        data_dir=tmp_path / "data", default_provider="ollama", default_model="fake")
+    app = create_app(settings)
+    trading = app.state.trading
+    # The engine is handed its observer at construction, so that is where a
+    # stand-in window goes; patching the controller afterwards would not reach it.
+    trading.drawing._observe = lambda: Window()
+
+    with TestClient(app) as client:
+        response = client.post("/api/tradingview/action", json={
+            "action": "calibrate", "price_a": 3000.0, "y_a": 100.0, "price_b": 2000.0, "y_b": 600.0,
+        })
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["verified"] is True
+    assert {"window_handle", "slope", "intercept"} <= set(body["data"]), "response shape preserved"
+    assert body["data"]["slope"] == pytest.approx(-2.0)
+
+    # The calibration the drawing engine consults is now present.
+    calibration, failure = trading.drawing.active_calibration(Window())
+    assert failure is None and calibration.verified
+    assert calibration.price_at(350.0) == pytest.approx(2500.0)
+    stored = trading.database.get_chart_calibration(
+        window_handle=7, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(geometry))
+    assert stored["method"] == "manual_anchors"
+
+
+def test_the_manual_calibrate_endpoint_still_validates_its_anchors(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    from sam_backend.app import create_app
+    from sam_backend.config import Settings
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "workspace",
+                        data_dir=tmp_path / "data", default_provider="ollama", default_model="fake")
+    with TestClient(create_app(settings)) as client:
+        missing = client.post("/api/tradingview/action", json={"action": "calibrate", "price_a": 3000.0})
+
+    assert missing.status_code == 400 and "required" in missing.json()["detail"]
+
+
+# --- The TradingView card ---------------------------------------------------------
+#
+# Found live: the API reported calibrated=true and verified_price_drawing=true
+# for a real XAUUSD chart while the panel still read "Unavailable until verified
+# chart calibration". The panel gated on `state.chart_geometry`, a field of
+# TradingViewState that observe() never assigns, so it was always null. Since
+# then the card also had to stop depending on the broker feed that shares the
+# status endpoint: one request at a time, given up before the next tick, and an
+# observation that never waits on it.
+#
+# The card is driven through the real panels.js by tests/render_tradingview_panel.js:
+# SAMTrading entry points fired per poll on a virtual clock, against scripted replies.
+
+STATE, STATUS = "/api/tradingview/state", "/api/trading/status"
+DRAWING_ROW = "tv-drawing-state"
+AVAILABLE = "Verified price drawing available"
+UNAVAILABLE = "Unavailable until verified chart calibration"
+UNREACHABLE = "Unavailable; the drawing engine could not be reached"
+PAGE_LOAD = ["tradingView", "toolStatus"]  # what DOMContentLoaded fires together
+PANEL_GEOMETRY = {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+TOOL_PAGES = {
+    "/api/tools/manifests": {"body": {"tools": [{"name": "read_file"}, {"name": "write_file"}, {"name": "analyze_market"}]}},
+    "/api/health": {"body": {"computer_control": True}},
+    "/api/desktop/status": {"body": {"tradingview": {"interactive": True, "running": True}}},
+}
+
+
+def observed_state(**overrides):
+    """A real TradingViewState, so the payload keys are the production ones."""
+    from sam_backend.trading.tradingview import TradingViewState
+
+    fields = dict(
+        running=True, process_ids=[4242], window_handle=919736, title="XAUUSD ▼ 4,310.55",
+        symbol="XAUUSD", feed="OANDA", timeframe="M15", timeframe_verified=True,
+        current_price=4310.55, window_geometry=PANEL_GEOMETRY, monitor={"name": r"\.\DISPLAY1"},
+        active=True, interactive=True, client_geometry=PANEL_GEOMETRY,
+    )
+    fields.update(overrides)
+    return TradingViewState(**fields)
+
+
+def calibrated_service(tmp_path, *, calibrated=True, permitted=True, viewport_moved=False, window=True):
+    """A real TradingService over a fake window, its drawing engine calibrated for it.
+
+    The verdict then comes from DrawingEngine.capability() over a real database,
+    not from a dict written to look like one.
+    """
+    from sam_backend.cancellation import CancellationManager
+    from sam_backend.config import Settings
+    from sam_backend.db import Database
+    from sam_backend.trading.calibration import geometry_hash
+    from sam_backend.trading.service import TradingService
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "workspace", data_dir=tmp_path / "data")
+    settings.prepare()
+    database = Database(settings.database_path)
+    trading = TradingService(settings, database, CancellationManager())
+    state = observed_state(**({} if window else {"window_handle": None, "active": False}))
+    trading.tradingview.observe = trading.drawing._observe = lambda: state
+    trading.drawing.computer_control = trading.drawing.screen_access = permitted
+    if calibrated:
+        # Calibrated for the viewport the chart had; optionally it has since moved.
+        stored = dict(PANEL_GEOMETRY, right=1400) if viewport_moved else PANEL_GEOMETRY
+        database.save_chart_calibration(
+            window_handle=919736, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(stored),
+            slope=-0.2556, intercept=4485.04, method="price_axis_ocr", verified=True, axis_x=1100.0,
+        )
+    return trading
+
+
+def chart_replies(trading):
+    """What the two endpoints answer for that service's chart."""
+    return {STATE: {"body": trading.tradingview.observe().as_dict()},
+            STATUS: {"body": {"drawing": trading.drawing.capability()}}}
+
+
+def observation(price):
+    return {"body": observed_state(current_price=price).as_dict()}
+
+
+def broker(calibrated=True):
+    return {"body": {"market_data": {"metatrader5": {"state": "AVAILABLE"}},
+                     "drawing": {"calibrated": calibrated, "verified_price_drawing": calibrated}}}
+
+
+def poll_panel(tmp_path, polls):
+    """Run the real panels.js through the scenario and report what it displayed."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({"polls": polls}, default=str), encoding="utf-8")
+    finished = subprocess.run(
+        [node, str(Path(__file__).parent / "render_tradingview_panel.js"),
+         str(PROJECT_ROOT / "frontend" / "panels.js"), str(scenario)],
+        check=True, capture_output=True, text=True, encoding="utf-8",
+    )
+    return json.loads(finished.stdout)
+
+
+def render_once(tmp_path, responses):
+    return poll_panel(tmp_path, [{"responses": responses}])["rendered"]
+
+
+# -- the drawing row reports the engine's verdict ------------------------------------
+
+
+def test_a_calibrated_chart_is_not_reported_as_uncalibrated(tmp_path):
+    """The live defect: the backend said yes and the panel said no."""
+    trading = calibrated_service(tmp_path)
+    assert trading.drawing.capability()["verified_price_drawing"] is True
+
+    assert render_once(tmp_path, chart_replies(trading))[DRAWING_ROW] == AVAILABLE
+
+
+def test_an_uncalibrated_chart_still_reads_unavailable(tmp_path):
+    trading = calibrated_service(tmp_path, calibrated=False)
+
+    assert render_once(tmp_path, chart_replies(trading))[DRAWING_ROW] == UNAVAILABLE
+
+
+def test_calibration_without_permission_never_claims_verified_drawing(tmp_path):
+    """Calibrated, but screen access and computer control are off."""
+    trading = calibrated_service(tmp_path, permitted=False)
+    assert trading.drawing.capability()["calibrated"] is True
+
+    shown = render_once(tmp_path, chart_replies(trading))[DRAWING_ROW]
+
+    assert shown == "Chart calibrated; desktop control permission still required"
+
+
+def test_a_moved_viewport_invalidates_the_panel_row(tmp_path):
+    """The stored calibration belongs to a chart geometry that no longer holds."""
+    trading = calibrated_service(tmp_path, viewport_moved=True)
+
+    assert render_once(tmp_path, chart_replies(trading))[DRAWING_ROW] == UNAVAILABLE
+
+
+def test_no_chart_window_reads_unavailable(tmp_path):
+    trading = calibrated_service(tmp_path, window=False)
+
+    assert render_once(tmp_path, chart_replies(trading))[DRAWING_ROW] == UNAVAILABLE
+
+
+def test_chart_geometry_is_gone_from_the_state_and_the_panel():
+    """It was never assigned, and it shadowed DrawingEngine.chart_geometry().
+
+    A reader who found `state.chart_geometry` reasonably assumed it held the
+    engine's answer; it held null, and the panel believed it.
+    """
+    import dataclasses
+
+    from sam_backend.trading.tradingview import TradingViewState
+
+    names = {field.name for field in dataclasses.fields(TradingViewState)}
+    assert "chart_geometry" not in names
+    assert "client_geometry" in names, "the geometry observe() does populate stays"
+    script = (PROJECT_ROOT / "frontend" / "panels.js").read_text(encoding="utf-8")
+    assert "chart_geometry" not in script, "the panel still gates on a field that is never sent"
+
+
+# -- the verdict does not depend on the broker -------------------------------------------
+
+
+def test_a_broken_metatrader_does_not_erase_the_chart_verdict(tmp_path):
+    """MT5 failing is reported as data; the drawing engine still answers."""
+    from sam_backend.trading.market_data import MarketDataError
+
+    trading = calibrated_service(tmp_path)
+    provider = trading.market_data.providers["metatrader5"]
+
+    def dead(*args, **kwargs):
+        # What the provider raises when the terminal is absent or unreachable.
+        raise MarketDataError("MetaTrader 5 terminal is not running")
+
+    provider.fetch = provider._module = dead
+
+    payload = trading.status()
+
+    assert payload["market_data"]["metatrader5"]["state"] == "UNAVAILABLE"
+    assert payload["capabilities"]["state"] == "UNAVAILABLE"
+    assert "not running" in payload["capabilities"]["error"]
+    assert payload["drawing"]["verified_price_drawing"] is True, "the part the panel needs was lost"
+
+    shown = render_once(tmp_path, {STATE: {"body": payload["tradingview"]}, STATUS: {"body": payload}})
+    assert shown[DRAWING_ROW] == AVAILABLE
+    assert shown["tv-observed-symbol"] == "XAUUSD"
+
+
+def test_a_status_payload_without_a_drawing_verdict_invents_none(tmp_path):
+    shown = render_once(tmp_path, {STATE: observation(1.0), STATUS: {"body": {"tradingview": observation(1.0)["body"]}}})
+
+    assert shown[DRAWING_ROW] == UNREACHABLE
+    assert shown["tv-observed-symbol"] == "XAUUSD"
+
+
+def test_losing_the_chart_observation_retires_the_previous_verdict(tmp_path):
+    """A verdict from an earlier tick describes a chart no longer being observed."""
+    shown = render_once(tmp_path, {STATE: {"status": 500, "body": {"detail": "window gone"}}, STATUS: broker()})
+
+    assert shown["tradingview-status"] == "UNAVAILABLE"
+    assert shown[DRAWING_ROW] == UNREACHABLE, "left a stale availability claim standing"
+
+
+# -- one broker-status request at a time, and the observation never waits on it ---------
+
+
+def test_observation_keeps_refreshing_while_the_broker_hangs(tmp_path):
+    polls = [{"responses": {STATE: observation(price), STATUS: {"hang": True}}} for price in (1.0, 2.0, 3.0)]
+
+    result = poll_panel(tmp_path, polls)
+
+    for poll, price in zip(result["polls"], ("1.00", "2.00", "3.00")):
+        assert STATE in poll["requested"], "the observation stopped being asked for"
+        assert poll["rendered"]["tv-observed-price"] == price
+    # A stall is reported as not reached, not as a stale verdict or a calibration claim.
+    assert result["rendered"][DRAWING_ROW] == UNREACHABLE
+    assert result["errors"] == [], f"console noise: {result['errors']}"
+
+
+def test_a_hung_broker_at_page_load_still_yields_one_request_per_tick(tmp_path):
+    hung = {**TOOL_PAGES, STATE: observation(1.0), STATUS: {"hang": True}}
+
+    result = poll_panel(tmp_path, [{"responses": hung, "fire": PAGE_LOAD}, {}, {}])
+
+    assert result["maxInFlight"][STATUS] == 1, result["maxInFlight"]
+    assert result["requested"].count(STATUS) == 3, "one request per tick, including the load"
+    assert result["rendered"][DRAWING_ROW] == UNREACHABLE
+    assert result["rendered"]["tool-status-mt5"] == "Unknown", "a badge claimed a broker state it never received"
+    assert result["rendered"]["tool-status-files"] == "● Available", "an unreachable broker blanked unrelated badges"
+    assert result["errors"] == []
+
+
+def test_a_refresh_inside_the_timeout_window_reuses_the_pending_request(tmp_path):
+    """tradingViewAction refreshes immediately; it must not open a second broker request."""
+    hung = {STATE: observation(1.0), STATUS: {"hang": True}}
+
+    result = poll_panel(tmp_path, [{"responses": hung, "advanceMs": 3_000}, {"advanceMs": 3_000}, {}])
+
+    assert result["maxInFlight"][STATUS] == 1, result["maxInFlight"]
+    assert result["requested"].count(STATUS) == 1, "each early refresh opened its own request"
+    assert result["requested"].count(STATE) == 3, "the observation itself must still refresh"
+
+
+def test_a_slow_old_answer_cannot_overwrite_a_newer_one(tmp_path):
+    """Request A is slow and says "available"; B, asked later, says "not calibrated"."""
+    polls = [{"responses": {STATE: observation(1.0), STATUS: dict(broker(True), delayMs=15_000)}},
+             {"responses": {STATE: observation(2.0), STATUS: broker(False)}}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["rendered"][DRAWING_ROW] != AVAILABLE, "a stale broker answer overwrote the newer one"
+    assert result["rendered"]["tv-observed-price"] == "2.00"
+
+
+def test_a_controlled_broker_error_releases_the_next_poll(tmp_path):
+    """Not being able to ask is not the same answer as "not calibrated"."""
+    polls = [{"responses": {STATE: observation(1.0), STATUS: {"status": 500, "body": {"detail": "broker down"}}}},
+             {"responses": {STATE: observation(2.0), STATUS: broker()}}]
+
+    result = poll_panel(tmp_path, polls)
+
+    first, second = result["polls"]
+    assert first["rendered"][DRAWING_ROW] == UNREACHABLE
+    assert first["rendered"]["tv-observed-symbol"] == "XAUUSD", "the observation needs no broker"
+    assert second["requested"].count(STATUS) == 1
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE
+
+
+def test_the_broker_recovers_without_a_reload(tmp_path):
+    """Hung ticks, then the broker answers; no lock may outlive the stall."""
+    hung = {**TOOL_PAGES, STATE: observation(1.0), STATUS: {"hang": True}}
+    polls = [{"responses": hung, "fire": PAGE_LOAD}, {},
+             {"responses": {**TOOL_PAGES, STATE: observation(3.0), STATUS: broker()}}]
+
+    result = poll_panel(tmp_path, polls)
+
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE, result["rendered"][DRAWING_ROW]
+    assert result["inFlight"].get(STATUS, 0) == 0, "an unanswered request was left in flight"
+    assert result["errors"] == []
+    # Only the card is on the interval; the badge was drawn once, at load, with the honest answer it got.
+    assert result["rendered"]["tool-status-mt5"] == "Unknown"
+
+
+def test_page_load_asks_the_broker_once_for_both_the_badge_and_the_verdict(tmp_path):
+    responses = {**TOOL_PAGES, STATE: observation(1.0), STATUS: broker()}
+
+    result = poll_panel(tmp_path, [{"responses": responses, "fire": PAGE_LOAD}])
+
+    assert result["requested"].count(STATUS) == 1, result["requested"]
+    assert result["rendered"]["tool-status-mt5"] == "● Connected read-only"
+    assert result["rendered"][DRAWING_ROW] == AVAILABLE
+    assert result["rendered"]["tool-status-files"] == "● Available"

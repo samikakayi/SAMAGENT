@@ -120,7 +120,12 @@ class AgentTask:
     events: list[TaskEvent] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
     modified_files: list[str] = field(default_factory=list)
+    # Every validation attempt, plus the raw output of the agent's own
+    # run_tests calls -- the history a re-planning run leaves behind.
     test_results: list[dict[str, Any]] = field(default_factory=list)
+    # The verdict that decided completion: the last verification report, or
+    # None when the run ended before anything could be verified.
+    verification: dict[str, Any] | None = None
     errors: list[str] = field(default_factory=list)
     tool_calls: int = 0
     retries: int = 0
@@ -158,6 +163,14 @@ class AgentTask:
         payload["events"] = payload["events"][-event_limit:]
         payload["event_count"] = len(self.events)
         return payload
+
+
+VERIFIED_STATUS = "completed_verified"
+
+
+def _unevidenced_claim(completion_status: Any, verification: Any) -> bool:
+    """A record asserting it was verified with nothing to show for it."""
+    return completion_status == VERIFIED_STATUS and verification is None
 
 
 class TaskStore:
@@ -202,9 +215,26 @@ class TaskStore:
         return task
 
     def save(self, task: AgentTask) -> AgentTask:
-        task.updated_at = time.time()
-        payload = json.dumps(task.as_dict())
         with self.database.write() as connection:
+            # The one authoritative rule: a run may not claim it was verified
+            # without the report that says so. The sole exception is a row
+            # that already made that claim before the rule existed -- it has
+            # to stay writable or rolling it back would fail -- and whether
+            # that applies is read from the stored row, never from the
+            # caller, so no field on the task in hand can grant it. Repairing
+            # such a row therefore ends the exemption by itself.
+            if _unevidenced_claim(task.completion_status, task.verification):
+                row = connection.execute(
+                    "SELECT payload_json FROM agent_tasks WHERE id = ?", (task.id,)
+                ).fetchone()
+                stored = json.loads(row["payload_json"]) if row else {}
+                if not _unevidenced_claim(stored.get("completion_status"), stored.get("verification")):
+                    raise ValueError(
+                        f"{task.id} cannot be saved as {VERIFIED_STATUS} "
+                        "without the verification report that earned it"
+                    )
+            task.updated_at = time.time()
+            payload = json.dumps(task.as_dict())
             connection.execute(
                 """
                 INSERT INTO agent_tasks (id, conversation_id, goal, state, payload_json, created_at, updated_at)
@@ -312,6 +342,7 @@ def _from_payload(payload: str) -> AgentTask:
         observations=list(data.get("observations") or []),
         modified_files=list(data.get("modified_files") or []),
         test_results=list(data.get("test_results") or []),
+        verification=data.get("verification"),
         errors=list(data.get("errors") or []),
         tool_calls=int(data.get("tool_calls") or 0),
         retries=int(data.get("retries") or 0),

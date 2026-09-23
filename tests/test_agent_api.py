@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from pathlib import Path
@@ -21,7 +22,8 @@ class ScriptedAdapter:
         self.executor_turns = 0
 
     async def list_models(self):
-        return [{"id": "fake", "name": "fake", "provider": "ollama"}]
+        return [{"id": "fake", "name": "fake", "provider": "ollama"},
+                {"id": "spare", "name": "spare", "provider": "ollama"}]
 
     async def complete(self, messages, tools, model):
         joined = "\n".join(str(item.get("content", "")) for item in messages)
@@ -93,6 +95,36 @@ def test_a_task_can_be_started_and_followed_to_completion(agent_client: TestClie
     assert task["state"] == "COMPLETED", task.get("summary")
     assert task["completion_status"] == "completed_verified"
     assert (Path(agent_settings.workspace_root) / "report.txt").read_text(encoding="utf-8") == "done"
+    # The API hands the panel the evidence, not just the label: a verified
+    # task can never serialise its verdict as null.
+    assert task["verification"] is not None and task["verification"]["verified"] is True
+    # The list stays a headline projection; its label must not disagree with
+    # the evidence the detail carries.
+    listed = next(item for item in agent_client.get("/api/tasks").json()["tasks"] if item["id"] == task_id)
+    assert listed["completion_status"] == "completed_verified"
+
+
+def test_a_legacy_verified_row_serialises_faithfully(agent_client: TestClient):
+    """History is served as it was recorded -- no crash, no invented verdict."""
+    from sam_backend.db import Database
+    from sam_backend.tasks import TaskStore
+
+    store = TaskStore(Database(agent_client.app.state.settings.database_path))
+    task = store.create("An older run")
+    stale = task.as_dict() | {"completion_status": "completed_verified", "verification": None,
+                              "state": "COMPLETED"}
+    with store.database.write() as connection:
+        connection.execute("UPDATE agent_tasks SET payload_json=?, state=? WHERE id=?",
+                           (json.dumps(stale), "COMPLETED", task.id))
+
+    body = agent_client.get(f"/api/tasks/{task.id}")
+
+    assert body.status_code == 200
+    served = body.json()["task"]
+    assert served["completion_status"] == "completed_verified"
+    assert served["verification"] is None
+    assert "legacy_unverified_claim" not in served
+    assert any(item["id"] == task.id for item in agent_client.get("/api/tasks").json()["tasks"])
 
 
 def test_a_running_task_appears_in_the_task_list(agent_client: TestClient):
@@ -204,6 +236,95 @@ def test_a_quota_blocked_primary_is_reported_with_its_fallback(agent_client: Tes
     assert body["primary"]["availability"] == "UNAVAILABLE_QUOTA" and "no paid credit" in body["primary"]["reason"]
     assert body["fallback"]["model"] == "spare" and body["fallback"]["usable"] is True
     assert "fake is unavailable" in body["fallback_reason"]
+
+
+# -- fallback configured at runtime, not at startup ------------------------
+
+def quota_block_primary(client: TestClient) -> None:
+    """Make the configured model unavailable the way a spent account would."""
+    from sam_backend.provider_health import Availability, ModelCapability
+
+    client.app.state.orchestrator.health.remember(ModelCapability(
+        "ollama", "fake", Availability.UNAVAILABLE_QUOTA, "no paid credit",
+        supports_tools=True, context_length=200_000, cost_class="paid",
+    ))
+
+
+def resolution_of(client: TestClient) -> dict:
+    quota_block_primary(client)
+    return client.get("/api/providers/resolution").json()["resolution"]
+
+
+def test_fallback_is_switched_on_and_off_through_the_api_with_no_restart(agent_client: TestClient):
+    """The whole point: the running process changes which model a run uses."""
+    assert agent_client.put("/api/settings", json={"fallback_model": "spare"}).status_code == 200
+    disabled = resolution_of(agent_client)
+    assert disabled["blocked"] is True and "fallback is disabled" in disabled["fallback_reason"]
+
+    assert agent_client.put("/api/settings", json={"fallback_enabled": True}).status_code == 200
+    engaged = resolution_of(agent_client)
+    assert engaged["blocked"] is False and engaged["fallback_engaged"] is True
+    assert engaged["active"]["model"] == "spare"
+
+    assert agent_client.put("/api/settings", json={"fallback_enabled": False}).status_code == 200
+    assert resolution_of(agent_client)["blocked"] is True
+
+
+def test_a_run_started_after_the_change_uses_the_newly_configured_fallback(agent_client: TestClient):
+    agent_client.put("/api/settings", json={"fallback_model": "spare", "fallback_enabled": True})
+    quota_block_primary(agent_client)
+
+    task_id = agent_client.post("/api/tasks", json={"goal": "Create a report file"}).json()["task_id"]
+    task = wait_for_state(agent_client, task_id)
+
+    assert task["state"] == "COMPLETED"
+    switch = [event for event in task["events"] if event["kind"] == "fallback"]
+    assert len(switch) == 1 and "spare" in switch[0]["message"]
+
+
+def test_renaming_the_fallback_drops_the_verdict_cached_for_the_old_one(agent_client: TestClient):
+    from sam_backend.provider_health import Availability, ModelCapability
+
+    health = agent_client.app.state.orchestrator.health
+    stale = ModelCapability("ollama", "spare", Availability.UNAVAILABLE_QUOTA, "spent an hour ago")
+    health.remember(stale)
+    agent_client.put("/api/settings", json={"fallback_model": "spare"})
+    assert health.cached("ollama", "spare") is None, "a changed model is re-checked, not inherited"
+
+    # Toggling the switch changes no verdict, so nothing usable is thrown away.
+    health.remember(ModelCapability("ollama", "spare", Availability.AVAILABLE,
+                                    supports_tools=True, context_length=200_000))
+    agent_client.put("/api/settings", json={"fallback_enabled": True})
+    assert health.cached("ollama", "spare") is not None
+
+
+@pytest.mark.parametrize("payload, status", [
+    ({"fallback_model": "nvidia/nemotron-3-ultra-550b-a55b:free"}, 200),
+    ({"fallback_model": "   "}, 200),               # blank clears it
+    ({"fallback_model": "not a model id"}, 422),    # not an identifier
+    ({"fallback_model": "vendor/mock-model"}, 422),  # a test double, not a model
+    ({"fallback_model": "fake"}, 422),
+    ({"fallback_enabled": "sometimes"}, 422),
+    ({"fallback_enabled": True}, 422),              # armed with nothing behind it
+])
+def test_fallback_settings_are_validated_before_they_take_effect(agent_client: TestClient, payload, status):
+    assert agent_client.put("/api/settings", json=payload).status_code == status
+
+
+def test_fallback_settings_are_persisted_and_survive_a_restart(agent_settings: Settings):
+    with TestClient(create_app(agent_settings, ScriptedRegistry())) as client:
+        client.put("/api/settings", json={"fallback_model": "spare", "fallback_enabled": True})
+        body = client.get("/api/settings").json()
+        assert body["overrides"]["fallback_model"] == "spare"
+        assert body["runtime"]["fallback_enabled"] is True
+        assert not any("api_key" in key for key in body["runtime"]), "no credential is returned"
+
+    # A second process reading the same store: the persisted value wins over
+    # the environment default the Settings object started with.
+    restarted = dataclasses.replace(agent_settings, fallback_model="", fallback_enabled=False)
+    with TestClient(create_app(restarted, ScriptedRegistry())) as client:
+        assert client.get("/api/settings").json()["runtime"]["fallback_model"] == "spare"
+    assert restarted.fallback_enabled is True
 
 
 def test_the_resolution_endpoint_is_served_from_cache_unless_refreshed(agent_client: TestClient):

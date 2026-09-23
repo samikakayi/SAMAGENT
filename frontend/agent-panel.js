@@ -208,6 +208,12 @@
         background: transparent; color: var(--muted); font: inherit; font-size: 10.5px; cursor: pointer;
       }
       .agent-model button:hover { background: var(--panel-hover); color: var(--text); }
+      .agent-verdict {
+        margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 10px;
+        font-weight: 600; letter-spacing: 0.02em; border: 1px solid var(--line); color: var(--muted);
+      }
+      .agent-verdict.ok { color: var(--ok, #3fb950); border-color: currentColor; }
+      .agent-verdict.warn { color: var(--warn, #d29922); border-color: currentColor; }
       .agent-summary {
         font-size: 12px; line-height: 1.55; color: var(--text-soft); white-space: pre-wrap;
         padding: 10px 11px; background: var(--panel-raised); border: 1px solid var(--line);
@@ -277,7 +283,7 @@
           <ul class="agent-files" id="agent-files"></ul>
         </div>
         <div class="agent-section" id="agent-summary-section" hidden>
-          <h4>Result</h4>
+          <h4>Result <span class="agent-verdict" id="agent-verdict" hidden></span></h4>
           <div class="agent-summary" id="agent-summary"></div>
         </div>
         <div class="agent-section">
@@ -652,11 +658,32 @@
       .join("");
   }
 
+  // The headline verdict, read from the same report that decided completion.
+  // The prose summary below it stays the detailed record.
+  function renderVerdict(task) {
+    const node = document.getElementById("agent-verdict");
+    const report = task.verification;
+    if (!node) return;
+    if (!report || !task.terminal) {
+      node.hidden = true;
+      return;
+    }
+    const ran = (report.checks || []).filter((check) => check.outcome !== "SKIPPED");
+    const passed = ran.filter((check) => check.outcome === "PASSED").length;
+    const failed = ran.length - passed;
+    node.hidden = false;
+    node.className = `agent-verdict ${report.verified ? "ok" : "warn"}`;
+    node.textContent = ran.length
+      ? `${report.verified ? "Verified" : "Not verified"} · ${passed} passed, ${failed} failed`
+      : "Nothing to verify";
+  }
+
   function renderSummary(task) {
     const section = document.getElementById("agent-summary-section");
     const visible = Boolean(task.summary) && task.terminal;
     section.hidden = !visible;
     if (visible) document.getElementById("agent-summary").textContent = task.summary;
+    renderVerdict(task);
   }
 
   function renderApproval(task) {
@@ -755,6 +782,9 @@
     if (!mount()) return;
     refreshHistory();
     loadModelResolution(false);
+    // Fallback is configured in Settings. Re-read the resolution when it
+    // changes so the strip never shows a rule the backend has stopped applying.
+    document.addEventListener("sam:settings-saved", () => loadModelResolution(false));
     connect();
   }
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 from pathlib import Path
 
 import numpy
@@ -180,13 +181,69 @@ def test_a_pure_tone_is_not_mistaken_for_speech():
 # --- Capability surface -------------------------------------------------------
 
 
+DEVICE_FIELDS = {"index", "name", "channels", "sample_rate", "default"}
+
+
 def test_devices_are_enumerated_with_defaults_marked():
+    """What this machine actually has. A headless host genuinely has no microphone."""
     devices = audio_devices()
     if devices["state"] == CapabilityState.UNCONFIGURED.value:
         pytest.skip("sounddevice is not installed")
-    assert devices["inputs"], "no input devices were found"
+    if not devices["inputs"]:
+        pytest.skip("this machine has no audio input device")
     for device in devices["inputs"]:
-        assert {"index", "name", "channels", "sample_rate", "default"} <= set(device)
+        assert DEVICE_FIELDS <= set(device)
+
+
+def test_an_enumerated_device_is_described_and_the_default_marked(monkeypatch):
+    """The same contract, on any machine: the skip above must not be the only cover.
+
+    Devices are supplied here rather than found, so the shape of an entry and
+    which one is marked default are checked even where no hardware exists.
+    """
+    import sys
+    import types
+
+    sounddevice = types.ModuleType("sounddevice")
+    sounddevice.__spec__ = importlib.machinery.ModuleSpec("sounddevice", loader=None)
+    sounddevice.query_devices = lambda: [
+        {"name": "Array Mic", "max_input_channels": 2, "max_output_channels": 0, "default_samplerate": 48000.0},
+        {"name": "Headset", "max_input_channels": 1, "max_output_channels": 2, "default_samplerate": 44100.0},
+        {"name": "Speakers", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000.0},
+    ]
+    sounddevice.default = types.SimpleNamespace(device=(1, 2))
+    monkeypatch.setitem(sys.modules, "sounddevice", sounddevice)
+
+    devices = audio_devices()
+
+    assert devices["state"] == CapabilityState.AVAILABLE.value
+    assert [device["name"] for device in devices["inputs"]] == ["Array Mic", "Headset"]
+    assert [device["name"] for device in devices["outputs"]] == ["Headset", "Speakers"]
+    for device in devices["inputs"] + devices["outputs"]:
+        assert DEVICE_FIELDS <= set(device)
+    # Exactly the reported default is marked, on each side.
+    assert [device["default"] for device in devices["inputs"]] == [False, True]
+    assert [device["default"] for device in devices["outputs"]] == [False, True]
+    assert devices["inputs"][0]["channels"] == 2 and devices["inputs"][0]["sample_rate"] == 48000
+
+
+def test_no_input_device_is_reported_as_partial_not_available(monkeypatch):
+    """A machine with speakers but no microphone must not claim full availability."""
+    import sys
+    import types
+
+    sounddevice = types.ModuleType("sounddevice")
+    sounddevice.__spec__ = importlib.machinery.ModuleSpec("sounddevice", loader=None)
+    sounddevice.query_devices = lambda: [
+        {"name": "Speakers", "max_input_channels": 0, "max_output_channels": 2, "default_samplerate": 48000.0},
+    ]
+    sounddevice.default = types.SimpleNamespace(device=(-1, 0))
+    monkeypatch.setitem(sys.modules, "sounddevice", sounddevice)
+
+    devices = audio_devices()
+
+    assert devices["inputs"] == []
+    assert devices["state"] == CapabilityState.PARTIALLY_AVAILABLE.value
 
 
 def test_capabilities_expose_every_subsystem(service: VoiceService):

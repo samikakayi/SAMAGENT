@@ -1104,6 +1104,10 @@
               <input class="text-field" id="settings-daily-budget" name="daily_budget_usd" type="number" min="0" max="100000" step="0.1" value="2" />
               <label class="field-label" for="settings-monthly-budget">Monthly cloud budget (USD)</label>
               <input class="text-field" id="settings-monthly-budget" name="monthly_budget_usd" type="number" min="0" max="1000000" step="1" value="30" />
+              <label class="field-label" for="settings-fallback-model">Fallback model</label>
+              <input class="text-field" id="settings-fallback-model" name="fallback_model" placeholder="vendor/model:tag" autocomplete="off" spellcheck="false" />
+              <label class="switch-row"><span><strong>Use the fallback</strong><small>When the default model is unavailable, run on the fallback instead of stopping</small></span><input type="checkbox" name="fallback_enabled" /><i aria-hidden="true"></i></label>
+              <p class="compatibility-note" id="settings-fallback-status">&#8230;</p>
               <div class="settings-callout"><span aria-hidden="true">&#x2139;</span><p>Cloud provider credentials are stored by the backend and are never returned to this interface.</p></div>
             </section>
             <section class="settings-panel" data-settings-section="voice" hidden>

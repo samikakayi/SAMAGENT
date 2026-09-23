@@ -29,6 +29,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .policy import redact_secrets
 from .project_map import ProjectMap
 
 MAX_CAPTURED_CHARS = 20_000
@@ -73,6 +74,12 @@ class CheckResult:
         payload = asdict(self)
         payload["outcome"] = self.outcome.value
         payload["ok"] = self.ok
+        # This view is persisted with the task and rendered in the UI, so
+        # command output that merely looks like a credential is masked. The
+        # attributes stay intact for the re-planner that has to read them.
+        payload["stdout_tail"], _ = redact_secrets(payload["stdout_tail"])
+        payload["stderr_tail"], _ = redact_secrets(payload["stderr_tail"])
+        payload["failures"] = [redact_secrets(item)[0] for item in payload["failures"]]
         return payload
 
 

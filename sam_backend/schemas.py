@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+from .config import is_placeholder_model
 
 
 class ConversationCreate(BaseModel):
@@ -57,6 +60,11 @@ class SettingsUpdate(BaseModel):
     openrouter_fast_model: str | None = None
     openrouter_strong_model: str | None = None
     openrouter_vision_model: str | None = None
+    # The real model a run switches to when the configured one is unavailable.
+    # Blank clears it; the pair is checked together where the current values
+    # are known, because a partial update sees only one half of it.
+    fallback_model: str | None = Field(default=None, max_length=160)
+    fallback_enabled: bool | None = None
     permission_mode: Literal["guarded", "strict", "trusted"] | None = None
     max_tool_iterations: int | None = Field(default=None, ge=1, le=20)
     command_timeout_seconds: int | None = Field(default=None, ge=3, le=300)
@@ -73,6 +81,18 @@ class SettingsUpdate(BaseModel):
     voice_wake_word: str | None = Field(default=None, min_length=1, max_length=40)
     # Which KurdishTTS voice speaks Sorani replies; blank means the default.
     sorani_speaker_id: str | None = Field(default=None, max_length=80)
+
+    @field_validator("fallback_model")
+    @classmethod
+    def check_fallback_model(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]+", normalized):
+            raise ValueError("fallback_model must be a model identifier such as vendor/model:tag")
+        if is_placeholder_model(normalized):
+            raise ValueError("fallback_model must name a real model, not a test double")
+        return normalized
 
     def provided(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)

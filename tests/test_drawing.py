@@ -396,11 +396,8 @@ def test_selection_retries_neighbouring_rows_before_giving_up():
 
 def test_the_pointer_settles_before_a_shortcut_is_sent():
     """The crosshair only follows a move it actually receives."""
-    from sam_backend.trading.drawing import (
-        DRAW_SETTLE_SECONDS,
-        MOUSE_SETTLE_OFFSET,
-        MOUSE_SETTLE_SECONDS,
-    )
+    from sam_backend.trading.desktop_input import MOUSE_SETTLE_OFFSET, MOUSE_SETTLE_SECONDS
+    from sam_backend.trading.drawing import DRAW_SETTLE_SECONDS
 
     assert MOUSE_SETTLE_OFFSET > 0, "the pointer must approach from a different row"
     assert MOUSE_SETTLE_SECONDS >= 0.2, "too short a settle loses the crosshair update"
@@ -640,6 +637,738 @@ def test_provider_and_chart_spellings_of_one_instrument_agree(trading: TradingSe
 
 def test_an_analysis_report_cannot_be_drawn_onto_a_different_symbol(trading: TradingService, monkeypatch):
     monkeypatch.setattr(trading.tradingview, "observe", lambda: _ChartOn("GLD"))
-    trading._last_report = {"symbol": "XAUUSD", "setup": {"entry": 100.0, "stop": 99.0}, "support": [], "resistance": []}
+    trading.analyst.latest = {"symbol": "XAUUSD", "setup": {"entry": 100.0, "stop": 99.0}, "support": [], "resistance": []}
     result = trading.draw_analysis()
     assert result.error_code == "SYMBOL_MISMATCH"
+
+
+# --- the drawing engine, through its public surface ---------------------------
+# Twenty-two of the engine's thirty-four methods were reached by no test. Most
+# of them need a TradingView window and a hand on the mouse, which is exactly
+# why: the engine's only coupling to the desktop is seven input primitives and
+# one screen grab, so those are stubbed and everything else -- the gates, the
+# price/pixel mapping, the verification maths, the ownership records -- runs
+# for real on synthetic pixels.
+
+from sam_backend.contracts import StandardResult
+from sam_backend.trading.desktop_input import DesktopInput
+from sam_backend.trading.drawing import TwoAnchorRequest
+
+GEOMETRY = {"left": 0, "top": 0, "right": 1200, "bottom": 800}
+AXIS_X = 1100.0
+# price_at(y) = slope * y + intercept: 3000 at the top of the plot, 1600 at the bottom.
+SLOPE, INTERCEPT = -2.0, 3200.0
+
+
+class ChartWindow:
+    """What observe() reports about a TradingView window showing XAUUSD M15."""
+
+    def __init__(self, *, active: bool = True, handle: int | None = 7) -> None:
+        self.window_handle = handle
+        self.symbol = "XAUUSD"
+        self.timeframe = "M15"
+        self.client_geometry = GEOMETRY
+        self.window_geometry = GEOMETRY
+        self.active = active
+        self.title = "TradingView"
+        self.current_price = 2500.0
+
+
+class Desktop(DesktopInput):
+    """A desktop that records what the engine asked of it and shows it chosen pixels.
+
+    The engine takes this in place of the real one; nothing is monkeypatched.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.frames: list[Image.Image] = []
+
+    def install(self, engine: DrawingEngine, *, before: Image.Image, after: Image.Image) -> None:
+        engine.desktop = self
+        self.frames = [before, after]
+
+    def move_mouse(self, x, y): self.calls.append(("move", x, y))
+    def press_chord(self, modifier, key): self.calls.append(("chord", modifier, key))
+    def press_key(self, key): self.calls.append(("key", key))
+    def click(self, x, y): self.calls.append(("click", x, y))
+    def drag(self, a, b): self.calls.append(("drag", a, b))
+    def grab(self, bbox): return self.frames.pop(0)
+
+
+def plot_frame(fill: int = 40) -> Image.Image:
+    region = ChartCalibrator.plot_region(GEOMETRY, AXIS_X)
+    return Image.new("L", (region["right"] - region["left"], region["bottom"] - region["top"]), fill)
+
+
+def with_row(frame: Image.Image, screen_y: float) -> Image.Image:
+    """The frame after a horizontal line appeared at that screen row."""
+    region = ChartCalibrator.plot_region(GEOMETRY, AXIS_X)
+    marked = frame.copy()
+    row = int(screen_y) - region["top"]
+    for x in range(marked.width):
+        marked.putpixel((x, row), 255)
+    return marked
+
+
+@pytest.fixture()
+def chart(database: Database, monkeypatch):
+    """A permitted, calibrated engine over a fake window, with the desktop stubbed."""
+    monkeypatch.setattr("sam_backend.trading.drawing.time.sleep", lambda seconds: None)
+    window = ChartWindow()
+    focus_calls: list[str] = []
+
+    def focus():
+        focus_calls.append("focus")
+        window.active = True
+        return StandardResult.success({})
+
+    desktop = Desktop()
+    engine = DrawingEngine(
+        database=database, calibrator=ChartCalibrator(), observe=lambda: window, focus=focus,
+        computer_control=True, screen_access=True, desktop=desktop,
+    )
+    database.save_chart_calibration(
+        window_handle=7, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(GEOMETRY),
+        slope=SLOPE, intercept=INTERCEPT, method="test", verified=True, axis_x=AXIS_X,
+    )
+    desktop.install(engine, before=plot_frame(), after=plot_frame())
+    engine.window, engine.focus_calls = window, focus_calls
+    return engine
+
+
+# -- price <-> pixel -----------------------------------------------------------
+
+def test_price_maps_to_a_row_and_back(chart):
+    placed = chart.price_to_screen(2500.0)
+
+    assert placed.verified and placed.data["on_screen"] is True
+    assert placed.data["y"] == pytest.approx((2500.0 - INTERCEPT) / SLOPE)
+    assert chart.screen_to_price(placed.data["y"]).data["price"] == pytest.approx(2500.0)
+
+
+def test_a_price_beyond_the_visible_range_is_reported_off_screen(chart):
+    placed = chart.price_to_screen(9999.0)
+
+    assert placed.executed and not placed.verified
+    assert placed.error_code == "PRICE_OFF_SCREEN" and placed.data["on_screen"] is False
+
+
+# -- drawing a horizontal line ---------------------------------------------------
+
+def test_a_verified_line_is_drawn_at_the_calibrated_row_and_recorded_as_owned(chart):
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+
+    result = chart.draw(DrawRequest(annotation="support", price=2500.0, label="S1", theory="snr"))
+
+    assert result.status.value == "SUCCESS" and result.verified
+    # The pointer went to the calibrated row, the documented shortcut fired, the tool was disarmed.
+    assert chart.desktop.calls == [("move", 546, int(target_y)), ("chord", "alt", "h"), ("key", 27)]
+    drawing = result.data["drawing"]
+    assert (drawing["drawing_type"], drawing["layer"], drawing["verified"]) == ("support", "SNR", True)
+    assert drawing["payload"]["geometry_hash"] == geometry_hash(GEOMETRY)
+    assert result.data["verification"]["matched_row"] is not None
+    assert chart.list_owned(symbol="XAUUSD").data["count"] == 1
+
+
+def test_an_unchanged_chart_is_partial_but_the_attempt_is_still_owned(chart):
+    """The shortcut was sent, so an unverified line may exist; owning it is how it gets cleaned up."""
+    result = chart.draw(DrawRequest(annotation="resistance", price=2600.0))
+
+    assert result.status.value == "PARTIAL" and result.executed and not result.verified
+    assert result.error_code == "DRAWING_NOT_VERIFIED"
+    assert result.data["drawing"]["verified"] is False
+    assert chart.list_owned().data["count"] == 1, "recorded precisely so it can be found and removed"
+
+
+def test_an_off_screen_price_is_refused_before_any_input_is_sent(chart):
+    result = chart.draw(DrawRequest(annotation="support", price=9999.0))
+
+    assert not result.executed and result.error_code == "PRICE_OFF_SCREEN"
+    assert chart.desktop.calls == [], "nothing may reach the chart for a line that cannot be placed"
+    assert chart.list_owned().data["count"] == 0
+
+
+def test_an_unknown_annotation_becomes_a_note_line_not_an_error(chart):
+    """The documented default: anything unrecognised is a horizontal line on NOTES."""
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+
+    result = chart.draw(DrawRequest(annotation="my_custom_marker", price=2500.0))
+
+    assert result.verified and result.data["drawing"]["layer"] == "NOTES"
+    assert result.data["drawing"]["drawing_type"] == "my_custom_marker"
+
+
+def test_a_two_anchor_type_cannot_be_drawn_with_one_price(chart):
+    result = chart.draw(DrawRequest(annotation="trendline", price=2500.0))
+
+    assert result.error_code == "TWO_ANCHOR_REQUIRED" and chart.desktop.calls == []
+
+
+@pytest.mark.parametrize("computer_control, screen_access, code", [
+    (False, True, "COMPUTER_CONTROL_DISABLED"),
+    (True, False, "SCREEN_ACCESS_DISABLED"),
+])
+def test_drawing_is_refused_without_both_permissions(chart, computer_control, screen_access, code):
+    chart.refresh_permissions(computer_control=computer_control, screen_access=screen_access)
+
+    for attempt in (chart.draw(DrawRequest(annotation="support", price=2500.0)), chart.undo(),
+                    chart.draw_two_anchor(TwoAnchorRequest("trendline", 2500.0, 60.0, 2600.0, 120.0))):
+        assert attempt.error_code == code and not attempt.executed
+    assert chart.desktop.calls == []
+
+
+@pytest.mark.parametrize("break_it, code", [
+    (lambda w: setattr(w, "window_handle", None), "WINDOW_NOT_FOUND"),
+    (lambda w: setattr(w, "timeframe", "H4"), "CALIBRATION_REQUIRED"),
+])
+def test_drawing_needs_a_window_and_a_calibration_for_this_exact_view(chart, break_it, code):
+    break_it(chart.window)
+
+    result = chart.draw(DrawRequest(annotation="support", price=2500.0))
+
+    assert result.error_code == code and chart.desktop.calls == []
+
+
+def test_an_unverified_calibration_row_blocks_price_accurate_drawing(chart, database):
+    database.save_chart_calibration(
+        window_handle=7, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(GEOMETRY),
+        slope=SLOPE, intercept=INTERCEPT, method="test", verified=False, axis_x=AXIS_X,
+    )
+
+    assert chart.draw(DrawRequest(annotation="support", price=2500.0)).error_code == "CALIBRATION_NOT_VERIFIED"
+
+
+# -- the chart must be in front --------------------------------------------------
+
+def test_a_background_chart_is_focused_first_when_control_is_allowed(chart):
+    chart.window.active = False
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+
+    result = chart.draw(DrawRequest(annotation="support", price=2500.0))
+
+    assert chart.focus_calls == ["focus"] and result.verified
+
+
+def test_a_background_chart_is_a_hard_failure_when_control_is_off(chart):
+    """A capture shows whatever is on screen; an occluded chart would be measured wrongly."""
+    chart.window.active = False
+    chart.refresh_permissions(computer_control=False, screen_access=True)
+
+    result = chart.capability()
+    placed = chart.price_to_screen(2500.0)
+
+    assert result["verified_price_drawing"] is False
+    assert placed.verified, "a pure query does not need the foreground"
+
+
+def test_a_focus_that_does_not_take_is_reported_not_ignored(chart):
+    chart.window.active = False
+    chart._focus = lambda: StandardResult.failure("no", error_code="FOCUS_FAILED")
+
+    result = chart.draw(DrawRequest(annotation="support", price=2500.0))
+
+    assert result.error_code == "FOCUS_FAILED" and chart.desktop.calls == []
+
+
+# -- capability ------------------------------------------------------------------
+
+def test_capability_reports_exactly_what_the_engine_can_do_right_now(chart):
+    full = chart.capability()
+    assert full["calibrated"] and full["verified_price_drawing"] and not full["time_calibrated"]
+    assert full["verified_two_anchor_drawing"] is False, "no time axis yet"
+    assert set(full["layers"]) == {layer.value for layer in Layer}
+
+    chart.window.timeframe = "H4"
+    uncalibrated = chart.capability()
+    assert uncalibrated["calibrated"] is False and "calibrated" in uncalibrated["calibration_error"].lower()
+    assert uncalibrated["verified_price_drawing"] is False
+
+
+# -- undo and ownership records ---------------------------------------------------
+
+def test_undo_is_sent_but_never_claimed_as_verified(chart):
+    result = chart.undo()
+
+    assert chart.desktop.calls == [("chord", "ctrl", "z")]
+    assert result.status.value == "PARTIAL" and result.error_code == "UNDO_NOT_VERIFIED"
+
+
+def test_layer_visibility_is_an_ownership_record_not_a_chart_command(chart):
+    chart.draw(DrawRequest(annotation="support", price=2500.0))
+    chart.desktop.calls.clear()
+
+    hidden = chart.set_layer_visibility("snr", False, symbol="XAUUSD")
+
+    assert hidden.verified and hidden.data["updated"] == 1
+    assert chart.desktop.calls == [], "nothing is sent to the chart"
+    assert chart.set_layer_visibility("no_such_layer", True).error_code == "UNKNOWN_LAYER"
+
+
+# -- clearing what SAM drew, and only that -----------------------------------------
+
+def test_clear_removes_owned_drawings_it_can_confirm_and_stops_at_the_first_it_cannot(chart, database):
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    for price in (2500.0, 2550.0, 2600.0):
+        chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), chart.price_to_screen(price).data["y"]))
+        chart.draw(DrawRequest(annotation="support", price=price))
+    assert chart.list_owned().data["count"] == 3
+    outcomes = iter([(True, {"ok": 1}), (False, {"ok": 0}), (True, {"ok": 1})])
+    chart._select_and_delete = lambda x, y, **kw: next(outcomes)
+
+    result = chart.clear_owned(symbol="XAUUSD")
+
+    assert result.status.value == "PARTIAL" and result.error_code == "CLEAR_PARTIALLY_VERIFIED"
+    assert result.data["count"] == 1 and len(result.data["skipped"]) == 1
+    assert "did not change" in result.data["skipped"][0]["reason"]
+    assert chart.list_owned().data["count"] == 2, "only the confirmed removal left the ownership table"
+
+
+def test_clear_never_touches_a_drawing_recorded_under_another_viewport(chart, database):
+    database.record_drawing(symbol="XAUUSD", layer="SNR", drawing_type="support", label="old", theory="",
+                            strategy="", timeframe="M15", setup_id=None, price=2500.0, price_secondary=None,
+                            verified=True, payload={"geometry_hash": "a-different-window"})
+    clicks: list = []
+    chart._select_and_delete = lambda *a, **kw: clicks.append(a) or (True, {})
+
+    result = chart.clear_owned(symbol="XAUUSD")
+
+    assert clicks == [], "clicking at a row computed for another viewport is not safe"
+    assert result.data["count"] == 0 and "different viewport" in result.data["skipped"][0]["reason"]
+
+
+def test_clear_with_nothing_owned_sends_nothing_and_needs_no_permission(chart):
+    chart.refresh_permissions(computer_control=False, screen_access=False)
+
+    result = chart.clear_owned(symbol="XAUUSD")
+
+    assert result.verified and result.data["count"] == 0 and chart.desktop.calls == []
+
+
+# -- two-anchor drawings --------------------------------------------------------------
+
+def time_calibrate(database: Database) -> None:
+    """Add a time axis: one minute per pixel, minute 0 at x=0, spanning the day."""
+    database.save_chart_calibration(
+        window_handle=7, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(GEOMETRY),
+        slope=SLOPE, intercept=INTERCEPT, method="test", verified=True, axis_x=AXIS_X,
+        minutes_per_pixel=1.0, time_intercept=0.0, minutes_span=[0.0, 1440.0],
+    )
+
+
+def test_a_two_anchor_object_needs_the_time_axis_too(chart):
+    result = chart.draw_two_anchor(TwoAnchorRequest("trendline", 2500.0, 100.0, 2600.0, 400.0))
+
+    assert result.error_code == "TIME_CALIBRATION_REQUIRED" and chart.desktop.calls == []
+
+
+def test_a_two_anchor_object_is_dragged_between_its_calibrated_anchors(chart, database, monkeypatch):
+    time_calibrate(database)
+    monkeypatch.setattr(chart.calibrator, "calibrate", lambda **kw: StandardResult.failure("no ocr"))
+    after = plot_frame()
+    region = ChartCalibrator.plot_region(GEOMETRY, AXIS_X)
+    a = chart.anchor_to_screen(chart.active_calibration(chart.window)[0], 2500.0, 100.0, region)
+    b = chart.anchor_to_screen(chart.active_calibration(chart.window)[0], 2600.0, 400.0, region)
+    steps = 300
+    for i in range(steps + 1):
+        x = a["x"] + (b["x"] - a["x"]) * i / steps
+        y = a["y"] + (b["y"] - a["y"]) * i / steps
+        for dy in (-1, 0, 1):
+            after.putpixel((int(x) - region["left"], int(y) + dy - region["top"]), 255)
+    chart.desktop.install(chart, before=plot_frame(), after=after)
+
+    result = chart.draw_two_anchor(TwoAnchorRequest("trendline", 2500.0, 100.0, 2600.0, 400.0, theory="structure"))
+
+    assert result.verified, result.error
+    kinds = [call[0] for call in chart.desktop.calls]
+    assert kinds == ["chord", "drag", "key"], "arm the tool, drag, disarm"
+    assert chart.desktop.calls[1] == ("drag", (int(a["x"]), int(a["y"])), (int(b["x"]), int(b["y"])))
+    drawing = result.data["drawing"]
+    assert drawing["payload"]["two_anchor"] is True and drawing["layer"] == "STRUCTURE"
+    assert drawing["price"] == 2500.0 and drawing["price_secondary"] == 2600.0
+    assert result.data["verification"]["path"]["coverage"] >= 0.5
+
+
+def test_an_anchor_off_the_visible_chart_is_refused_before_dragging(chart, database):
+    time_calibrate(database)
+
+    result = chart.draw_two_anchor(TwoAnchorRequest("trendline", 2500.0, 100.0, 9999.0, 400.0))
+
+    assert result.error_code == "ANCHOR_OFF_SCREEN" and "B" in result.error and chart.desktop.calls == []
+
+
+def test_a_drag_that_panned_the_chart_is_named_and_invalidates_the_calibration(chart, database, monkeypatch):
+    """If the tool never armed, the same drag moves the view; every later price would be wrong."""
+    time_calibrate(database)
+    # The re-read axis says prices shifted by far more than tolerance at anchor A.
+    monkeypatch.setattr(chart.calibrator, "calibrate",
+                        lambda **kw: StandardResult.success({"slope": SLOPE, "intercept": INTERCEPT + 500.0}, verified=True))
+
+    result = chart.draw_two_anchor(TwoAnchorRequest("trendline", 2500.0, 100.0, 2600.0, 400.0))
+
+    assert result.error_code == "CHART_PANNED" and result.data["verification"]["chart_panned"] is True
+    assert database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                          geometry_hash=geometry_hash(GEOMETRY)) is None, \
+        "a moved view must not keep a calibration that no longer describes it"
+
+
+# -- clipping a segment to the plot ---------------------------------------------------
+
+def clipping_calibration() -> Calibration:
+    return Calibration(slope=SLOPE, intercept=INTERCEPT, method="test", verified=True,
+                       minutes_per_pixel=1.0, time_intercept=0.0, minutes_span=[0.0, 1440.0])
+
+
+@pytest.mark.parametrize("label, start, end, expect", [
+    ("fully inside is unchanged",
+     {"price": 2500.0, "minutes": 100.0}, {"price": 2600.0, "minutes": 500.0}, "same"),
+    ("a ray leaving the top is trimmed to the plot edge",
+     {"price": 2500.0, "minutes": 100.0}, {"price": 9000.0, "minutes": 900.0}, "trimmed"),
+    ("a segment entirely above the plot is dropped",
+     {"price": 8000.0, "minutes": 100.0}, {"price": 9000.0, "minutes": 500.0}, None),
+    ("a segment entirely to the right of the plot is dropped",
+     {"price": 2500.0, "minutes": 1300.0}, {"price": 2600.0, "minutes": 1400.0}, None),
+    ("a segment too short to drag is dropped",
+     {"price": 2500.0, "minutes": 100.0}, {"price": 2505.0, "minutes": 110.0}, None),
+])
+def test_clamp_segment_keeps_exactly_the_visible_part_of_a_line(label, start, end, expect):
+    region = ChartCalibrator.plot_region(GEOMETRY, AXIS_X)
+    calibration = clipping_calibration()
+
+    clipped = DrawingEngine.clamp_segment(start, end, calibration, region)
+
+    if expect is None:
+        assert clipped is None, label
+        return
+    a, b = clipped
+    for point in (a, b):
+        assert region["top"] - 1 <= calibration.y_at(point["price"]) <= region["bottom"] + 1, label
+        assert region["left"] - 1 <= calibration.x_at_minutes(point["minutes"]) <= region["right"] + 1, label
+    if expect == "same":
+        assert a["price"] == pytest.approx(start["price"]) and b["price"] == pytest.approx(end["price"])
+    else:
+        assert b["price"] < end["price"], "the far end was pulled back onto the chart"
+
+
+def test_clamp_segment_needs_a_time_axis(chart):
+    no_time = Calibration(slope=SLOPE, intercept=INTERCEPT, method="test", verified=True)
+
+    assert DrawingEngine.clamp_segment({"price": 2500.0, "minutes": 1.0}, {"price": 2600.0, "minutes": 2.0},
+                                       no_time, ChartCalibrator.plot_region(GEOMETRY, AXIS_X)) is None
+
+
+# -- multi-line constructions and calibration upkeep ---------------------------------
+
+def test_a_construction_draws_each_visible_line_and_reports_the_rest_as_off_screen(chart, database, monkeypatch):
+    """A Gann fan or pitchfork is several trendlines, each verified on its own."""
+    time_calibrate(database)
+    monkeypatch.setattr(chart.calibrator, "calibrate", lambda **kw: StandardResult.failure("no ocr"))
+    outcomes = iter([
+        StandardResult.success({"drawing": {"id": "d1", "verified": True}}, verified=True),
+        StandardResult(ExecutionStatus.PARTIAL, True, False, data={"drawing": {"id": "d2", "verified": False}},
+                       error="faint", error_code="DRAWING_NOT_VERIFIED"),
+    ])
+    asked: list[TwoAnchorRequest] = []
+
+    def fake_two_anchor(request):
+        asked.append(request)
+        return next(outcomes)
+
+    chart.draw_two_anchor = fake_two_anchor
+    lines = [
+        {"label": "1x1", "start": {"price": 2500.0, "minutes": 100.0}, "end": {"price": 2600.0, "minutes": 500.0}},
+        {"label": "2x1", "start": {"price": 2500.0, "minutes": 100.0}, "end": {"price": 2700.0, "minutes": 500.0}},
+        {"label": "8x1", "start": {"price": 8000.0, "minutes": 100.0}, "end": {"price": 9000.0, "minutes": 500.0}},
+    ]
+
+    result = chart.draw_line_plan(lines, annotation="gann_fan", theory="gann", layer=Layer.THEORY)
+
+    assert result.status.value == "PARTIAL" and result.error_code == "DRAWING_PARTIALLY_VERIFIED"
+    assert [item["line"] for item in result.data["drawn"]] == ["1x1"]
+    assert [item["line"] for item in result.data["unverified"]] == ["2x1"]
+    assert result.data["skipped"] == [{"label": "8x1", "reason": "Falls outside the visible chart."}]
+    assert result.data["requested"] == 3 and result.data["attempted"] == 3
+    # Every line went through as a trendline on the requested layer with the construction's label.
+    assert all(r.annotation == "trendline" and r.layer is Layer.THEORY for r in asked)
+    assert [r.label for r in asked] == ["gann_fan:1x1", "gann_fan:2x1"]
+
+
+def test_a_construction_entirely_off_screen_is_refused_not_half_drawn(chart, database):
+    time_calibrate(database)
+    lines = [{"label": "far", "start": {"price": 8000.0, "minutes": 100.0}, "end": {"price": 9000.0, "minutes": 500.0}}]
+
+    result = chart.draw_line_plan(lines, annotation="gann_fan", theory="gann", layer=Layer.THEORY)
+
+    assert not result.executed and result.error_code == "CONSTRUCTION_OFF_SCREEN"
+    assert chart.desktop.calls == []
+
+
+def test_a_construction_is_capped_at_its_line_budget(chart, database, monkeypatch):
+    time_calibrate(database)
+    chart.draw_two_anchor = lambda request: StandardResult.success({"drawing": {"id": request.label}}, verified=True)
+    lines = [{"label": str(i), "start": {"price": 2500.0, "minutes": 100.0}, "end": {"price": 2600.0, "minutes": 500.0}}
+             for i in range(10)]
+
+    result = chart.draw_line_plan(lines, annotation="fan", theory="t", layer=Layer.THEORY, max_lines=4)
+
+    assert result.verified and result.data["attempted"] == 4 and len(result.data["drawn"]) == 4
+
+
+def test_a_construction_needs_the_time_axis(chart):
+    result = chart.draw_line_plan([{"start": {"price": 1, "minutes": 1}, "end": {"price": 2, "minutes": 2}}],
+                                  annotation="fan", theory="t", layer=Layer.THEORY)
+
+    assert result.error_code == "TIME_CALIBRATION_REQUIRED"
+
+
+def test_a_drifted_calibration_is_invalidated_rather_than_kept_authorising_drawings(chart, database, monkeypatch):
+    monkeypatch.setattr(chart.calibrator, "verify",
+                        lambda calibration, **kw: StandardResult.failure("axis moved", error_code="CALIBRATION_DRIFTED"))
+
+    result = chart.verify_calibration()
+
+    assert result.error_code == "CALIBRATION_DRIFTED"
+    assert database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                          geometry_hash=geometry_hash(GEOMETRY)) is None
+    assert chart.draw(DrawRequest(annotation="support", price=2500.0)).error_code == "CALIBRATION_REQUIRED"
+
+
+def test_a_calibration_that_still_holds_is_left_alone(chart, database, monkeypatch):
+    monkeypatch.setattr(chart.calibrator, "verify", lambda calibration, **kw: StandardResult.success({"ok": True}, verified=True))
+
+    result = chart.verify_calibration()
+
+    assert result.verified
+    assert database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                          geometry_hash=geometry_hash(GEOMETRY)) is not None
+
+
+# -- calibration persistence --------------------------------------------------------
+
+def test_calibrate_persists_both_axes_and_unlocks_two_anchor_drawing(chart, database, monkeypatch):
+    """One pass fits price and time; the stored row is what every later draw consults."""
+    database.invalidate_chart_calibration(window_handle=7)
+    assert chart.capability()["calibrated"] is False
+    fit = StandardResult.success({
+        "slope": SLOPE, "intercept": INTERCEPT, "method": "ocr", "geometry_hash": geometry_hash(GEOMETRY),
+        "axis_x": AXIS_X, "anchors": [{"y": 100, "price": 3000.0}], "max_error": 0.4, "precision": 0.1,
+    }, verified=True)
+    monkeypatch.setattr(chart.calibrator, "calibrate", lambda **kw: fit)
+    monkeypatch.setattr(chart.calibrator, "calibrate_time_axis", lambda geometry, axis_x: StandardResult.success(
+        {"minutes_per_pixel": 1.0, "time_intercept": 0.0, "time_axis_y": 780.0, "minutes_span": [0.0, 1440.0]}, verified=True))
+
+    result = chart.calibrate()
+
+    assert result.verified and result.data["time_axis_verified"] is True
+    stored = database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15", geometry_hash=geometry_hash(GEOMETRY))
+    assert stored["slope"] == SLOPE and stored["verified"] and stored["minutes_per_pixel"] == 1.0
+    capability = chart.capability()
+    assert capability["calibrated"] and capability["time_calibrated"] and capability["verified_two_anchor_drawing"]
+
+
+def test_calibrate_keeps_a_price_fit_when_the_time_axis_cannot_be_read(chart, database, monkeypatch):
+    """Single-price annotations stay available; the limitation is said out loud."""
+    database.invalidate_chart_calibration(window_handle=7)
+    fit = StandardResult.success({"slope": SLOPE, "intercept": INTERCEPT, "method": "ocr",
+                                  "geometry_hash": geometry_hash(GEOMETRY), "axis_x": AXIS_X}, verified=True)
+    monkeypatch.setattr(chart.calibrator, "calibrate", lambda **kw: fit)
+    monkeypatch.setattr(chart.calibrator, "calibrate_time_axis",
+                        lambda geometry, axis_x: StandardResult.failure("no date labels", error_code="TIME_AXIS_UNREADABLE"))
+
+    result = chart.calibrate()
+
+    assert result.verified and result.data["time_axis_verified"] is False
+    assert any("only single-price annotations" in note and "no date labels" in note for note in result.observations)
+    capability = chart.capability()
+    assert capability["verified_price_drawing"] and not capability["time_calibrated"]
+
+
+def test_a_failed_axis_read_stores_nothing(chart, database, monkeypatch):
+    database.invalidate_chart_calibration(window_handle=7)
+    monkeypatch.setattr(chart.calibrator, "calibrate",
+                        lambda **kw: StandardResult.failure("no numeric labels", error_code="AXIS_UNREADABLE"))
+
+    result = chart.calibrate()
+
+    assert result.error_code == "AXIS_UNREADABLE"
+    assert database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                          geometry_hash=geometry_hash(GEOMETRY)) is None
+
+
+def test_calibrate_needs_screen_access_but_not_computer_control(chart):
+    chart.refresh_permissions(computer_control=False, screen_access=False)
+    assert chart.calibrate().error_code == "SCREEN_ACCESS_DISABLED"
+
+
+# -- selecting and deleting an owned object, for real ---------------------------------
+
+def test_clear_clicks_the_owned_row_presses_delete_and_confirms_the_line_is_gone(chart):
+    """_select_and_delete through clear_owned: the mark disappears at the first offset."""
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+    chart.draw(DrawRequest(annotation="support", price=2500.0))
+    chart.desktop.calls.clear()
+    # Before the click the line is there; after Delete it is not.
+    chart.desktop.frames = [with_row(plot_frame(), target_y), plot_frame()]
+
+    result = chart.clear_owned(symbol="XAUUSD")
+
+    assert result.verified and result.data["count"] == 1 and result.data["skipped"] == []
+    assert chart.desktop.calls == [("click", 546, int(target_y)), ("key", DesktopInput.DELETE)]
+    verification = result.data["removed"][0]["verification"]
+    assert verification["attempts"] == [{"offset": 0, "changed": True, "matched_row": verification["matched_row"]}]
+    assert chart.list_owned().data["count"] == 0
+
+
+def test_clear_tries_every_adjacent_row_before_giving_up_on_an_object(chart):
+    """A line that will not select is retried one pixel at a time, then reported, never guessed."""
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+    chart.draw(DrawRequest(annotation="support", price=2500.0))
+    chart.desktop.calls.clear()
+    # The chart never changes, however many times it is clicked.
+    still = plot_frame()
+    chart.desktop.frames = [still] * 40
+
+    result = chart.clear_owned(symbol="XAUUSD")
+
+    assert result.status.value == "PARTIAL" and result.error_code == "CLEAR_PARTIALLY_VERIFIED"
+    offsets = [call[2] - int(target_y) for call in chart.desktop.calls if call[0] == "click"]
+    assert offsets == list(DrawingEngine.SELECT_OFFSETS), "each adjacent row is tried exactly once, in order"
+    assert result.data["skipped"][0]["reason"].startswith("The chart did not change")
+    assert chart.list_owned().data["count"] == 1, "an unconfirmed deletion keeps the ownership record"
+
+
+# -- one calibration truth ------------------------------------------------------------
+# Manual calibration used to write a dict on the chart controller that no
+# drawing ever read, so a user could calibrate by hand, be told it worked, and
+# still be refused with CALIBRATION_REQUIRED. Both paths now write the store
+# active_calibration consults.
+
+def test_manual_calibration_lets_the_very_next_drawing_through(chart, database):
+    """The defect, stated as behaviour: calibrate by hand, then draw."""
+    database.invalidate_chart_calibration(window_handle=7)
+    assert chart.draw(DrawRequest(annotation="support", price=2500.0)).error_code == "CALIBRATION_REQUIRED"
+
+    # Two anchors the user picked off the axis, describing the same mapping.
+    manual = chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    assert manual.verified and manual.data["slope"] == pytest.approx(SLOPE)
+    assert manual.data["intercept"] == pytest.approx(INTERCEPT)
+    target_y = chart.price_to_screen(2500.0).data["y"]
+    chart.desktop.install(chart, before=plot_frame(), after=with_row(plot_frame(), target_y))
+
+    drawn = chart.draw(DrawRequest(annotation="support", price=2500.0))
+
+    assert drawn.verified, drawn.error
+    assert drawn.data["drawing"]["payload"]["geometry_hash"] == geometry_hash(GEOMETRY)
+
+
+def test_manual_calibration_is_stored_where_drawing_looks_and_nowhere_else(chart, database):
+    database.invalidate_chart_calibration(window_handle=7)
+
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    row = database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                         geometry_hash=geometry_hash(GEOMETRY))
+    assert row is not None and row["verified"] and row["method"] == "manual_anchors"
+    assert row["anchors"] == [{"y": 100.0, "price": 3000.0}, {"y": 600.0, "price": 2000.0}]
+    # The controller no longer keeps a calibration of its own to disagree with it.
+    assert not hasattr(chart._observe(), "_calibration")
+    from sam_backend.trading.tradingview import TradingViewController
+    assert not hasattr(TradingViewController, "calibrate"), "one writer, not two"
+    assert not hasattr(TradingViewController, "price_to_screen")
+
+
+def test_manual_calibration_is_scoped_to_this_symbol_timeframe_and_viewport(chart, database):
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    # The same window showing something else is not calibrated by that act.
+    chart.window.timeframe = "H4"
+    assert chart.capability()["calibrated"] is False
+    chart.window.timeframe = "M15"
+    chart.window.symbol = "EURUSD"
+    assert chart.capability()["calibrated"] is False
+    chart.window.symbol = "XAUUSD"
+    assert chart.capability()["calibrated"] is True
+
+
+def test_a_manually_calibrated_chart_still_needs_the_axis_read_for_two_anchor_objects(chart, database):
+    """Two price anchors say nothing about time; the limitation is stated, not hidden."""
+    database.invalidate_chart_calibration(window_handle=7)
+
+    manual = chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    assert any("still need" in note for note in manual.observations)
+    assert chart.capability()["time_calibrated"] is False
+    assert chart.draw_two_anchor(
+        TwoAnchorRequest("trendline", 2500.0, 100.0, 2600.0, 400.0)
+    ).error_code == "TIME_CALIBRATION_REQUIRED"
+
+
+@pytest.mark.parametrize("anchors, why", [
+    ((3000.0, 100.0, 2000.0, 100.0), "two rows the same"),
+    ((3000.0, 100.0, 3000.0, 600.0), "two prices the same"),
+    ((None, 100.0, 2000.0, 600.0), "a missing price"),
+])
+def test_manual_calibration_refuses_anchors_that_describe_no_mapping(chart, database, anchors, why):
+    database.invalidate_chart_calibration(window_handle=7)
+
+    result = chart.calibrate_from_anchors(*anchors)
+
+    assert result.error_code == "INVALID_CALIBRATION", why
+    assert database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                          geometry_hash=geometry_hash(GEOMETRY)) is None
+
+
+def test_manual_calibration_needs_a_chart_window(chart, database):
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.window.window_handle = None
+
+    assert chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0).error_code == "WINDOW_NOT_FOUND"
+
+
+def test_a_manual_calibration_is_invalidated_by_a_pan_like_any_other(chart, database, monkeypatch):
+    """The manual path must not become a way around viewport invalidation."""
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+    monkeypatch.setattr(chart.calibrator, "verify",
+                        lambda calibration, **kw: StandardResult.failure("axis moved", error_code="CALIBRATION_DRIFTED"))
+
+    assert chart.verify_calibration().error_code == "CALIBRATION_DRIFTED"
+    assert chart.draw(DrawRequest(annotation="support", price=2500.0)).error_code == "CALIBRATION_REQUIRED"
+
+
+def test_manual_calibration_survives_a_reload_because_it_is_persisted(chart, database, tmp_path):
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+
+    # A second reader of the same store, as a restarted process would be.
+    reopened = Database(database.path)
+    row = reopened.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                         geometry_hash=geometry_hash(GEOMETRY))
+
+    assert row is not None and row["slope"] == pytest.approx(SLOPE)
+
+
+def test_auto_calibration_still_owns_the_same_store_and_wins_when_it_runs_later(chart, database, monkeypatch):
+    """Both writers, one record: the most recent calibration is the one in force."""
+    database.invalidate_chart_calibration(window_handle=7)
+    chart.calibrate_from_anchors(3000.0, 100.0, 2000.0, 600.0)
+    monkeypatch.setattr(chart.calibrator, "calibrate", lambda **kw: StandardResult.success({
+        "slope": -1.0, "intercept": 3100.0, "method": "ocr", "geometry_hash": geometry_hash(GEOMETRY),
+        "axis_x": AXIS_X,
+    }, verified=True))
+    monkeypatch.setattr(chart.calibrator, "calibrate_time_axis", lambda geometry, axis_x: StandardResult.success(
+        {"minutes_per_pixel": 1.0, "time_intercept": 0.0, "time_axis_y": 780.0, "minutes_span": [0.0, 1440.0]}, verified=True))
+
+    chart.calibrate()
+
+    row = database.get_chart_calibration(window_handle=7, symbol="XAUUSD", timeframe="M15",
+                                         geometry_hash=geometry_hash(GEOMETRY))
+    assert row["method"] == "ocr" and row["slope"] == pytest.approx(-1.0)
+    assert chart.capability()["time_calibrated"] is True

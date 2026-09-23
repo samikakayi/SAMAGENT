@@ -12,6 +12,7 @@ from sam_backend.config import Settings
 from sam_backend.db import Database
 from sam_backend.models import AdapterRegistry, AssistantTurn, ModelError
 from sam_backend.routing import ModelRouter
+from sam_backend.schemas import SettingsUpdate
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SENTINEL = "sk-or-v1-THIS-IS-A-TEST-SENTINEL-0123456789"
@@ -41,9 +42,12 @@ def test_the_public_settings_view_never_carries_the_key(settings: Settings):
 
 
 def test_saved_ui_overrides_cannot_persist_a_credential(settings: Settings):
-    settings.save_public_overrides({"openrouter_api_key": SENTINEL, "model_mode": "AUTO"})
-    saved = json.loads((settings.data_dir / "settings.json").read_text(encoding="utf-8"))
-    assert "openrouter_api_key" not in saved
+    """The update schema is the gate: a key the UI sends never reaches the store."""
+    values = SettingsUpdate(openrouter_api_key=SENTINEL, model_mode="AUTO").provided()
+    assert "openrouter_api_key" not in values
+
+    saved = Database(settings.database_path).update_settings(values)
+    assert saved["model_mode"] == "AUTO"
     assert SENTINEL not in json.dumps(saved)
 
 
