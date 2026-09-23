@@ -425,3 +425,86 @@ def test_a_listener_that_is_not_ours_is_still_a_port_conflict(tmp_path):
     assert status.state is RuntimeState.PORT_CONFLICT
     assert status.record.pid is None, "SAM does not adopt a pid it cannot vouch for"
     assert engine.start().state is RuntimeState.PORT_CONFLICT
+
+
+# --- two callers starting at once ------------------------------------------------
+
+
+def test_two_simultaneous_starts_launch_one_process(tmp_path):
+    """Check-then-spawn had a window: both callers saw STOPPED and both spawned.
+
+    Observed against the real install -- one process won the port, the other
+    exited with code 1, and its caller was told STOPPED while n8n was in fact
+    running. Only one survived, so nothing leaked, but the verdict was wrong.
+    """
+    import subprocess as sp
+    import threading
+
+    engine = runtime(tmp_path)
+    spawned: list[object] = []
+    lock = threading.Lock()
+    launched = threading.Event()
+
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(*_args, **_kwargs):
+        with lock:
+            spawned.append(object())
+        launched.set()
+        return FakeProcess()
+
+    engine._port_owner = lambda: None
+    # Healthy only once something has been launched, as a real start behaves.
+    engine.healthy = lambda timeout=4.0: launched.is_set()
+    engine._owned_process = lambda pid: FakeProcess() if pid == 4242 and launched.is_set() else None
+
+    original = sp.Popen
+    sp.Popen = fake_popen
+    barrier = threading.Barrier(2)
+    try:
+        import concurrent.futures as futures
+
+        def start(_index):
+            barrier.wait(timeout=10)
+            return engine.start(timeout=20)
+
+        with futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = [f.result() for f in [pool.submit(start, i) for i in (0, 1)]]
+    finally:
+        sp.Popen = original
+
+    assert len(spawned) == 1, f"{len(spawned)} processes were launched for one instance"
+    states = sorted(r.state.value for r in results)
+    assert states == ["RUNNING", "RUNNING"], f"callers disagreed: {states}"
+
+
+def test_a_start_that_really_fails_is_still_reported(tmp_path):
+    """Serialising must not hide a genuine launch failure."""
+    import subprocess as sp
+
+    engine = runtime(tmp_path)
+    engine._port_owner = lambda: None
+    engine.healthy = lambda timeout=4.0: False
+    engine._owned_process = lambda pid: None
+
+    class DeadProcess:
+        pid = 4243
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    original = sp.Popen
+    sp.Popen = lambda *a, **k: DeadProcess()
+    try:
+        status = engine.start(timeout=10)
+    finally:
+        sp.Popen = original
+
+    assert status.state is RuntimeState.STOPPED
+    assert "exited during startup" in status.detail
