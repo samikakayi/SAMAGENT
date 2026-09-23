@@ -26,7 +26,6 @@ from sam_backend.wake import (
     phrase_heard,
 )
 from tests.test_hands_free_voice import (
-    FRAME,
     FakeVoice,
     ScriptedDetector,
     ScriptedStream,
@@ -212,6 +211,9 @@ def test_captured_audio_is_transcribed_by_the_configured_language(monkeypatch):
     ([(" Hey", 0.1, 0.6), (" S", 0.6, 0.8), (".A", 0.8, 0.9), (".M", 0.9, 1.1), (" tell", 1.1, 1.3)], 1.1),
     ([(" Hey,", 0.1, 0.6), (" SA", 0.7, 0.9), ("-M", 0.9, 1.0), (" Open,", 1.0, 1.3)], 1.0),
     ([(" Hey,", 0.1, 0.6), (" S.A.M.,", 0.7, 1.0), (" tell", 1.1, 1.3)], 1.0),
+    # exactly what the room returned for "Hey SAM what is gold doing right now"
+    ([(" Hey,", 0.1, 0.4), (" S", 0.4, 0.58), ("-A", 0.58, 0.72), ("-M,", 0.72, 0.9),
+      (" what", 0.9, 1.16)], 0.9),
     # in the middle
     ([(" Okay,", 0.1, 0.5), (" hey,", 0.6, 0.8), (" Sam", 0.9, 1.1), (" status.", 1.2, 1.6)], 1.1),
     # at the very end: nothing follows it
@@ -279,7 +281,8 @@ def test_near_misses_do_not_wake_it(heard):
     assert phrase_heard(heard, "Hey SAM") is False
 
 
-@pytest.mark.parametrize("heard", ["Hey SAM", "Hey, SAM!", "Hey S.A.M.", "hey sam", "Hey SA-M, open"])
+@pytest.mark.parametrize("heard", ["Hey SAM", "Hey, SAM!", "Hey S.A.M.", "hey sam", "Hey SA-M, open",
+                                   "Hey, S-A-M, what is school doing right now?"])
 def test_the_phrase_in_its_usual_spellings_still_wakes_it(heard):
     assert phrase_heard(heard, "Hey SAM") is True
 
@@ -374,3 +377,76 @@ def test_the_listener_survives_utterance_after_utterance():
         assert session.wake.running, "the listener died between utterances"
     finally:
         session.stop()
+
+
+# --- the capture after an answer ------------------------------------------------
+
+
+class PacedStream:
+    """A microphone that delivers frames at a pace, so silence takes time."""
+
+    def __init__(self, frames, *args, **kwargs):
+        self._frames = [frame for group in frames for frame in group]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def frames(self, timeout: float = 0.4):
+        for frame in self._frames:
+            time.sleep(0.004)
+            yield frame
+
+
+def paced_listen(monkeypatch, script, **kwargs):
+    import sam_backend.voice as voice_module
+    from sam_backend.config import Settings
+
+    monkeypatch.setattr(voice_module, "MicrophoneStream", lambda *a, **k: PacedStream(script))
+    service = voice_module.VoiceService(Settings.from_env())
+    kept: list[float] = []
+    monkeypatch.setattr(service, "transcribe_captured",
+                        lambda audio, **kw: kept.append(len(audio) / 16_000) or {"text": "x", "captured": True})
+    service.listen_once(max_seconds=5, silence_ms=60, language="en-US", **kwargs)
+    return kept
+
+
+def test_a_click_is_not_a_question(monkeypatch):
+    """With nobody pressing a button, one loud frame used to start a capture.
+
+    In a room measured as quiet, isolated spikes over the fixed gate were
+    enough to "capture" up to a second of nothing, which the Sorani provider
+    -- no silence filter -- would transcribe into words. Hands-free now asks
+    for a syllable of voice above the room's own threshold.
+    """
+    click = frames_of(0.2, 0.06)          # two frames: a key, a chair
+    speech = frames_of(0.2, 0.6)
+    # Paced at 4 ms a frame, so a 0.6 s gap outlasts the 60 ms silence window.
+    kept = paced_listen(monkeypatch, [quiet(0.2), click, quiet(0.6), speech, quiet(0.6)],
+                        threshold=0.010, min_speech_frames=5)
+
+    assert len(kept) == 1
+    assert 0.6 <= kept[0] < 0.6 + 0.6 + 0.05, f"{kept[0]:.2f}s kept: the click and the gap came with it"
+
+
+def test_push_to_talk_is_unchanged(monkeypatch):
+    """Without the hands-free arguments, capture starts on the first voiced frame, as before."""
+    click = frames_of(0.2, 0.06)
+    kept = paced_listen(monkeypatch, [quiet(0.2), click, quiet(0.4)])
+
+    assert len(kept) == 1, "push-to-talk no longer captures what it used to"
+
+
+def test_hands_free_asks_for_the_room_threshold_and_a_syllable():
+    captured: list[dict] = []
+    voice = OneBreathVoice(["open gold"])
+    original = voice.listen_once
+    voice.listen_once = lambda **kw: (captured.append(kw), original(**kw))[1]
+    session = controller(voice=voice)
+
+    session._capture()
+
+    assert captured[0]["threshold"] == session.wake.threshold
+    assert captured[0]["min_speech_frames"] >= 5
