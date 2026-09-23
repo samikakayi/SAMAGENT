@@ -531,6 +531,9 @@ class VoiceService:
         self.stt = WhisperSTT(str(getattr(settings, "local_stt_model", "small") or "small"))
         self.tts = TextToSpeech(voice_path=str(getattr(settings, "local_tts_voice", "") or "") or None)
         self.barge_in = BargeInController()
+        # Called with True when SAM starts speaking and False when it stops.
+        # The hands-free wake listener uses it to go deaf while SAM talks.
+        self.on_speaking: Callable[[bool], None] | None = None
 
     @property
     def mode(self) -> str:
@@ -778,12 +781,33 @@ class VoiceService:
         wanted = language or getattr(self.settings, "voice_language", None)
         use_sorani = sorani_speech.is_sorani(wanted) or sorani_speech.looks_sorani(text)
         self.barge_in.begin_speaking()
+        self._notify_speaking(True)
         try:
             if use_sorani:
                 return self._speak_sorani(text)
             return self.tts.speak(text, cancel=self.barge_in.should_stop_tts)
         finally:
             self.barge_in.end_speaking()
+            self._notify_speaking(False)
+
+    def _notify_speaking(self, speaking: bool) -> None:
+        """Tell whoever is listening that SAM's own voice is on the speakers.
+
+        This lives here rather than in the hands-free loop because the loop is
+        not the only caller: the manual voice endpoint speaks too, and if the
+        wake listener were only deafened by the loop, SAM would hear itself say
+        the phrase through any other path and answer itself.
+
+        The end of speech is not instant -- resuming waits out the echo -- so
+        this call can block for about a second on the way back down.
+        """
+        hook = self.on_speaking
+        if hook is None:
+            return
+        try:
+            hook(speaking)
+        except Exception:  # noqa: BLE001 - a listener must not break speech
+            pass
 
     def synthesize(self, text: str, language: str | None = None) -> dict[str, Any]:
         """Produce audio bytes without playing them, so the browser can.

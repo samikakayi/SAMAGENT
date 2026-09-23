@@ -495,6 +495,11 @@
                 </div>
               </div>
               <div class="composer-region">
+                <div class="voice-wave" id="hands-free-bar" aria-live="polite" hidden>
+                  <span class="voice-live-dot" id="hands-free-dot" aria-hidden="true"></span>
+                  <span id="hands-free-status">Waiting for Hey SAM…</span>
+                  <button class="micro-button" type="button" id="hands-free-toggle" aria-label="Toggle hands-free voice">Stop</button>
+                </div>
                 <div class="voice-wave" id="voice-wave" hidden aria-live="polite">
                   <span class="voice-live-dot" aria-hidden="true"></span>
                   <span id="voice-status-text">گوێدەگرێت…</span>
@@ -1162,8 +1167,16 @@
               <select class="text-field" id="settings-voice-mode" name="voice_mode"><option value="PUSH_TO_TALK">Push to talk</option><option value="CONVERSATION">Conversation</option><option value="ALWAYS_LISTENING">Always listening</option><option value="WAKE_WORD">Wake word</option></select>
               <label class="field-label" for="settings-voice-language">Recognition language</label>
               <input class="text-field" id="settings-voice-language" name="voice_language" value="ckb-IQ" autocomplete="off" />
-              <label class="field-label" for="settings-wake-word">Wake word</label>
-              <input class="text-field" id="settings-wake-word" name="voice_wake_word" value="SAM" autocomplete="off" />
+              <div class="settings-section-heading"><h3>Hands-free</h3><p>Say the wake phrase and speak; SAM answers out loud. Wake detection runs on this machine and no audio leaves it before the phrase.</p></div>
+              <label class="switch-row"><span><strong>Hands-free voice</strong><small>Listen for the wake phrase while SAM is running</small></span><input type="checkbox" id="settings-hands-free" name="hands_free_enabled" /><i aria-hidden="true"></i></label>
+              <label class="switch-row"><span><strong>Speak answers</strong><small>Read replies aloud during a hands-free session</small></span><input type="checkbox" id="settings-hands-free-speak" name="hands_free_auto_speak" checked /><i aria-hidden="true"></i></label>
+              <label class="field-label" for="settings-wake-word">Wake phrase</label>
+              <input class="text-field" id="settings-wake-word" name="voice_wake_word" value="Hey SAM" autocomplete="off" />
+              <label class="field-label" for="settings-hands-free-sensitivity">Wake sensitivity</label>
+              <select class="text-field" id="settings-hands-free-sensitivity" name="hands_free_sensitivity"><option value="LOW">Low &#183; fewest false wakes</option><option value="NORMAL" selected>Normal</option><option value="HIGH">High &#183; hears quieter speech</option></select>
+              <label class="field-label" for="settings-hands-free-continuation">Follow-up window <output id="hands-free-continuation-output">10s</output></label>
+              <input class="range-field" id="settings-hands-free-continuation" name="hands_free_continuation_seconds" type="range" min="0" max="30" step="1" value="10" />
+              <p class="p-note">Within the window you can ask a follow-up without repeating the wake phrase. Set it to 0 for one question per wake.</p>
               <label class="field-label" for="settings-voice">System voice</label>
               <select class="text-field" id="settings-voice" name="voice"><option value="">System default</option></select>
               <label class="field-label" for="settings-speech-rate">Speech rate <output id="speech-rate-output">1.0x</output></label>
@@ -1271,6 +1284,7 @@
     <script src="./app.js" defer></script>
     <script src="./panels.js" defer></script>
     <script src="./routing-panel.js" defer></script>
+    <script src="./hands-free.js" defer></script>
     <script src="./integration-health.js" defer></script>
     <script src="./workflow-intelligence.js" defer></script>
     <script src="./agent-panel.js" defer></script>

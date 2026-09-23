@@ -46,6 +46,7 @@ from .trading.replay import BarReplayResearch
 from .trading.service import TradingService
 from .verification import VerificationEngine
 from .voice import VoiceService
+from .voice_session import VoiceConversationController
 from .workflows import WorkflowIntelligence
 from .windows_control import WindowsController
 
@@ -116,6 +117,10 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     # The Sorani providers are configured by key, so the voice service resolves
     # them from the store on use rather than at construction.
     voice = VoiceService(settings, secret_store)
+    # Hands-free voice drives the ordinary agent: it captures speech and
+    # hands the text to the same `agent.chat` the typed box uses, so a
+    # spoken request gets no authority a typed one would not have.
+    voice_session = VoiceConversationController(settings, voice, agent)
     replay = BarReplayResearch(trading.market_data, trading.tradingview)
     # Workflow Intelligence: SAM reasons and gates, n8n executes.
     workflow_intelligence = WorkflowIntelligence(settings, router=router)
@@ -151,9 +156,14 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         monitor_stop.clear()
         await agent_api.startup()
         active_app.state.monitor_task = asyncio.create_task(setup_monitor_worker())
+        # The wake listener lives and dies with the application -- no service,
+        # no scheduled task -- and only starts when the user has asked for it.
+        if settings.hands_free_enabled:
+            await asyncio.to_thread(voice_session.start)
         try:
             yield
         finally:
+            await asyncio.to_thread(voice_session.stop)
             monitor_stop.set()
             task = getattr(active_app.state, "monitor_task", None)
             if task:
@@ -181,6 +191,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     application.state.windows = windows
     application.state.cancellation = cancellation
     application.state.voice = voice
+    application.state.voice_session = voice_session
     application.state.secrets = secret_store
     application.state.replay = replay
     application.state.orchestrator = orchestrator
@@ -216,7 +227,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
         provider_health=provider_health, integrations=integrations,
         n8n_runtime=n8n_runtime, router=router, agent=agent,
         task_store=task_store, orchestrator=orchestrator, agent_api=agent_api,
-        voice=voice, replay=replay,
+        voice=voice, voice_session=voice_session, replay=replay,
         apply_stored_credentials=apply_stored_credentials,
         workflows=workflow_intelligence,
         rebuild_adapters=rebuild_adapters,

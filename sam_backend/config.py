@@ -117,7 +117,16 @@ class Settings:
     voice_language: str = "ckb-IQ"
     voice_vad_threshold: float = 0.035
     voice_silence_ms: int = 800
-    voice_wake_word: str = "SAM"
+    # "Hey SAM" rather than bare "SAM": a two-word phrase is far harder for
+    # ordinary conversation to trigger by accident.
+    voice_wake_word: str = "Hey SAM"
+    voice_input_device: int | None = None
+    # Hands-free is off until the user asks for it. A microphone that starts
+    # listening because software was installed is not a feature.
+    hands_free_enabled: bool = False
+    hands_free_sensitivity: str = "NORMAL"
+    hands_free_continuation_seconds: float = 10.0
+    hands_free_auto_speak: bool = True
     # Which KurdishTTS voice speaks Sorani replies; blank picks the first Sorani
     # speaker the provider offers.
     sorani_speaker_id: str = ""
@@ -210,7 +219,11 @@ class Settings:
             voice_language=os.getenv("SAM_VOICE_LANGUAGE", "ckb-IQ"),
             voice_vad_threshold=float(os.getenv("SAM_VOICE_VAD_THRESHOLD", "0.035")),
             voice_silence_ms=int(os.getenv("SAM_VOICE_SILENCE_MS", "800")),
-            voice_wake_word=os.getenv("SAM_VOICE_WAKE_WORD", "SAM"),
+            voice_wake_word=os.getenv("SAM_VOICE_WAKE_WORD", "Hey SAM"),
+            hands_free_enabled=_env_bool("SAM_HANDS_FREE", False),
+            hands_free_sensitivity=os.getenv("SAM_HANDS_FREE_SENSITIVITY", "NORMAL").strip().upper(),
+            hands_free_continuation_seconds=float(os.getenv("SAM_HANDS_FREE_CONTINUATION", "10")),
+            hands_free_auto_speak=_env_bool("SAM_HANDS_FREE_AUTO_SPEAK", True),
             sorani_speaker_id=os.getenv("SAM_SORANI_SPEAKER_ID", ""),
             local_stt_model=os.getenv("SAM_LOCAL_STT_MODEL", "small"),
             local_tts_voice=os.getenv("SAM_LOCAL_TTS_VOICE", ""),
