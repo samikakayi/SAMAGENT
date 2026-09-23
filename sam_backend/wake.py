@@ -249,6 +249,11 @@ class LocalPhraseDetector(WakeDetector):
             # The dictation model, already in memory. The wake phrase is
             # English even when the command that follows is not, so this asks
             # for English regardless of the configured command language.
+            #
+            # That is a limit, and a deliberate one. Sorani has no local
+            # recogniser -- SAM sends it to a provider -- and the wake phrase
+            # is the one thing that may never leave this machine. So the
+            # phrase is English and the command is whatever the user speaks.
             try:
                 return str(self.shared.transcribe(audio, language="en").get("text") or "")
             except Exception as exc:  # noqa: BLE001 - a bad frame must not end the loop
