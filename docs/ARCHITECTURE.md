@@ -352,6 +352,73 @@ bounded in count, field length and time, returned as structured data, and
 subject to the same tool-output boundary as everything else. It fetches
 results; it does not open pages or run anything.
 
+## Workflow Intelligence
+
+SAM reasons and holds the gate; n8n runs the automation. Nothing in
+`sam_backend/workflows/` replaces the orchestrator, the tool registry, the
+approval system or the verification invariant -- n8n is an execution target
+and a workflow library is a knowledge source, neither is a second brain.
+
+**The library is not vendored.** The public collection is ~37 MB across ~2000
+files. `GitHubWorkflowLibrary` reads one directory listing and one category
+map -- enough to search by name, service, trigger and category -- and fetches a
+workflow's JSON only when someone asks for that one. Search thousands, read
+one. The cache lives in SAM's data directory, carries a TTL and a commit SHA,
+and a fallback to an expired cache is reported as `LIBRARY_STALE_CACHE` rather
+than passed off as current.
+
+**Every workflow is untrusted third-party data.** The inspector is static: a
+Code node's JavaScript, an Execute Command's shell line and every expression
+are read as text and never evaluated. The risk engine is a table, not a model,
+because a classifier that reads the workflow could be argued out of its answer
+by the workflow. A node type the table does not know is `UNKNOWN_NODE` and
+raises the level -- unknown behaviour is not safe behaviour.
+
+| Flag | Level it forces |
+| --- | --- |
+| `SHELL_EXECUTION`, `FINANCIAL_ACTION` | CRITICAL |
+| `CODE_EXECUTION`, `UNKNOWN_NODE`, `DATABASE_WRITE`, `FILESYSTEM_WRITE`, `SUBWORKFLOW_EXECUTION` | HIGH |
+| `EXTERNAL_WRITE`, `WEBHOOK_EXPOSURE` | MEDIUM |
+
+An unreadable subworkflow makes the assessment `incomplete`: a floor, not a
+verdict.
+
+**Approval binds to the artifact, not the intention.** `prepare` produces the
+exact bytes an import would send, and the approval fingerprint is a SHA-256
+over the workflow hash *and* the operation *and* the target instance *and* the
+inputs. Changing one character of the workflow, or reusing an import approval
+to activate, or pointing at a different n8n, all produce a different
+fingerprint and need a new decision. The prepared artifact is held in SAM, so
+the bytes that were inspected are the bytes that are sent -- the model only
+ever holds the hash.
+
+**Credentials stay n8n's.** Foreign credential IDs from an exporting instance
+are stripped: an ID that means nothing here is useless at best, and at worst
+silently attaches a real local credential nobody chose. Each requirement must
+be mapped to a credential that already exists in the configured instance, and
+SAM only ever handles opaque IDs and names. A workflow carrying a literal
+key-shaped string fails validation outright rather than being redacted into
+n8n.
+
+**The target is settings-only.** `n8n_base_url` decides where SAM sends
+everything. A workflow's own contents can never redirect the client, which is
+what keeps a downloaded file from turning SAM into a request forwarder.
+
+**Import is inactive, always.** Activation starts schedules and exposes
+webhooks, so it is a separate tool with its own approval. n8n's public API has
+no endpoint for running a workflow on demand, so SAM does not run one: it says
+so rather than reaching for the editor's internal routes, and reads execution
+history through the supported endpoints instead.
+
+**An execution is not verification.** n8n reporting `success` means the
+workflow ran, not that the task's goal was met. `completed_verified` still
+requires SAM's own evidence.
+
+| Tool | Permission class |
+| --- | --- |
+| `workflow_search`, `workflow_inspect`, `workflow_prepare`, `workflow_run_status` | `network` |
+| `workflow_import`, `workflow_activate` | `destructive_actions` (approval required) |
+
 ## Known debt
 
 Real, none blocking. Each is here because it is worth knowing, not because it

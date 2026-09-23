@@ -72,6 +72,9 @@ class SettingsUpdate(BaseModel):
     routing_profile: Literal["FREE", "BALANCED", "PREMIUM"] | None = None
     # Ordered "provider/model" references FREE and BALANCED try in this order.
     free_candidates: list[str] | None = Field(default=None, max_length=MAX_FREE_CANDIDATES)
+    # Where SAM sends workflow imports. Only this value ever decides the
+    # target; a workflow's own contents never do.
+    n8n_base_url: str | None = Field(default=None, max_length=300)
     permission_mode: Literal["guarded", "strict", "trusted"] | None = None
     max_tool_iterations: int | None = Field(default=None, ge=1, le=20)
     command_timeout_seconds: int | None = Field(default=None, ge=3, le=300)
@@ -235,7 +238,7 @@ class TwoAnchorDrawRequest(BaseModel):
 
 class CredentialRequest(BaseModel):
     name: Literal["openrouter_api_key", "openai_api_key", "litellm_api_key",
-                  "groq_api_key", "gemini_api_key"]
+                  "groq_api_key", "gemini_api_key", "n8n_api_key"]
     # The value is accepted, never echoed. Responses carry only a fingerprint.
     value: str = Field(min_length=8, max_length=400)
 

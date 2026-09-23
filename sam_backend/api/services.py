@@ -34,6 +34,7 @@ from ..trading.replay import BarReplayResearch
 from ..trading.service import TradingService
 from ..verification import VerificationEngine
 from ..voice import VoiceService
+from ..workflows import WorkflowIntelligence
 from ..windows_control import WindowsController
 
 
@@ -58,6 +59,7 @@ class AppServices:
     agent_api: AgentApi
     voice: VoiceService
     replay: BarReplayResearch
+    workflows: WorkflowIntelligence
     # Re-resolve credentials and swap the adapter registry in place, so a new
     # key takes effect without a restart.
     apply_stored_credentials: Callable[[], None]

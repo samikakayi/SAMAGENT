@@ -18,6 +18,7 @@ from .settings import register_settings_routes
 from .system import register_system_routes
 from .trading import register_trading_routes
 from .voice import register_voice_routes
+from .workflows import register_workflow_routes
 
 __all__ = [
     "AppServices",
@@ -30,4 +31,5 @@ __all__ = [
     "register_system_routes",
     "register_trading_routes",
     "register_voice_routes",
+    "register_workflow_routes",
 ]

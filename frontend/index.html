@@ -602,6 +602,20 @@
 <div class="sam-action-row"><input type="password" id="groq-key-input" placeholder="Groq API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><input type="password" id="gemini-key-input" placeholder="Gemini API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><button class="primary-button" type="button" id="free-keys-save-btn">Configure</button></div>
 <p class="p-note">The key is sent to the local backend only, stored outside the web root, and never returned to this page.</p>
 </div></div>
+<div class="trade-card" id="card-workflow-intelligence"><div class="trade-card-header"><h3>Workflow Intelligence</h3><button class="secondary-button" type="button" id="wf-refresh-btn">Refresh</button></div><div class="trade-card-body">
+<div class="level-row"><span class="level-label">Workflow library</span><span class="badge badge-subtle" id="wf-library-state">UNKNOWN</span></div>
+<p class="p-note" id="wf-library-detail">The workflow library has not been read yet.</p>
+<div class="level-row"><span class="level-label">n8n instance</span><span class="badge badge-subtle" id="wf-n8n-state">UNKNOWN</span></div>
+<p class="p-note" id="wf-n8n-detail"></p>
+<div class="sam-action-row"><input class="text-field" type="text" id="wf-query" placeholder="What should the automation do? e.g. gmail drive invoice" autocomplete="off" style="flex:1;min-width:220px"><select class="text-field" id="wf-trigger" style="min-width:140px"><option value="">Any trigger</option><option value="scheduled">Scheduled</option><option value="webhook">Webhook</option><option value="triggered">Triggered</option><option value="manual">Manual</option></select><button class="primary-button" type="button" id="wf-search-btn">Search</button></div>
+<div id="wf-results"></div>
+<div id="wf-inspection"></div>
+<div class="sam-action-row"><input class="text-field" type="text" id="wf-name" placeholder="Name for the adapted workflow (optional)" autocomplete="off" style="flex:1;min-width:220px"></div>
+<div id="wf-prepared"></div>
+<h4>Recent runs</h4>
+<div id="wf-runs"></div>
+<p class="p-note">Workflows come from a public third-party library and are not reviewed by SAM's authors. Read the risk flags before approving an import. Imports are always created inactive; activation is a separate decision.</p>
+</div></div>
 <div class="trade-card" id="card-routing"><div class="trade-card-header"><h3>AI Routing Profile</h3><button class="secondary-button" type="button" id="routing-refresh-btn">Refresh</button></div><div class="trade-card-body">
 <div class="sam-action-row"><select class="text-field" id="routing-profile-select" style="flex:1;min-width:180px">
 <option value="PREMIUM">Premium &#183; configured model chain</option>
@@ -1244,6 +1258,7 @@
     <script src="./app.js" defer></script>
     <script src="./panels.js" defer></script>
     <script src="./routing-panel.js" defer></script>
+    <script src="./workflow-intelligence.js" defer></script>
     <script src="./agent-panel.js" defer></script>
   </body>
 </html>

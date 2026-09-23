@@ -150,6 +150,19 @@ class RiskPolicy:
             return PolicyDecision(True, False, RiskLevel.LOW, "Versioned local trading-memory update; existing versions are not overwritten.")
         if tool_name in {"focus_tradingview", "set_tradingview_symbol", "set_tradingview_timeframe"}:
             return PolicyDecision(True, True, RiskLevel.MEDIUM, "Changing a desktop application's state requires explicit approval when initiated by a model tool call.")
+        if tool_name == "workflow_import":
+            return PolicyDecision(
+                True, True, RiskLevel.HIGH,
+                "Importing creates a workflow in your n8n instance. It is created inactive, but the "
+                "workflow came from a third party and should be read before it is approved.",
+            )
+        if tool_name == "workflow_activate":
+            turning_on = bool(arguments.get("active"))
+            return PolicyDecision(
+                True, True, RiskLevel.HIGH if turning_on else RiskLevel.MEDIUM,
+                "Activating starts schedules and exposes webhooks, so the workflow keeps acting after "
+                "this run ends." if turning_on else "Deactivating stops a running automation.",
+            )
         if tool_name == "stop_process":
             return PolicyDecision(True, True, RiskLevel.HIGH, "Stopping a process can lose unsaved work and requires explicit approval.")
         if tool_name == "window_action":

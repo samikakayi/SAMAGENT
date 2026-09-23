@@ -89,6 +89,10 @@ class Settings:
     # Groq and Gemini both publish OpenAI-compatible chat endpoints, so they
     # reuse the adapter OpenRouter and LiteLLM already share. Base URLs stay
     # configurable: a provider moving a path must not need a code release.
+    # Optional automation engine. SAM never learns n8n's credential values;
+    # it references them by the opaque IDs n8n already exposes.
+    n8n_base_url: str = ""
+    n8n_api_key: str | None = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_api_key: str | None = None
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -173,6 +177,7 @@ class Settings:
             litellm_strong_model=os.getenv("LITELLM_STRONG_MODEL", "sam-strong"),
             litellm_vision_model=os.getenv("LITELLM_VISION_MODEL", "sam-vision"),
             openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
+            n8n_base_url=os.getenv("N8N_BASE_URL", "").rstrip("/"),
             groq_base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
             gemini_base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/"),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
