@@ -189,8 +189,10 @@ class ToolExecutor:
         record = self.database.authorize_approval(approval_id, decision, note)
         if record is None:
             raise KeyError("Approval not found")
-        expected_status = "executing" if decision == "approved" else "denied"
-        if record["status"] != expected_status:
+        # `claimed` distinguishes the caller that moved this approval out of
+        # pending from one that merely found it already taken. The status alone
+        # cannot: an approval being executed right now also reads `executing`.
+        if not record.get("claimed"):
             raise ApprovalStateError(f"Approval is already {record['status']}")
 
         call = ToolCall(record["tool_call_id"], record["tool_name"], record["arguments"])
