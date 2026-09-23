@@ -111,17 +111,32 @@ def test_a_pid_alone_is_not_ownership(tmp_path):
     assert engine._owned_process(999_999_999) is None
 
 
-def test_a_process_whose_command_names_the_runtime_is_ours(tmp_path):
+def test_a_process_whose_command_names_the_entrypoint_is_ours(tmp_path):
     engine = runtime(tmp_path)
-    # A real child process whose command line contains the runtime path, which
-    # is exactly the evidence `stop` requires.
-    marker = str(engine.runtime_dir)
-    child = subprocess.Popen([sys.executable, "-c",
-                              f"import time,sys; sys.argv.append({marker!r}); time.sleep(30)",
-                              marker],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # A real child process whose command line contains n8n's own bin script,
+    # which is exactly the evidence `stop` requires.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", str(engine.entrypoint)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         assert engine._owned_process(child.pid) is not None
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+def test_naming_the_runtime_directory_alone_is_not_ownership(tmp_path):
+    """Otherwise a broad SAM_N8N_RUNTIME_DIR would make unrelated processes killable.
+
+    Ownership decides what may be terminated, so it matches the full path to
+    n8n's bin script rather than a directory substring an operator chose.
+    """
+    engine = runtime(tmp_path)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", str(engine.runtime_dir)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert engine._owned_process(child.pid) is None
     finally:
         child.kill()
         child.wait(timeout=10)

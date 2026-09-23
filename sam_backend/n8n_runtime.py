@@ -175,7 +175,13 @@ class ManagedN8nRuntime:
             line = " ".join(process.cmdline() or [])
         except Exception:  # noqa: BLE001 - gone, denied, or psutil unavailable
             return None
-        marker = str(self.runtime_dir).replace("\\", "/").lower()
+        # The entrypoint, not the directory. A directory substring is only as
+        # specific as whatever the operator put in SAM_N8N_RUNTIME_DIR -- set
+        # to something broad, it would match unrelated processes and this
+        # method decides what may be killed. The full path to n8n's own bin
+        # script is the narrowest evidence available and is what the command
+        # line actually contains.
+        marker = str(self.entrypoint).replace("\\", "/").lower()
         if marker and marker in line.replace("\\", "/").lower():
             return process
         return None

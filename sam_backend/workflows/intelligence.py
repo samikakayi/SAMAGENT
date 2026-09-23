@@ -43,6 +43,8 @@ class WorkflowIntelligence:
         self.router = router
         self.library = library or GitHubWorkflowLibrary(Path(getattr(settings, "data_dir", ".")))
         self._n8n = n8n
+        self._client: N8nClient | None = None
+        self._client_identity: tuple[str, str | None] | None = None
         self._artifacts: dict[str, tuple[float, WorkflowArtifact]] = {}
 
     # -- the configured instance, and only that one ------------------------
@@ -55,8 +57,16 @@ class WorkflowIntelligence:
         """
         if self._n8n is not None:
             return self._n8n
-        return N8nClient(getattr(self.settings, "n8n_base_url", "") or "",
-                         getattr(self.settings, "n8n_api_key", None))
+        base_url = getattr(self.settings, "n8n_base_url", "") or ""
+        api_key = getattr(self.settings, "n8n_api_key", None)
+        # Cached per (url, key) rather than rebuilt blindly: a credential or
+        # host change still produces a new client, but an unchanged one keeps
+        # what it learned -- notably whether this instance has the current
+        # publish endpoint, which was otherwise re-probed on every call.
+        if self._client is None or self._client_identity != (base_url, api_key):
+            self._client = N8nClient(base_url, api_key)
+            self._client_identity = (base_url, api_key)
+        return self._client
 
     # -- read ---------------------------------------------------------------
     def search(self, query: str = "", **filters: Any) -> dict[str, Any]:
