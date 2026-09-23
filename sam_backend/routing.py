@@ -9,6 +9,10 @@ from .config import Settings
 from .db import Database
 from .models import AdapterRegistry, AssistantTurn, ErrorCategory, ModelError
 from .provider_health import CONFIRMED_UNAVAILABLE, ProviderHealth
+from .routing_profiles import (
+    Eligibility, FreeCandidate, eligibility, normalise_profile, parse_candidates,
+    usable_free_candidates,
+)
 
 
 @dataclass(slots=True)
@@ -145,7 +149,18 @@ class ModelRouter:
         explicit = provider and provider.lower() not in {"auto", ""}
         if explicit:
             selected = provider.lower()
-            return profile, [RouteChoice(selected, self._model_for(selected, profile, model), "Explicit provider selection")]
+            named = RouteChoice(selected, self._model_for(selected, profile, model), "Explicit provider selection")
+            # FREE is a ceiling, not a preference. The orchestrator names its
+            # provider on every step -- it resolves one route and passes it
+            # down -- so without this the profile only ever constrained the
+            # chat path, and every autonomous run reached the configured model
+            # whatever the profile said.
+            if self.permits(named):
+                return profile, [named]
+            narrowed = self.apply_profile([named])
+            if not narrowed:
+                raise self._no_route_error()
+            return profile, narrowed
         budget = self.budget_state()
         if budget["mode"] == "LOCAL_ONLY":
             mode = "LOCAL_ONLY"
@@ -182,11 +197,88 @@ class ModelRouter:
             deduplicated.setdefault((choice.provider, choice.model), choice)
         ordered = list(deduplicated.values())
         ordered.sort(key=lambda choice: self.failures.get(choice.provider, 0))
+        ordered = self.apply_profile(ordered)
         if not ordered:
-            raise ModelError(
-                "No AI model route is available. Start Ollama with a downloaded model, configure LiteLLM, or set OPENROUTER_API_KEY."
-            )
+            raise self._no_route_error()
         return profile, ordered
+
+    def _no_route_error(self) -> ModelError:
+        """Say which rule left nothing to call, rather than one generic line.
+
+        FREE running out of candidates is a different situation from having no
+        provider configured at all, and reporting it as the latter would hide
+        that SAM refused to spend money on purpose.
+        """
+        selected = normalise_profile(getattr(self.settings, "routing_profile", None))
+        if selected != "FREE":
+            return ModelError(
+                "No AI model route is available. Start Ollama with a downloaded model, "
+                "configure LiteLLM, or set OPENROUTER_API_KEY."
+            )
+        usable, refused = usable_free_candidates(self.free_candidates())
+        if not self.free_candidates():
+            detail = "no free-tier candidates are configured"
+        elif not usable:
+            detail = "every configured candidate is published by its provider as paid"
+        else:
+            detail = "every free-tier candidate was unavailable"
+        if refused:
+            detail += f" ({len(refused)} refused as paid)"
+        return ModelError(
+            f"FREE routing has nothing left to call: {detail}. SAM will not fall back to a "
+            "paid model while FREE is active; add a free-tier candidate or switch to BALANCED.",
+            ErrorCategory.NOT_CONFIGURED,
+        )
+
+    # -- routing profile ---------------------------------------------------
+    def free_candidates(self) -> list[FreeCandidate]:
+        return parse_candidates(getattr(self.settings, "free_candidates", []))
+
+    def permits(self, choice: RouteChoice) -> bool:
+        """Whether this profile may reach this specific model.
+
+        Only FREE refuses anything: a candidate the operator listed is theirs
+        to name, and one published as paid is refused however it was chosen.
+        """
+        if normalise_profile(getattr(self.settings, "routing_profile", None)) != "FREE":
+            return True
+        if eligibility(choice.provider, choice.model) is Eligibility.FREE:
+            return True
+        listed = {(c.provider, c.model) for c in usable_free_candidates(self.free_candidates())[0]}
+        return (choice.provider, choice.model) in listed
+
+    def apply_profile(self, configured: list[RouteChoice]) -> list[RouteChoice]:
+        """Narrow or widen the configured chain according to the profile.
+
+        PREMIUM returns the chain untouched, so an installation that never set
+        a profile routes exactly as it did before profiles existed. FREE keeps
+        only the free candidates, in the operator's order -- no failure-count
+        reordering, because the configured order is the whole promise. BALANCED
+        puts those first and keeps the configured chain behind them.
+        """
+        selected = normalise_profile(getattr(self.settings, "routing_profile", None))
+        if selected == "PREMIUM":
+            return configured
+        usable, _refused = usable_free_candidates(self.free_candidates())
+        free = [
+            RouteChoice(candidate.provider, candidate.model, f"{selected} free-tier candidate")
+            for candidate in usable
+        ]
+        if selected == "FREE":
+            return free
+        seen = {(choice.provider, choice.model) for choice in free}
+        return free + [c for c in configured if (c.provider, c.model) not in seen]
+
+    def profile_state(self) -> dict[str, Any]:
+        """Why the next run will reach what it reaches, without secrets."""
+        selected = normalise_profile(getattr(self.settings, "routing_profile", None))
+        usable, refused = usable_free_candidates(self.free_candidates())
+        return {
+            "routing_profile": selected,
+            "free_candidates": [candidate.as_dict() for candidate in usable],
+            "refused_candidates": refused,
+            "paid_fallback_allowed": selected != "FREE",
+        }
 
     async def complete(
         self,

@@ -57,6 +57,10 @@ def tool_specs(registry: Any) -> list[dict[str, Any]]:
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
         }, ["code"])),
         ("open_url", "Open an http(s) URL in the user's default browser.", _schema({"url": {"type": "string"}}, ["url"])),
+        ("web_search", "Search the public web and return titles, URLs and snippets. Read-only: it fetches results, it does not open pages or run anything.", _schema({
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+        }, ["query"])),
         ("browser_automate", "Run a bounded browser workflow in a fresh profile with no saved cookies or passwords. Interactive actions require approval.", _schema({
             "url": {"type": "string"},
             "actions": {
@@ -218,6 +222,9 @@ def tool_manifests(registry: Any) -> list[dict[str, Any]]:
         "list_files": "filesystem", "search_files": "filesystem", "read_file": "filesystem", "write_file": "filesystem",
         "replace_text": "filesystem", "delete_path": "destructive_actions", "run_terminal": "shell", "run_python": "shell",
         "open_url": "browser", "browser_automate": "browser", "launch_app": "applications",
+        # Reading search results is a network read, not browser control: it
+        # opens nothing and runs nothing on the machine.
+        "web_search": "network",
         "market_snapshot": "network", "analyze_market": "network", "get_tradingview_state": "desktop",
         "focus_tradingview": "desktop", "set_tradingview_symbol": "desktop", "set_tradingview_timeframe": "desktop",
         "list_processes": "applications", "process_info": "applications", "stop_process": "destructive_actions",

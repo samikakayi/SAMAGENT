@@ -84,6 +84,8 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
             ("openrouter_api_key", "openrouter_api_key"),
             ("openai_api_key", "openai_api_key"),
             ("litellm_api_key", "litellm_api_key"),
+            ("groq_api_key", "groq_api_key"),
+            ("gemini_api_key", "gemini_api_key"),
         ):
             value, _ = resolve_credential(name, secret_store)
             setattr(settings, attribute, value)

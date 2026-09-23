@@ -595,9 +595,26 @@
 <div class="level-row"><span class="level-label">OpenRouter</span><span class="badge badge-subtle" id="provider-openrouter">UNKNOWN</span></div>
 <div class="level-row"><span class="level-label">Ollama</span><span class="badge badge-subtle" id="provider-ollama">UNKNOWN</span></div>
 <div class="level-row"><span class="level-label">LiteLLM</span><span class="badge badge-subtle" id="provider-litellm">UNKNOWN</span></div>
+<div class="level-row"><span class="level-label">Groq</span><span class="badge badge-subtle" id="provider-groq">UNKNOWN</span></div>
+<div class="level-row"><span class="level-label">Gemini</span><span class="badge badge-subtle" id="provider-gemini">UNKNOWN</span></div>
 <p class="p-note" id="provider-detail">Provider health has not been checked yet.</p>
 <div class="sam-action-row"><input type="password" id="openrouter-key-input" placeholder="OpenRouter API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><button class="primary-button" type="button" id="openrouter-save-btn">Configure</button><button class="secondary-button" type="button" id="ollama-start-btn">Start Ollama</button></div>
+<div class="sam-action-row"><input type="password" id="groq-key-input" placeholder="Groq API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><input type="password" id="gemini-key-input" placeholder="Gemini API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><button class="primary-button" type="button" id="free-keys-save-btn">Configure</button></div>
 <p class="p-note">The key is sent to the local backend only, stored outside the web root, and never returned to this page.</p>
+</div></div>
+<div class="trade-card" id="card-routing"><div class="trade-card-header"><h3>AI Routing Profile</h3><button class="secondary-button" type="button" id="routing-refresh-btn">Refresh</button></div><div class="trade-card-body">
+<div class="sam-action-row"><select class="text-field" id="routing-profile-select" style="flex:1;min-width:180px">
+<option value="PREMIUM">Premium &#183; configured model chain</option>
+<option value="BALANCED">Balanced &#183; free first, then configured</option>
+<option value="FREE">Free &#183; free-tier-eligible only</option>
+</select><button class="primary-button" type="button" id="routing-save-btn">Apply</button></div>
+<p class="p-note" id="routing-explainer">Premium uses the model chain you already configured.</p>
+<div class="level-row"><span class="level-label">Effective route</span><span class="level-value" id="routing-effective">&#8212;</span></div>
+<div class="level-row"><span class="level-label">Paid fallback</span><span class="badge badge-subtle" id="routing-paid-fallback">UNKNOWN</span></div>
+<p class="p-note"><strong>Free-tier only</strong> is a routing policy, not a billing guarantee: SAM will not choose a model it knows to be paid while Free is active, but what a provider charges under your account terms is theirs to decide.</p>
+<div class="sam-action-row"><input class="text-field" type="text" id="routing-candidate-input" placeholder="provider/model &#183; e.g. groq/llama-3.3-70b-versatile" autocomplete="off" spellcheck="false" style="flex:1;min-width:220px"><button class="secondary-button" type="button" id="routing-candidate-add">Add</button></div>
+<div id="routing-candidates"></div>
+<p class="p-note" id="routing-refused"></p>
 </div></div>
 <div class="trade-card" id="card-sorani"><div class="trade-card-header"><h3>Sorani Voice &#183; دەنگی سۆرانی</h3><button class="secondary-button" type="button" id="sorani-refresh-btn">Refresh</button></div><div class="trade-card-body">
 <div class="level-row"><span class="level-label">KurdishTTS speech recognition</span><span class="badge badge-subtle" id="sorani-stt-status">UNKNOWN</span></div>
@@ -1226,6 +1243,7 @@
     <script src="./i18n.js"></script>
     <script src="./app.js" defer></script>
     <script src="./panels.js" defer></script>
+    <script src="./routing-panel.js" defer></script>
     <script src="./agent-panel.js" defer></script>
   </body>
 </html>

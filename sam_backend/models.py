@@ -72,7 +72,17 @@ def classify_exception(exc: Exception) -> ErrorCategory:
     return ErrorCategory.UNKNOWN
 
 
-_CREDENTIAL_NOISE = re.compile(r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9._\-]{8,}|api[_-]?key\s*[:=]\s*\S+)")
+# Each provider stamps its keys differently, so adding a provider means
+# teaching this what its keys look like -- otherwise a provider that echoes
+# the request back in an error body leaks the key into logs and the UI.
+#   sk-    OpenAI and OpenRouter        gsk_  Groq        AIza  Google
+_CREDENTIAL_NOISE = re.compile(
+    r"(?i)(bearer\s+\S+"
+    r"|sk-[A-Za-z0-9._\-]{8,}"
+    r"|gsk_[A-Za-z0-9._\-]{8,}"
+    r"|AIza[A-Za-z0-9._\-]{8,}"
+    r"|api[_-]?key\s*[:=]\s*\S+)"
+)
 
 
 def sanitize_provider_message(message: str, limit: int = 300) -> str:
@@ -410,6 +420,40 @@ class OpenRouterAdapter(ChatCompletionsAdapter):
         )
 
 
+class GroqAdapter(ChatCompletionsAdapter):
+    """Groq's OpenAI-compatible endpoint, so the shared transport does the work.
+
+    Nothing here is Groq-specific beyond the address and the key: the same
+    retry policy, error classification and tool-call conversion apply, which is
+    the point of routing it through the shared adapter rather than a new one.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(
+            provider="groq",
+            base_url=settings.groq_base_url,
+            api_key=settings.groq_api_key,
+            key_required=True,
+        )
+
+
+class GeminiAdapter(ChatCompletionsAdapter):
+    """Gemini through Google's OpenAI-compatible surface.
+
+    Chosen over the Google SDK so Gemini answers SAM's provider contract by
+    construction instead of needing a translation layer, and so it inherits the
+    same error taxonomy every other provider already reports.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(
+            provider="gemini",
+            base_url=settings.gemini_base_url,
+            api_key=settings.gemini_api_key,
+            key_required=True,
+        )
+
+
 class LiteLLMAdapter(ChatCompletionsAdapter):
     def __init__(self, settings: Settings) -> None:
         super().__init__(
@@ -427,6 +471,8 @@ class AdapterRegistry:
             "openai": OpenAIResponsesAdapter(settings),
             "openrouter": OpenRouterAdapter(settings),
             "litellm": LiteLLMAdapter(settings),
+            "groq": GroqAdapter(settings),
+            "gemini": GeminiAdapter(settings),
         }
 
     @property

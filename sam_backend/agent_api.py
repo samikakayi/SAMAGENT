@@ -242,7 +242,9 @@ class AgentApi:
             the provider's free catalogue and key endpoints when refreshed.
             """
             resolution = await orchestrator.health.resolve(self._adapters(), refresh=refresh)
-            return {"resolution": resolution.as_dict()}
+            # Which models the profile even permits, so "why this model" can be
+            # answered without reading the settings table by hand.
+            return {"resolution": resolution.as_dict(), "routing": orchestrator.router.profile_state()}
 
         @router.get("/api/environment")
         async def get_environment() -> dict[str, Any]:
