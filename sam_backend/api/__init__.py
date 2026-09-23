@@ -11,6 +11,7 @@ from __future__ import annotations
 from .conversations import register_conversation_routes
 from .desktop import register_desktop_routes
 from .integrations import register_integration_routes
+from .n8n_runtime import register_n8n_runtime_routes
 from .oversight import register_oversight_routes
 from .providers import register_provider_routes
 from .security import register_local_request_guard
@@ -26,6 +27,7 @@ __all__ = [
     "register_conversation_routes",
     "register_desktop_routes",
     "register_integration_routes",
+    "register_n8n_runtime_routes",
     "register_oversight_routes",
     "register_local_request_guard",
     "register_provider_routes",

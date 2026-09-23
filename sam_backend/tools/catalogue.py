@@ -61,6 +61,7 @@ def tool_specs(registry: Any) -> list[dict[str, Any]]:
             "goal": {"type": "string"},
             "name": {"type": "string"},
             "credential_mapping": {"type": "object"},
+            "customize": {"type": "boolean"},
         }, ["goal"])),
         ("workflow_search", "Search the public n8n automation library by goal, service or category. Returns a handful of summaries, never whole workflows.", _schema({
             "query": {"type": "string"},

@@ -61,6 +61,61 @@
     }
   }
 
+  // -- the local n8n runtime ------------------------------------------------
+  // Two buttons and no text field, deliberately: the backend takes no path,
+  // port or command, so there is nothing here to type a command into. Start
+  // and stop are mutations and go through the same approval every other
+  // mutation does, which is why each is two clicks.
+  const RUNTIME_CLASS = {
+    RUNNING: "badge-success", STOPPED: "badge-subtle", STARTING: "badge-subtle",
+    NOT_INSTALLED: "badge-subtle", UNHEALTHY: "badge-danger",
+    PORT_CONFLICT: "badge-danger", UNKNOWN_PROCESS: "badge-danger",
+  };
+  const runtimeApproval = { start: null, stop: null };
+
+  async function refreshRuntime() {
+    try {
+      const state = await json("/api/n8n/runtime");
+      badge("n8n-runtime-state", state.state, RUNTIME_CLASS[state.state]);
+      text("n8n-runtime-detail", state.detail || "");
+      const start = $("n8n-runtime-start-btn");
+      const stop = $("n8n-runtime-stop-btn");
+      if (start) start.disabled = state.state === "RUNNING" || state.state === "NOT_INSTALLED";
+      if (stop) stop.disabled = state.state !== "RUNNING" && state.state !== "UNHEALTHY";
+      return state;
+    } catch (error) {
+      text("n8n-runtime-detail", error.message);
+      return null;
+    }
+  }
+
+  async function runtimeAction(action) {
+    const button = $(`n8n-runtime-${action}-btn`);
+    const label = action === "start" ? "Start local n8n" : "Stop";
+    if (button) button.disabled = true;
+    try {
+      const body = runtimeApproval[action] ? { approval_id: runtimeApproval[action] } : {};
+      const result = await json(`/api/n8n/runtime/${action}`, {
+        method: "POST", body: JSON.stringify(body),
+      });
+      if (result.approval_required) {
+        runtimeApproval[action] = result.approval_id;
+        text("n8n-runtime-detail", `Approval required (${result.risk_level}): ${result.reason}`);
+        if (button) { button.textContent = `Confirm ${action}`; button.disabled = false; }
+        return;
+      }
+      runtimeApproval[action] = null;
+      if (button) button.textContent = label;
+      text("n8n-runtime-detail", result.detail || "");
+      await refreshRuntime();
+      await refreshStatus();
+    } catch (error) {
+      runtimeApproval[action] = null;
+      if (button) { button.textContent = label; button.disabled = false; }
+      text("n8n-runtime-detail", error.message);
+    }
+  }
+
   // -- search ---------------------------------------------------------------
   async function search() {
     const query = $("wf-query")?.value?.trim() || "";
@@ -376,15 +431,19 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
+    $("n8n-runtime-start-btn")?.addEventListener("click", () => runtimeAction("start"));
+    $("n8n-runtime-stop-btn")?.addEventListener("click", () => runtimeAction("stop"));
     $("wf-goal-btn")?.addEventListener("click", planGoal);
     $("wf-goal")?.addEventListener("keydown", (event) => { if (event.key === "Enter") planGoal(); });
     $("wf-search-btn")?.addEventListener("click", search);
     $("wf-query")?.addEventListener("keydown", (event) => { if (event.key === "Enter") search(); });
-    $("wf-refresh-btn")?.addEventListener("click", () => { refreshStatus(); refreshRuns(); });
+    $("wf-refresh-btn")?.addEventListener("click", () => { refreshStatus(); refreshRuns(); refreshRuntime(); });
     refreshStatus();
+    refreshRuntime();
   });
 
   window.SAMWorkflows = { search, inspectWorkflow, prepareWorkflow, planGoal, refreshStatus,
+    refreshRuntime, runtimeAction,
     refreshRuns, prepared: () => prepared, renderResults, renderInspection, renderPrepared,
     renderPlan };
 })();

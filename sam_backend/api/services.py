@@ -33,6 +33,7 @@ from ..tools import ToolRegistry
 from ..trading.replay import BarReplayResearch
 from ..trading.service import TradingService
 from ..integrations import IntegrationHealth
+from ..n8n_runtime import ManagedN8nRuntime
 from ..verification import VerificationEngine
 from ..voice import VoiceService
 from ..workflows import WorkflowIntelligence
@@ -54,6 +55,7 @@ class AppServices:
     secrets: SecretStore
     provider_health: ProviderHealth
     integrations: IntegrationHealth
+    n8n_runtime: ManagedN8nRuntime
     router: ModelRouter
     agent: AgentService
     task_store: TaskStore

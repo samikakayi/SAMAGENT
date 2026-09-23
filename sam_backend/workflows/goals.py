@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from inspect import signature
 from typing import Any
 
+from .adaptation import AdaptationRejected, AdaptationUnavailable, adaptation_needed
 from .inspector import activation, inspect
 from .models import (
     RiskFlag,
@@ -103,12 +105,18 @@ class Candidate:
     score: int
     reasons: tuple[str, ...] = ()
     concerns: tuple[str, ...] = ()
+    # The subset of concerns that are about fit rather than safety. Risk is
+    # a reason to read carefully, not a reason to rewrite: adapting a
+    # workflow does not make it less dangerous, and treating every MEDIUM
+    # as a gap would send almost every real workflow to a model.
+    fit_gaps: tuple[str, ...] = ()
     inspection: WorkflowInspection | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
             **self.summary.as_dict(), "score": self.score,
             "reasons": list(self.reasons), "concerns": list(self.concerns),
+            "fit_gaps": list(self.fit_gaps),
         }
         if self.inspection is not None:
             payload["risk"] = self.inspection.risk.as_dict()
@@ -127,6 +135,11 @@ class GoalPlan:
     selected: Candidate | None = None
     selection_reason: str = ""
     adaptations: tuple[str, ...] = ()
+    # PROPOSED | NOT_NEEDED | UNAVAILABLE | REJECTED -- what became of the
+    # model step, separate from what the deterministic pipeline then found.
+    adaptation: str = "NOT_NEEDED"
+    adaptation_reason: str = ""
+    adaptation_claims: dict[str, Any] = field(default_factory=dict)
     artifact: WorkflowArtifact | None = None
     activation: dict[str, Any] = field(default_factory=dict)
     next_action: str = ""
@@ -141,6 +154,11 @@ class GoalPlan:
             "selected": self.selected.as_dict() if self.selected else None,
             "selection_reason": self.selection_reason,
             "adaptations": list(self.adaptations),
+            "adaptation": self.adaptation,
+            "adaptation_reason": self.adaptation_reason,
+            # Labelled claims, never findings: the risk and credential
+            # numbers a reviewer reads come from `prepared`, not from here.
+            "adaptation_claims": self.adaptation_claims,
             "activation": self.activation,
             "next_action": self.next_action,
             "blockers": list(self.blockers),
@@ -202,6 +220,7 @@ def score_candidate(summary: WorkflowSummary, reading: GoalReading,
     """Rank on things a reviewer can verify, never on a model's opinion."""
     reasons: list[str] = []
     concerns: list[str] = []
+    gaps: list[str] = []
     score = 0
 
     haystack = f"{summary.title} {' '.join(summary.services)} {summary.category}".lower()
@@ -215,6 +234,7 @@ def score_candidate(summary: WorkflowSummary, reading: GoalReading,
         reasons.append(f"starts the way the goal asks ({summary.trigger})")
     elif reading.trigger and summary.trigger not in ("", "unknown"):
         concerns.append(f"starts on {summary.trigger}, the goal asked for {reading.trigger}")
+        gaps.append(f"it starts on {summary.trigger} and the goal asked for {reading.trigger}")
 
     if inspection is not None:
         penalty = RISK_PENALTY.get(inspection.risk.level, 0)
@@ -236,8 +256,9 @@ def score_candidate(summary: WorkflowSummary, reading: GoalReading,
         if RiskFlag.UNKNOWN_NODE in inspection.risk.flags:
             score -= 10
             concerns.append("contains a node SAM cannot classify")
+            gaps.append("it contains a node SAM cannot classify")
 
-    return Candidate(summary, score, tuple(reasons), tuple(concerns), inspection)
+    return Candidate(summary, score, tuple(reasons), tuple(concerns), tuple(gaps), inspection)
 
 
 # --- generating, when nothing fits --------------------------------------------
@@ -305,7 +326,7 @@ def _coerce(value: str) -> Any:
 def plan_goal(
     goal: str, intelligence: Any, *, name: str = "",
     credential_mapping: dict[str, str] | None = None,
-    adapt: Any = None,
+    adapt: Any = None, customize: bool = False,
 ) -> GoalPlan:
     """Search, choose, adapt, validate and hash -- then stop.
 
@@ -344,7 +365,26 @@ def plan_goal(
 
     adaptations: list[str] = []
     if adapt is not None:
-        candidate, adaptations = _adapt(candidate, reading, adapt)
+        wanted, why = adaptation_needed(
+            origin=plan.origin,
+            score=best.score if (best is not None and plan.origin == "library") else 0,
+            concerns=best.fit_gaps if (best is not None and plan.origin == "library") else (),
+            requested=customize,
+        )
+        plan.adaptation_reason = why
+        if wanted:
+            candidate, adaptations, plan.adaptation = _adapt(
+                candidate, reading, adapt,
+                inspect(candidate) if plan.origin == "library" else None)
+            claims = getattr(adapt, "last_proposal", None)
+            if plan.adaptation == "PROPOSED" and claims is not None:
+                plan.adaptation_claims = claims.as_dict()
+        else:
+            # Not an omission: declining to spend a completion is the decision.
+            plan.adaptation = "NOT_NEEDED"
+    else:
+        plan.adaptation = "NOT_NEEDED"
+        plan.adaptation_reason = "Model adaptation is not enabled for this request."
 
     available: list[dict[str, str]] = []
     if credential_mapping and intelligence.n8n.configured:
@@ -393,12 +433,14 @@ def _shortlist(reading: GoalReading, intelligence: Any) -> list[Candidate]:
         rescored = score_candidate(candidate.summary, reading, inspect(workflow))
         candidate.score, candidate.reasons = rescored.score, rescored.reasons
         candidate.concerns, candidate.inspection = rescored.concerns, rescored.inspection
+        candidate.fit_gaps = rescored.fit_gaps
 
     scored.sort(key=lambda item: (-item.score, item.summary.size_bytes))
     return scored
 
 
-def _adapt(candidate: dict[str, Any], reading: GoalReading, adapt: Any) -> tuple[dict[str, Any], list[str]]:
+def _adapt(candidate: dict[str, Any], reading: GoalReading, adapt: Any,
+           inspection: Any = None) -> tuple[dict[str, Any], list[str], str]:
     """Let something else propose a change, then forget that it did.
 
     The proposal is only accepted as far as "these are bytes to inspect". It is
@@ -406,15 +448,27 @@ def _adapt(candidate: dict[str, Any], reading: GoalReading, adapt: Any) -> tuple
     model, and it is re-read from scratch on the way back.
     """
     redacted, _ = sanitize_for_model(candidate)
+    # The inspection is a courtesy, not a contract, so an adapter may take two
+    # arguments or three. Asking the signature rather than catching TypeError
+    # matters: a TypeError raised *inside* a three-argument adapter would
+    # otherwise look like an arity mismatch and call it a second time.
     try:
-        proposed = adapt(redacted, reading.goal)
+        takes_inspection = len(signature(adapt).parameters) >= 3
+    except (TypeError, ValueError):
+        takes_inspection = False
+    try:
+        proposed = adapt(redacted, reading.goal, inspection) if takes_inspection             else adapt(redacted, reading.goal)
+    except AdaptationUnavailable as exc:
+        return candidate, [f"Model adaptation was unavailable, so the workflow is unchanged: {exc}"], "UNAVAILABLE"
+    except AdaptationRejected as exc:
+        return candidate, [f"The model's proposal was rejected ({exc}), so the workflow is unchanged."], "REJECTED"
     except Exception as exc:  # noqa: BLE001 - an adapter is third-party by nature
         return candidate, [f"An adaptation was proposed but could not be read ({type(exc).__name__}); "
-                           "the original workflow is used unchanged."]
+                           "the original workflow is used unchanged."], "REJECTED"
     if not isinstance(proposed, dict) or not proposed.get("nodes"):
-        return candidate, ["The proposed adaptation was not a workflow, so it was discarded."]
+        return candidate, ["The proposed adaptation was not a workflow, so it was discarded."], "REJECTED"
     return proposed, ["A model proposed an adaptation; it was re-inspected and re-validated from "
-                      "scratch, and the diff below is what actually changed."]
+                      "scratch, and the diff below is what actually changed."], "PROPOSED"
 
 
 def _explain(best: Candidate, candidates: list[Candidate]) -> str:
