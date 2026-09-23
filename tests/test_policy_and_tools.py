@@ -256,8 +256,14 @@ def test_a_hostile_path_never_reaches_the_filesystem_unapproved(settings, tmp_pa
     )
 
 
-@pytest.mark.parametrize("path", ["C:ESCAPED.txt", "..%2FESCAPED.txt"])
-def test_a_path_that_only_looks_like_an_escape_stays_inside(settings, tmp_path, path):
+@pytest.mark.parametrize("shape", [
+    # A drive-relative path only stays inside when it names the workspace's own
+    # drive; written as a literal "C:" it silently became a real escape on any
+    # machine whose workspace is elsewhere, which is a different test.
+    lambda workspace: f"{workspace.drive}ESCAPED.txt",
+    lambda workspace: "..%2FESCAPED.txt",
+])
+def test_a_path_that_only_looks_like_an_escape_stays_inside(settings, tmp_path, shape):
     """Two shapes that resolve inside the workspace, and must keep doing so.
 
     A drive-relative path joins onto the workspace drive, and percent-encoding
@@ -266,9 +272,25 @@ def test_a_path_that_only_looks_like_an_escape_stays_inside(settings, tmp_path, 
     """
     policy = RiskPolicy(settings)
     workspace = Path(settings.workspace_root)
+    path = shape(workspace)
 
     decision = policy.evaluate("write_file", {"path": path, "content": "x"})
     resolved = (workspace / Path(path)).resolve(strict=False)
 
     assert decision.allowed and not decision.approval_required
     assert resolved.is_relative_to(workspace), f"{path} resolved outside the workspace"
+
+
+def test_a_drive_relative_path_on_another_drive_is_not_treated_as_inside(settings, tmp_path):
+    """The other half of the same rule, and the reason the case above is drive-derived.
+
+    Naming a drive that is not the workspace's leaves the workspace entirely, so
+    it must be refused or held for approval rather than quietly written.
+    """
+    workspace = Path(settings.workspace_root)
+    elsewhere = "Z:" if workspace.drive.upper() != "Z:" else "Y:"
+    policy = RiskPolicy(settings)
+
+    decision = policy.evaluate("write_file", {"path": f"{elsewhere}ESCAPED.txt", "content": "x"})
+
+    assert not decision.allowed or decision.approval_required
