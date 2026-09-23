@@ -718,3 +718,41 @@ def test_switching_off_ends_the_follow_up_window_too():
     assert voice.listen_calls == 1, "a follow-up was captured after switching off"
     assert voice.spoken == ["Gold is quiet."]
     assert session.status.state.value == "OFF"
+
+
+def test_a_yes_or_no_detector_never_cuts_a_sentence_in_progress():
+    """Round 3, R1: a detector that can only say "heard it" has no boundary.
+
+    Mid-sentence, treating the phrase as filling the window threw the start
+    of the command away and submitted the rest. Such a detector now wakes only
+    once the speaker has finished, and then carries nothing forward.
+    """
+    detector = ScriptedDetector(["hey sam"] * 5)
+    session, voice, _ = run([quiet(0.3), phrase(), command(5.5), quiet(1.5)], detector=detector,
+                            voice=OneBreathVoice(["open gold"], transcripts=["the tail of a command"]))
+    finish(session, voice, seconds=10.0)
+
+    assert voice.transcribed == [], "part of a sentence in progress was sent as the command"
+    assert session.transcripts == ["open gold"], "SAM should have asked for the command"
+
+
+def test_words_heard_after_switching_off_are_not_acted_on():
+    """Round 3, R3: a capture already running when hands-free is switched off.
+
+    It finishes on its own time -- up to twenty seconds -- and what it heard
+    used to be transcribed, answered and spoken anyway.
+    """
+    voice = OneBreathVoice(["close all positions"])
+    session = controller(voice=voice)
+    original = voice.listen_once
+
+    def listen_while_switched_off(**kwargs):
+        heard = original(**kwargs)
+        session.stop()  # switched off while the words were being spoken
+        return heard
+
+    voice.listen_once = listen_while_switched_off
+    session.run_session()
+
+    assert session.transcripts == [] and voice.spoken == [], "SAM acted on words heard after switching off"
+    assert session.status.state.value == "OFF"

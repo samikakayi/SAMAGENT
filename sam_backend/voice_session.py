@@ -189,6 +189,10 @@ class VoiceConversationController:
             if not follow_up and detection is None:
                 self._set(VoiceState.LISTENING, "Listening…")
             heard = self._capture()
+            if self.wake.stopped:
+                # Switched off while that capture was running: whatever it
+                # heard arrived after the user said stop, and is not acted on.
+                return {"captured": False, "spoke": False}
         if not heard.get("captured"):
             if not follow_up:
                 self._set(VoiceState.WAKE_LISTENING, "I did not catch that.",

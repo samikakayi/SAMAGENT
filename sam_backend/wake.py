@@ -283,6 +283,10 @@ class WakeDetector:
         raise NotImplementedError
 
     def locate(self, audio: Any, phrase: str, *, complete: bool = True) -> float | None:  # pragma: no cover
+        # No boundary to cut at: only a finished utterance can be a wake, and
+        # then nothing in it is carried forward.
+        if not complete:
+            return None
         return len(audio) / SAMPLE_RATE if self.detect(audio, phrase) else None
 
     @property
@@ -751,12 +755,16 @@ class WakeWordService:
 
         A detector that can only say yes or no is treated as if the phrase
         filled the window: nothing in it is carried forward, and the command is
-        whatever is said next.
+        whatever is said next. It has no boundary to cut at, so it is not asked
+        mid-sentence at all -- cutting there would keep the end of a command
+        and lose its start.
         """
         locate = getattr(self.detector, "locate", None)
         if callable(locate):
             end = locate(window, self.phrase, complete=complete)
             return None if end is None else float(end)
+        if not complete:
+            return None
         return len(window) / SAMPLE_RATE if self.detector.detect(window, self.phrase) else None
 
     def _examine(self, span: int | None = None) -> bool:
