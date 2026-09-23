@@ -362,3 +362,66 @@ def test_readiness_means_the_public_api_not_merely_healthz(tmp_path):
     finally:
         module.httpx.Client = original
     assert "/api/v1/workflows" in seen
+
+
+# --- SAM's own instance, while it is still coming up ----------------------------
+#
+# n8n answers /healthz well before it mounts its public API, so there is a real
+# window where the managed process is alive and `healthy()` is still False. If
+# the recorded pid does not match in that window -- a cleared record, a restart,
+# a launch whose pid was never written -- SAM looked at the port, saw a
+# listener, and called its own instance somebody else's.
+
+
+def test_its_own_starting_instance_is_not_called_a_port_conflict(tmp_path):
+    """The healthy path reattaches to an owned listener; this path forgot to."""
+    engine = runtime(tmp_path)
+    engine.healthy = lambda timeout=4.0: False  # alive, API not mounted yet
+
+    class Ours:
+        pid = 4242
+
+    engine._port_owner = lambda: Ours()
+    # Nothing recorded -- but the listener is demonstrably the managed n8n.
+    engine._owned_process = lambda pid: object() if pid == 4242 else None
+
+    status = engine.status()
+
+    assert status.state is RuntimeState.UNHEALTHY, "it is SAM's own n8n, still starting"
+    assert status.state is not RuntimeState.PORT_CONFLICT
+    assert status.record.pid == 4242, "and the record reattaches to it"
+
+
+def test_starting_while_its_own_instance_comes_up_waits_instead_of_refusing(tmp_path):
+    """PORT_CONFLICT makes start() refuse, so the false verdict blocked the feature."""
+    engine = runtime(tmp_path)
+
+    class Ours:
+        pid = 4242
+
+    engine._port_owner = lambda: Ours()
+    engine._owned_process = lambda pid: object() if pid == 4242 else None
+    answers = iter([False, False, True])
+    engine.healthy = lambda timeout=4.0: next(answers, True)
+
+    status = engine.start(timeout=20)
+
+    assert status.state is RuntimeState.RUNNING
+    assert "already starting" in status.detail
+
+
+def test_a_listener_that_is_not_ours_is_still_a_port_conflict(tmp_path):
+    """The refusal has to survive: a stranger on the port is still a stranger."""
+    engine = runtime(tmp_path)
+    engine.healthy = lambda timeout=4.0: False
+
+    class Foreign:
+        pid = os.getpid()
+
+    engine._port_owner = lambda: Foreign()
+
+    status = engine.status()
+
+    assert status.state is RuntimeState.PORT_CONFLICT
+    assert status.record.pid is None, "SAM does not adopt a pid it cannot vouch for"
+    assert engine.start().state is RuntimeState.PORT_CONFLICT

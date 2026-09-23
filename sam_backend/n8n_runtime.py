@@ -245,6 +245,17 @@ class ManagedN8nRuntime:
             return RuntimeStatus(RuntimeState.UNHEALTHY, record=record, url=self.url,
                                  detail="The managed n8n process is alive but not answering yet.")
         listener = self._port_owner()
+        if listener is not None and self._owned_process(listener.pid) is not None:
+            # n8n answers /healthz long before it mounts its public API, so
+            # there is a real window where the managed process is alive and
+            # `healthy()` is still False. Without this, a record that did not
+            # name that pid -- cleared, restarted, never written -- made SAM
+            # call its own starting instance somebody else's, and PORT_CONFLICT
+            # makes start() refuse. The healthy path above already reattaches;
+            # this one has the same duty.
+            record = self._write_record(pid=listener.pid)
+            return RuntimeStatus(RuntimeState.UNHEALTHY, record=record, url=self.url,
+                                 detail="The managed n8n process is alive but not answering yet.")
         if listener is not None:
             return RuntimeStatus(RuntimeState.PORT_CONFLICT, record=record, url=self.url,
                                  detail=(f"Port {self.port} is held by another process, so the managed "
