@@ -83,10 +83,11 @@ def register_workflow_routes(application: FastAPI, sv: AppServices) -> None:
         if claimed.get("tool_name") != tool or claimed.get("arguments") != arguments:
             raise HTTPException(409, {"error": "That approval was granted for a different action.",
                                       "code": "VALIDATION_FAILED"})
-        # `authorize_approval` only moves pending -> executing, so a second
-        # attempt finds it already spent. Recording the result below is what
-        # closes that window, exactly as the tool execution path does.
-        if claimed.get("status") != "executing":
+        # `claimed` is true only for the caller that actually moved this
+        # approval out of pending. Reading the status instead let a second
+        # request arriving mid-execution see `executing` and take it for
+        # success, which imported the same workflow twice.
+        if not claimed.get("claimed"):
             raise HTTPException(409, {"error": f"Approval is already {claimed.get('status')}.",
                                       "code": "VALIDATION_FAILED"})
         return None

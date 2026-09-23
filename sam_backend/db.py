@@ -484,7 +484,15 @@ class Database:
         return self.get_approval(approval_id)
 
     def authorize_approval(self, approval_id: str, decision: str, note: str = "") -> dict[str, Any] | None:
-        """Atomically deny or claim a single-use approval for execution."""
+        """Atomically deny or claim a single-use approval for execution.
+
+        The returned record carries `claimed`: True only when *this* call moved
+        the approval out of `pending`. Callers used to infer that from the
+        resulting status, which cannot distinguish "I just claimed it" from "it
+        was already claimed and is running right now" -- both read `executing`.
+        Two requests arriving together therefore both passed, and a single
+        approval imported a workflow twice.
+        """
         now = utc_now()
         with self._write_lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -495,18 +503,19 @@ class Database:
             record = dict(row)
             if record["status"] != "pending":
                 connection.rollback()
-                return self._decode_approval(record)
+                return {**self._decode_approval(record), "claimed": False}
             if record["expires_at"] <= now:
                 connection.execute("UPDATE approvals SET status='expired', decided_at=? WHERE id=?", (now, approval_id))
                 connection.commit()
-                return self.get_approval(approval_id)
+                return {**(self.get_approval(approval_id) or {}), "claimed": False}
             new_status = "executing" if decision == "approved" else "denied"
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE approvals SET status=?, decided_at=?, decision_note=? WHERE id=? AND status='pending'",
                 (new_status, now, note[:1000], approval_id),
             )
+            claimed = cursor.rowcount == 1
             connection.commit()
-        return self.get_approval(approval_id)
+        return {**(self.get_approval(approval_id) or {}), "claimed": claimed}
 
     def set_approval_result(self, approval_id: str, result: dict[str, Any], status: str = "executed") -> None:
         with self._write_lock, self.connect() as connection:

@@ -52,7 +52,9 @@ def register_n8n_runtime_routes(application: FastAPI, sv: AppServices) -> None:
         if claimed.get("tool_name") != tool or claimed.get("arguments") != arguments:
             raise HTTPException(409, {"error": "That approval was granted for a different action.",
                                       "code": "VALIDATION_FAILED"})
-        if claimed.get("status") != "executing":
+        # Only the caller that actually claimed it may act; a second request
+        # arriving mid-start would otherwise see `executing` and proceed.
+        if not claimed.get("claimed"):
             raise HTTPException(409, {"error": f"Approval is already {claimed.get('status')}.",
                                       "code": "VALIDATION_FAILED"})
         return None
