@@ -89,6 +89,11 @@ class SettingsUpdate(BaseModel):
     voice_vad_threshold: float | None = Field(default=None, ge=0.001, le=1)
     voice_silence_ms: int | None = Field(default=None, ge=100, le=10000)
     voice_wake_word: str | None = Field(default=None, min_length=1, max_length=40)
+    voice_input_device: int | None = Field(default=None, ge=0, le=512)
+    hands_free_enabled: bool | None = None
+    hands_free_sensitivity: Literal["LOW", "NORMAL", "HIGH"] | None = None
+    hands_free_continuation_seconds: float | None = Field(default=None, ge=0, le=120)
+    hands_free_auto_speak: bool | None = None
     # Which KurdishTTS voice speaks Sorani replies; blank means the default.
     sorani_speaker_id: str | None = Field(default=None, max_length=80)
 

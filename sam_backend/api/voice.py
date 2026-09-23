@@ -24,6 +24,28 @@ def register_voice_routes(application: FastAPI, sv: AppServices) -> None:
     database = sv.database
     cancellation = sv.cancellation
     voice = sv.voice
+    @application.get("/api/voice/handsfree")
+    async def handsfree_status() -> dict[str, Any]:
+        """What the hands-free loop is doing. Read-only, and never audio."""
+        return sv.voice_session.describe()
+
+    @application.post("/api/voice/handsfree/start")
+    async def handsfree_start() -> dict[str, Any]:
+        """Begin listening for the wake phrase.
+
+        Refuses while the setting is off rather than quietly turning it on:
+        switching a microphone on is the user's decision, made in Settings.
+        """
+        if not sv.settings.hands_free_enabled:
+            raise HTTPException(409, {
+                "error": "Hands-free voice is switched off. Enable it in Settings first.",
+                "code": "NOT_CONFIGURED"})
+        return await asyncio.to_thread(sv.voice_session.start)
+
+    @application.post("/api/voice/handsfree/stop")
+    async def handsfree_stop() -> dict[str, Any]:
+        return await asyncio.to_thread(sv.voice_session.stop)
+
     @application.get("/api/voice/capabilities")
     async def voice_capabilities() -> dict[str, Any]:
         local = await asyncio.to_thread(voice.capabilities)

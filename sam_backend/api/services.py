@@ -36,6 +36,7 @@ from ..integrations import IntegrationHealth
 from ..n8n_runtime import ManagedN8nRuntime
 from ..verification import VerificationEngine
 from ..voice import VoiceService
+from ..voice_session import VoiceConversationController
 from ..workflows import WorkflowIntelligence
 from ..windows_control import WindowsController
 
@@ -62,6 +63,7 @@ class AppServices:
     orchestrator: AutonomousOrchestrator
     agent_api: AgentApi
     voice: VoiceService
+    voice_session: VoiceConversationController
     replay: BarReplayResearch
     workflows: WorkflowIntelligence
     # Re-resolve credentials and swap the adapter registry in place, so a new
