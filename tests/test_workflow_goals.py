@@ -616,3 +616,23 @@ def test_no_service_vocabulary_means_no_services_claimed():
 
     assert reading.services == ()
     assert reading.keywords, "the keywords are still what the search uses"
+
+
+def test_a_tie_is_described_as_a_tie_not_as_winning(tmp_path):
+    """Two candidates on the same score were not 'ahead' of each other."""
+    body = workflow(GMAIL_TRIGGER, node("Save", "n8n-nodes-base.googleDrive"))
+    entries = {
+        "big": (WorkflowSummary(workflow_id="big", title="Gmail invoices to Drive big",
+                                services=("gmail", "drive"), trigger="triggered",
+                                category="email", size_bytes=9000), body),
+        "small": (WorkflowSummary(workflow_id="small", title="Gmail invoices to Drive small",
+                                  services=("gmail", "drive"), trigger="triggered",
+                                  category="email", size_bytes=100), body),
+    }
+
+    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()))
+
+    assert plan.selected.summary.workflow_id == "small", "the simpler one wins a tie"
+    assert plan.candidates[0].score == plan.candidates[1].score
+    assert "level with" in plan.selection_reason
+    assert "ahead of" not in plan.selection_reason

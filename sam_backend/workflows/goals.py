@@ -418,12 +418,17 @@ def _adapt(candidate: dict[str, Any], reading: GoalReading, adapt: Any) -> tuple
 
 
 def _explain(best: Candidate, candidates: list[Candidate]) -> str:
-    parts = [f"{best.summary.title!r} scored highest"]
+    parts = [f"{best.summary.title!r} scored {best.score}"]
     if best.reasons:
         parts.append("because it " + "; ".join(best.reasons))
     runner_up = candidates[1] if len(candidates) > 1 else None
     if runner_up is not None:
-        parts.append(f"ahead of {runner_up.summary.title!r} ({runner_up.score} vs {best.score})")
+        # A tie broken by size is not "scoring higher", and saying it did
+        # would be inventing a distinction the scorer never made.
+        parts.append(
+            f"level with {runner_up.summary.title!r} on {best.score}, and chosen for being smaller"
+            if runner_up.score == best.score
+            else f"ahead of {runner_up.summary.title!r} on {runner_up.score}")
     if best.concerns:
         parts.append("Worth knowing: " + "; ".join(best.concerns) + ".")
     return ". ".join(parts[:3]) + ("" if parts[-1].endswith(".") else ".")
