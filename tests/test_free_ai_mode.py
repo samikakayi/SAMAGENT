@@ -710,3 +710,75 @@ def test_no_credential_field_can_reach_the_page_by_being_forgotten():
     assert public["groq_configured"] is True and public["gemini_configured"] is True
     # Names the page already reads keep working.
     assert public["openrouter_configured"] is True and public["litellm_key_configured"] is True
+
+
+# --- FREE is a ceiling, not a preference --------------------------------------
+#
+# `route()` short-circuits when a caller names a provider explicitly, and
+# AutonomousOrchestrator always does: it resolves `active_route` from
+# ProviderHealth and passes that provider and model into every step. So the
+# short-circuit was the path every autonomous run took, and FREE never reached
+# it -- the profile only constrained the chat path that omits a provider.
+
+async def routed(router, **kwargs):
+    _, chain = await router.route("do the thing", **kwargs)
+    return references(chain)
+
+
+def live_router(tmp_path, profile, candidates, **overrides):
+    """A real ModelRouter, so the explicit path is exercised as it ships."""
+    from sam_backend.db import Database
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d",
+                        openrouter_api_key="sk-or-ROUTEPROBE", **overrides)
+    settings.prepare()
+    settings.routing_profile, settings.free_candidates = profile, candidates
+    return ModelRouter(settings, AdapterRegistry(settings), Database(settings.database_path))
+
+
+def test_free_refuses_an_explicitly_named_paid_model(tmp_path):
+    """The orchestrator names its provider every step; FREE must still hold."""
+    router = live_router(tmp_path, "FREE", ["groq/llama-3.3-70b-versatile"])
+
+    chain = asyncio.run(routed(router, provider="openrouter", model="anthropic/claude-sonnet-4"))
+
+    assert "openrouter/anthropic/claude-sonnet-4" not in chain, "a paid model was reached under FREE"
+    assert chain == ["groq/llama-3.3-70b-versatile"]
+
+
+def test_free_with_no_candidates_refuses_an_explicit_paid_model_outright(tmp_path):
+    router = live_router(tmp_path, "FREE", [])
+
+    with pytest.raises(ModelError) as raised:
+        asyncio.run(routed(router, provider="openrouter", model="anthropic/claude-sonnet-4"))
+
+    assert raised.value.category is ErrorCategory.NOT_CONFIGURED
+    assert "will not fall back to a paid model" in str(raised.value)
+
+
+def test_free_still_honours_an_explicit_choice_that_is_free_eligible(tmp_path):
+    """Naming a free model explicitly is allowed -- it costs nothing."""
+    router = live_router(tmp_path, "FREE", ["groq/a"])
+
+    chain = asyncio.run(routed(router, provider="openrouter", model="some/model:free"))
+
+    assert chain == ["openrouter/some/model:free"]
+
+
+def test_free_honours_an_explicit_choice_the_operator_listed_as_free(tmp_path):
+    """An unverified candidate the operator configured is theirs to name."""
+    router = live_router(tmp_path, "FREE", ["groq/llama-3.3-70b-versatile"])
+
+    chain = asyncio.run(routed(router, provider="groq", model="llama-3.3-70b-versatile"))
+
+    assert chain == ["groq/llama-3.3-70b-versatile"]
+
+
+@pytest.mark.parametrize("profile", ["BALANCED", "PREMIUM"])
+def test_an_explicit_choice_is_untouched_outside_free(tmp_path, profile):
+    """Only FREE is a hard ceiling; the others keep the previous behaviour."""
+    router = live_router(tmp_path, profile, ["groq/a"])
+
+    chain = asyncio.run(routed(router, provider="openrouter", model="anthropic/claude-sonnet-4"))
+
+    assert chain == ["openrouter/anthropic/claude-sonnet-4"]

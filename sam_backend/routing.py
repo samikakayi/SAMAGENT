@@ -10,7 +10,8 @@ from .db import Database
 from .models import AdapterRegistry, AssistantTurn, ErrorCategory, ModelError
 from .provider_health import CONFIRMED_UNAVAILABLE, ProviderHealth
 from .routing_profiles import (
-    FreeCandidate, normalise_profile, parse_candidates, usable_free_candidates,
+    Eligibility, FreeCandidate, eligibility, normalise_profile, parse_candidates,
+    usable_free_candidates,
 )
 
 
@@ -148,7 +149,18 @@ class ModelRouter:
         explicit = provider and provider.lower() not in {"auto", ""}
         if explicit:
             selected = provider.lower()
-            return profile, [RouteChoice(selected, self._model_for(selected, profile, model), "Explicit provider selection")]
+            named = RouteChoice(selected, self._model_for(selected, profile, model), "Explicit provider selection")
+            # FREE is a ceiling, not a preference. The orchestrator names its
+            # provider on every step -- it resolves one route and passes it
+            # down -- so without this the profile only ever constrained the
+            # chat path, and every autonomous run reached the configured model
+            # whatever the profile said.
+            if self.permits(named):
+                return profile, [named]
+            narrowed = self.apply_profile([named])
+            if not narrowed:
+                raise self._no_route_error()
+            return profile, narrowed
         budget = self.budget_state()
         if budget["mode"] == "LOCAL_ONLY":
             mode = "LOCAL_ONLY"
@@ -221,6 +233,19 @@ class ModelRouter:
     # -- routing profile ---------------------------------------------------
     def free_candidates(self) -> list[FreeCandidate]:
         return parse_candidates(getattr(self.settings, "free_candidates", []))
+
+    def permits(self, choice: RouteChoice) -> bool:
+        """Whether this profile may reach this specific model.
+
+        Only FREE refuses anything: a candidate the operator listed is theirs
+        to name, and one published as paid is refused however it was chosen.
+        """
+        if normalise_profile(getattr(self.settings, "routing_profile", None)) != "FREE":
+            return True
+        if eligibility(choice.provider, choice.model) is Eligibility.FREE:
+            return True
+        listed = {(c.provider, c.model) for c in usable_free_candidates(self.free_candidates())[0]}
+        return (choice.provider, choice.model) in listed
 
     def apply_profile(self, configured: list[RouteChoice]) -> list[RouteChoice]:
         """Narrow or widen the configured chain according to the profile.
