@@ -86,9 +86,94 @@ def test_a_provider_for_sorani_does_not_make_kurmanji_supported():
     assert language_support("kmr", CONNECTED_SORANI)["stt_supported"] is False
 
 
+def local_speech_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("faster_whisper") is not None
+
+
 @pytest.mark.parametrize("code", ["en", "en-US", "ar", "fa", "tr"])
 def test_languages_whisper_covers_are_reported_supported(code):
+    """Only answerable when the optional engine is actually installed.
+
+    Local speech is an opt-in extra (`setup.ps1 -InstallLocalVoice`), so a
+    default install has no Whisper to ask. Asserting support unconditionally
+    made the supported install and the default install disagree, and the
+    default one lost -- five failures that said nothing was wrong.
+    """
+    if not local_speech_installed():
+        pytest.skip("faster-whisper is not installed; local speech is optional")
     assert language_support(code)["stt_supported"] is True
+
+
+@pytest.mark.parametrize("code", ["en", "ar", "tr"])
+def test_without_local_speech_the_answer_is_unconfigured_not_unsupported(code):
+    """Absence has to be reported as absence, not as an unsupported language."""
+    if local_speech_installed():
+        pytest.skip("faster-whisper is installed; this is the absent-engine case")
+
+    support = language_support(code)
+
+    assert support["stt_supported"] is False
+    assert support["state"] == CapabilityState.UNCONFIGURED.value
+    assert "not installed" in support["reason"], "the reason must name the missing engine"
+    # A language Whisper genuinely lacks is a different answer from a missing
+    # engine. Sorani stays UNAVAILABLE either way; installing Whisper would
+    # not add it, so the two must not collapse into one state.
+    sorani = language_support("ckb")
+    assert sorani["state"] == CapabilityState.UNAVAILABLE.value
+    assert "not installed" not in (sorani["reason"] or "")
+
+
+def test_with_the_engine_present_the_same_languages_report_supported(monkeypatch):
+    """The presence branch, provable on a machine that does not have it.
+
+    Scoped to this test rather than faked globally: it supplies the one
+    attribute `language_support` reads, so both halves of the optional
+    contract are exercised wherever the suite runs.
+    """
+    import sys
+    import types
+
+    stub = types.ModuleType("faster_whisper.tokenizer")
+    stub._LANGUAGE_CODES = {"en", "ar", "tr", "fa"}
+    package = types.ModuleType("faster_whisper")
+    package.tokenizer = stub
+    monkeypatch.setitem(sys.modules, "faster_whisper", package)
+    monkeypatch.setitem(sys.modules, "faster_whisper.tokenizer", stub)
+
+    for code in ("en", "ar", "tr"):
+        support = language_support(code)
+        assert support["stt_supported"] is True, code
+        assert support["state"] == CapabilityState.AVAILABLE.value
+
+    # A code Whisper does not carry is unsupported, not unconfigured.
+    missing = language_support("zzz")
+    assert missing["stt_supported"] is False
+    assert missing["state"] == CapabilityState.UNAVAILABLE.value
+
+
+def test_sam_starts_and_stays_honest_without_the_optional_voice_engine(tmp_path):
+    """The whole point of optional: no import crash, no false capability."""
+    import sys
+
+    from sam_backend.voice import audio_devices
+
+    settings = Settings(project_root=tmp_path, workspace_root=tmp_path / "w", data_dir=tmp_path / "d")
+    settings.prepare()
+    service = VoiceService(settings)
+
+    capabilities = service.capabilities()
+
+    assert capabilities["mode"] in capabilities["modes"], "the service is usable"
+    if not local_speech_installed():
+        assert capabilities["stt"]["state"] != CapabilityState.AVAILABLE.value
+        assert "faster_whisper" not in sys.modules, "an optional engine must not be imported eagerly"
+    # Device enumeration degrades the same way rather than raising.
+    assert audio_devices()["state"] in {
+        CapabilityState.AVAILABLE.value, CapabilityState.PARTIALLY_AVAILABLE.value,
+        CapabilityState.UNCONFIGURED.value, CapabilityState.UNAVAILABLE.value,
+    }
 
 
 def test_transcribing_an_unsupported_language_returns_no_text(service: VoiceService):
