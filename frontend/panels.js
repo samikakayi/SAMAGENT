@@ -394,6 +394,8 @@
       setStatus("provider-openrouter", data.openrouter?.status);
       setStatus("provider-ollama", data.ollama?.status);
       setStatus("provider-litellm", data.litellm?.status);
+      setStatus("provider-groq", data.groq?.status);
+      setStatus("provider-gemini", data.gemini?.status);
       const parts = [data.openrouter?.detail, data.ollama?.detail].filter(Boolean);
       text("provider-detail", parts.join(" ") || "—");
       renderSorani(data.sorani);

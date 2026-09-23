@@ -73,6 +73,10 @@ KEY_PATTERNS: dict[str, re.Pattern[str]] = {
     "openrouter_api_key": re.compile(r"^sk-or-[A-Za-z0-9._\-]{20,200}$"),
     "openai_api_key": re.compile(r"^sk-[A-Za-z0-9._\-]{20,200}$"),
     "litellm_api_key": re.compile(r"^[A-Za-z0-9._\-]{8,200}$"),
+    # Groq issues gsk_-prefixed keys; Google AI Studio issues AIza-prefixed
+    # ones. Shapes only -- enough to catch a paste error before a network call.
+    "groq_api_key": re.compile(r"^gsk_[A-Za-z0-9._\-]{20,200}$"),
+    "gemini_api_key": re.compile(r"^AIza[A-Za-z0-9._\-]{20,200}$"),
     # KurdishTTS issues separate hex keys for speech-to-text and text-to-speech.
     "kurdishtts_stt_api_key": re.compile(r"^[A-Za-z0-9._\-]{16,200}$"),
     "kurdishtts_tts_api_key": re.compile(r"^[A-Za-z0-9._\-]{16,200}$"),
@@ -387,3 +391,49 @@ def start_ollama(project_root: Path) -> dict[str, Any]:
     except OSError as exc:
         return {"started": False, "reason": f"Could not launch Ollama: {exc}"}
     return {"started": True, "executable": executable, "detail": "Ollama was started; it may take a few seconds to answer."}
+
+
+async def openai_compatible_status(provider: str, base_url: str, api_key: str | None) -> dict[str, Any]:
+    """Classify a keyed OpenAI-compatible provider without spending a completion.
+
+    Listing models is the cheapest call that still proves the credential works,
+    so a status panel costs a catalogue request rather than tokens. The key is
+    used to authenticate and never appears in what is returned.
+    """
+    label = provider.upper()
+    if not api_key:
+        return {
+            "provider": provider, "status": "UNCONFIGURED",
+            "state": CapabilityState.UNCONFIGURED.value,
+            "detail": f"No {label}_API_KEY in the environment and nothing in the local secret store.",
+        }
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            response = await client.get(
+                f"{base_url.rstrip('/')}/models", headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except httpx.HTTPError as exc:
+        return {"provider": provider, "status": "ERROR", "state": CapabilityState.UNAVAILABLE.value,
+                "detail": f"Could not reach {label}: {type(exc).__name__}"}
+    latency = round((time.perf_counter() - started) * 1000, 1)
+    common = {"provider": provider, "latency_ms": latency}
+    if response.status_code in (401, 403):
+        return {**common, "status": "AUTH_FAILED", "state": CapabilityState.UNAVAILABLE.value,
+                "detail": f"{label} rejected the credential."}
+    if response.status_code == 429:
+        return {**common, "status": "RATE_LIMITED", "state": CapabilityState.PARTIALLY_AVAILABLE.value,
+                "detail": f"{label} is rate limiting this credential."}
+    if response.status_code == 402:
+        return {**common, "status": "QUOTA", "state": CapabilityState.UNAVAILABLE.value,
+                "detail": f"{label} reports this credential is out of quota."}
+    if response.status_code >= 400:
+        return {**common, "status": "ERROR", "state": CapabilityState.UNAVAILABLE.value,
+                "detail": f"{label} returned HTTP {response.status_code}."}
+    try:
+        catalogue = (response.json() or {}).get("data") or []
+    except ValueError:
+        catalogue = []
+    return {**common, "status": "CONNECTED", "state": CapabilityState.AVAILABLE.value,
+            "models_listed": len(catalogue),
+            "detail": f"Authenticated against the {label} model catalogue."}

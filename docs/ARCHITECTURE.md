@@ -298,6 +298,60 @@ general answer and the heaviest. The honest label for the first two is
 *transactional*, and none of it should be built before something demonstrates
 the current behaviour is actually costing someone a file.
 
+## AI routing profiles
+
+A profile answers one question: may this run spend money? It does not choose a
+model -- `ModelRouter` still does, with the same health checks, retries and
+fallback events. `routing_profiles.py` only decides which candidates the router
+may consider, and in what order.
+
+| Profile | Candidates |
+| --- | --- |
+| `PREMIUM` | the configured primary/fallback chain, exactly as before profiles existed |
+| `BALANCED` | the free candidates first, then that same configured chain, de-duplicated |
+| `FREE` | the free candidates and nothing else |
+
+`PREMIUM` is the default, and an installation that never sets a profile routes
+exactly as it did before. Adding Groq or Gemini does not insert them into
+`PREMIUM`: they are reached only if an operator configures them.
+
+**FREE fails closed.** If no free candidate survives, the run stops with a
+`not_configured` model error naming the reason, rather than quietly falling
+back to a paid model. Running out of free options is not permission to spend.
+
+**Free-tier is a routing policy, not a billing guarantee.** SAM promises not to
+*choose* a model it knows to be paid while FREE is active. It cannot promise
+what a third party charges under future account terms. Eligibility is therefore
+explicit configuration rather than a guess from a model name, with one
+exception: OpenRouter documents the `:free` suffix, so a slug without it is
+known to be paid and is refused from FREE even if an operator lists it. Groq
+and Gemini meter free use by account rather than by model, so their candidates
+are reported as `unverified` -- the operator's assertion, not SAM's claim.
+
+The `:free` suffix says a model is *published* as free, not that it is serving
+free right now. A live check during development found a `:free` slug whose free
+capacity had been withdrawn; OpenRouter refused it and named the paid slug
+instead. SAM surfaced that refusal and moved to the next candidate rather than
+taking the paid suggestion, which is the behaviour FREE promises -- but it is
+why the guarantee is worded as "will not choose a model it knows to be paid"
+rather than "will never be charged".
+
+Candidate order is the operator's. Unlike the configured chain, the free list
+is not re-sorted by failure count: a deterministic order is the whole promise.
+
+Both new providers publish OpenAI-compatible endpoints, so `GroqAdapter` and
+`GeminiAdapter` subclass the same `ChatCompletionsAdapter` that OpenRouter and
+LiteLLM already use. They inherit its retry policy, its error taxonomy and its
+tool-call conversion rather than restating any of it. Credentials go through
+the existing secret store (`groq_api_key`, `gemini_api_key`) and are never
+returned to the page.
+
+`web_search` is a `network`-class tool over DuckDuckGo's keyless endpoints, so
+FREE mode can search without a paid provider. Results are untrusted text:
+bounded in count, field length and time, returned as structured data, and
+subject to the same tool-output boundary as everything else. It fetches
+results; it does not open pages or run anything.
+
 ## Known debt
 
 Real, none blocking. Each is here because it is worth knowing, not because it

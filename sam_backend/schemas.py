@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .routing_profiles import MAX_FREE_CANDIDATES
+
 from .config import is_placeholder_model
 
 
@@ -65,6 +67,11 @@ class SettingsUpdate(BaseModel):
     # are known, because a partial update sees only one half of it.
     fallback_model: str | None = Field(default=None, max_length=160)
     fallback_enabled: bool | None = None
+    # Which models a run may reach. Absent leaves the stored value alone, so an
+    # installation that never sets it keeps routing exactly as it did before.
+    routing_profile: Literal["FREE", "BALANCED", "PREMIUM"] | None = None
+    # Ordered "provider/model" references FREE and BALANCED try in this order.
+    free_candidates: list[str] | None = Field(default=None, max_length=MAX_FREE_CANDIDATES)
     permission_mode: Literal["guarded", "strict", "trusted"] | None = None
     max_tool_iterations: int | None = Field(default=None, ge=1, le=20)
     command_timeout_seconds: int | None = Field(default=None, ge=3, le=300)
@@ -81,6 +88,26 @@ class SettingsUpdate(BaseModel):
     voice_wake_word: str | None = Field(default=None, min_length=1, max_length=40)
     # Which KurdishTTS voice speaks Sorani replies; blank means the default.
     sorani_speaker_id: str | None = Field(default=None, max_length=80)
+
+    @field_validator("free_candidates")
+    @classmethod
+    def check_free_candidates(cls, value: list[str] | None) -> list[str] | None:
+        """Reject a malformed entry rather than dropping it silently.
+
+        A candidate the operator cannot see was discarded is worse than an
+        error: FREE would quietly have one fewer model than they configured.
+        """
+        if value is None:
+            return value
+        cleaned: list[str] = []
+        for item in value:
+            provider, _, model = str(item).partition("/")
+            if not provider.strip() or not model.strip():
+                raise ValueError(f"{item!r} is not a provider/model reference")
+            reference = f"{provider.strip().lower()}/{model.strip()}"
+            if reference not in cleaned:
+                cleaned.append(reference)
+        return cleaned
 
     @field_validator("fallback_model")
     @classmethod
@@ -207,7 +234,8 @@ class TwoAnchorDrawRequest(BaseModel):
 
 
 class CredentialRequest(BaseModel):
-    name: Literal["openrouter_api_key", "openai_api_key", "litellm_api_key"]
+    name: Literal["openrouter_api_key", "openai_api_key", "litellm_api_key",
+                  "groq_api_key", "gemini_api_key"]
     # The value is accepted, never echoed. Responses carry only a fingerprint.
     value: str = Field(min_length=8, max_length=400)
 

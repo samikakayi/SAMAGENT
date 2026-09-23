@@ -60,10 +60,14 @@ class ToolRegistry:
         scanner: ProjectScanner | None = None,
         verifier: VerificationEngine | None = None,
         capabilities: CapabilityRegistry | None = None,
+        search: Any = None,
     ):
         self.settings = settings
         self.database = database
         self.trading = trading
+        # Injected in tests so the suite never reaches the network; built on
+        # first use otherwise, because most runs never search.
+        self.search = search
         self.windows = windows
         self.cancellation = cancellation
         self.workspace = settings.workspace_root.resolve()
@@ -82,6 +86,7 @@ class ToolRegistry:
             "run_terminal": self._run_terminal,
             "run_python": self._run_python,
             "open_url": self._open_url,
+            "web_search": self._web_search,
             "browser_automate": self._browser_automate,
             "launch_app": self._launch_app,
             "remember": self._remember,
@@ -406,6 +411,27 @@ class ToolRegistry:
             raise ValueError("Only absolute http(s) URLs can be opened")
         opened = webbrowser.open(url, new=2, autoraise=True)
         return ToolResult(bool(opened), {"url": url, "opened": bool(opened)}, None if opened else "The operating system did not confirm a browser launch")
+
+    def _web_search(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        """Return bounded, structured search results as data.
+
+        The text comes from the open internet, so it is returned the same way
+        any other tool output is -- the model may reason about it, and it
+        reaches nothing else. Nothing here opens a page or executes anything.
+        """
+        from ..search import SearchUnavailable, WebSearch
+
+        query = str(arguments.get("query", ""))
+        limit = arguments.get("limit")
+        try:
+            found = (self.search or WebSearch()).search(query, int(limit) if limit else 5)
+        except SearchUnavailable as exc:
+            return ToolResult(False, None, str(exc))
+        return ToolResult(True, {
+            "query": " ".join(query.split())[:400],
+            "count": len(found),
+            "results": [item.as_dict() for item in found],
+        })
 
     def _browser_automate(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
         try:

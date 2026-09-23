@@ -5,10 +5,13 @@ import os
 import re
 import threading
 
-GLOBAL_ABORT_EVENT = threading.Event()
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .routing_profiles import DEFAULT_PROFILE, normalise_profile, parse_candidates
+
+GLOBAL_ABORT_EVENT = threading.Event()
 
 from dotenv import load_dotenv
 
@@ -72,10 +75,24 @@ class Settings:
     # Never a scripted or mock model: fallback is between real providers.
     fallback_model: str = ""
     fallback_enabled: bool = False
+    # Which models a run may reach. PREMIUM is the behaviour that existed
+    # before profiles, so an installation that never sets this routes exactly
+    # as it did before. See routing_profiles for what FREE actually promises.
+    routing_profile: str = DEFAULT_PROFILE
+    # Ordered "provider/model" references FREE and BALANCED try, in this order.
+    # Empty is the honest default: SAM does not guess which models are free.
+    free_candidates: list[str] = field(default_factory=list)
     openrouter_http_referer: str | None = None
     openrouter_title: str = "SAM Local Agent"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str | None = None
+    # Groq and Gemini both publish OpenAI-compatible chat endpoints, so they
+    # reuse the adapter OpenRouter and LiteLLM already share. Base URLs stay
+    # configurable: a provider moving a path must not need a code release.
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_api_key: str | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    gemini_api_key: str | None = None
     openai_model: str = "gpt-5-mini"
     max_tool_iterations: int = 8
     command_timeout_seconds: int = 45
@@ -117,6 +134,10 @@ class Settings:
         self.model_mode = self.model_mode.strip().upper()
         if self.model_mode not in {"AUTO", "LOCAL_ONLY", "CLOUD_ONLY", "MANUAL"}:
             raise ValueError("SAM_MODEL_MODE must be AUTO, LOCAL_ONLY, CLOUD_ONLY, or MANUAL")
+        # An unreadable or absent profile means the pre-profile behaviour, so
+        # an older settings row loads instead of refusing to start.
+        self.routing_profile = normalise_profile(self.routing_profile)
+        self.free_candidates = [item.reference for item in parse_candidates(self.free_candidates)]
         self.voice_mode = self.voice_mode.strip().upper()
         if self.voice_mode not in {"PUSH_TO_TALK", "CONVERSATION", "ALWAYS_LISTENING", "WAKE_WORD"}:
             raise ValueError("SAM_VOICE_MODE is invalid")
@@ -152,6 +173,8 @@ class Settings:
             litellm_strong_model=os.getenv("LITELLM_STRONG_MODEL", "sam-strong"),
             litellm_vision_model=os.getenv("LITELLM_VISION_MODEL", "sam-vision"),
             openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/"),
+            groq_base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
+            gemini_base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/"),
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             openrouter_fast_model=os.getenv("OPENROUTER_FAST_MODEL", "openrouter/auto"),
             openrouter_strong_model=os.getenv("OPENROUTER_STRONG_MODEL", "openrouter/auto"),
@@ -214,12 +237,19 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
     def public_dict(self) -> dict[str, Any]:
+        """Settings as the local page may see them: never a credential.
+
+        Every field whose name ends in `_api_key` is dropped by rule rather
+        than by a list someone has to remember to extend -- adding a provider
+        used to mean its key shipped to the page until the list caught up.
+        Each one leaves behind a boolean saying only whether it is set.
+        """
         result = asdict(self)
-        for secret_name in ("openai_api_key", "openrouter_api_key", "litellm_api_key"):
-            result.pop(secret_name, None)
+        for name in [key for key in result if key.endswith("_api_key")]:
+            result.pop(name, None)
+            result[f"{name.removesuffix('_api_key')}_configured"] = bool(getattr(self, name, None))
         for key in ("project_root", "workspace_root", "data_dir"):
             result[key] = str(result[key])
-        result["openai_configured"] = bool(self.openai_api_key)
-        result["openrouter_configured"] = bool(self.openrouter_api_key)
+        # Kept under its original name: the page already reads this one.
         result["litellm_key_configured"] = bool(self.litellm_api_key)
         return result

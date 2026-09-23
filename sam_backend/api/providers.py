@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from ..schemas import CredentialRequest
-from ..secrets import ollama_status
-from ..secrets import openrouter_status
-from ..secrets import start_ollama
+from ..secrets import ollama_status, openai_compatible_status, openrouter_status, start_ollama
 from .services import AppServices
 from fastapi import HTTPException
 from typing import Any
@@ -97,9 +95,19 @@ def register_provider_routes(application: FastAPI, sv: AppServices) -> None:
             ollama_status(settings.ollama_base_url),
         )
         sorani = await asyncio.to_thread(voice.sorani_status)
+        # Both are keyed OpenAI-compatible providers, so one helper classifies
+        # them the same way and neither costs a completion to check.
+        groq, gemini = await asyncio.gather(
+            openai_compatible_status("groq", settings.groq_base_url, settings.groq_api_key),
+            openai_compatible_status("gemini", settings.gemini_base_url, settings.gemini_api_key),
+        )
         return {
             "openrouter": openrouter,
             "ollama": ollama,
+            "groq": groq,
+            "gemini": gemini,
+            # What the next run may reach, and which candidates FREE refused.
+            "routing": router.profile_state(),
             "litellm": {
                 "provider": "litellm", "base_url": settings.litellm_base_url,
                 "key_configured": bool(settings.litellm_api_key),
