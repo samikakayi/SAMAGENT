@@ -28,6 +28,9 @@ class GoalRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=1000)
     name: str | None = Field(default=None, max_length=200)
     credential_mapping: dict[str, str] | None = None
+    # Asking for a tailored workflow is the one thing that spends a model
+    # call on a match SAM already considers exact.
+    customize: bool = False
 
 
 class ImportRequest(BaseModel):
@@ -145,7 +148,8 @@ def register_workflow_routes(application: FastAPI, sv: AppServices) -> None:
         """
         return await asyncio.to_thread(lambda: answer(lambda: workflows.plan_goal(
             payload.goal, name=payload.name or "",
-            credential_mapping=payload.credential_mapping)))
+            credential_mapping=payload.credential_mapping,
+            customize=payload.customize)))
 
     @application.get("/api/workflows/n8n/workflows")
     async def n8n_workflows(limit: int = 20) -> dict[str, Any]:

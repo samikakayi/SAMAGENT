@@ -34,10 +34,17 @@ MAX_ARTIFACTS = 25
 class WorkflowIntelligence:
     """Search, understand, prepare, and -- only with approval -- import."""
 
-    def __init__(self, settings: Any, *, library: Any = None, n8n: Any = None) -> None:
+    def __init__(self, settings: Any, *, library: Any = None, n8n: Any = None,
+                 router: Any = None) -> None:
         self.settings = settings
+        # The router is optional so every deterministic test and every
+        # offline install still works; adaptation is an enhancement, not a
+        # dependency of understanding a workflow.
+        self.router = router
         self.library = library or GitHubWorkflowLibrary(Path(getattr(settings, "data_dir", ".")))
         self._n8n = n8n
+        self._client: N8nClient | None = None
+        self._client_identity: tuple[str, str | None] | None = None
         self._artifacts: dict[str, tuple[float, WorkflowArtifact]] = {}
 
     # -- the configured instance, and only that one ------------------------
@@ -50,8 +57,16 @@ class WorkflowIntelligence:
         """
         if self._n8n is not None:
             return self._n8n
-        return N8nClient(getattr(self.settings, "n8n_base_url", "") or "",
-                         getattr(self.settings, "n8n_api_key", None))
+        base_url = getattr(self.settings, "n8n_base_url", "") or ""
+        api_key = getattr(self.settings, "n8n_api_key", None)
+        # Cached per (url, key) rather than rebuilt blindly: a credential or
+        # host change still produces a new client, but an unchanged one keeps
+        # what it learned -- notably whether this instance has the current
+        # publish endpoint, which was otherwise re-probed on every call.
+        if self._client is None or self._client_identity != (base_url, api_key):
+            self._client = N8nClient(base_url, api_key)
+            self._client_identity = (base_url, api_key)
+        return self._client
 
     # -- read ---------------------------------------------------------------
     def search(self, query: str = "", **filters: Any) -> dict[str, Any]:
@@ -93,16 +108,21 @@ class WorkflowIntelligence:
 
     def plan_goal(self, goal: str, *, name: str = "",
                   credential_mapping: dict[str, str] | None = None,
-                  adapt: Any = None) -> dict[str, Any]:
+                  adapt: Any = None, customize: bool = False,
+                  conversation_id: str | None = None) -> dict[str, Any]:
         """Carry a plain-language goal as far as a reviewable artifact.
 
         Imported here rather than at module scope because the planner needs
         this class: the facade owns the artifact store, and a plan is only
         worth anything if its hash is one `artifact()` can later hand back.
         """
+        from .adaptation import ModelWorkflowAdapter
         from .goals import plan_goal as _plan
 
-        plan = _plan(goal, self, name=name, credential_mapping=credential_mapping, adapt=adapt)
+        if adapt is None and self.router is not None:
+            adapt = ModelWorkflowAdapter(self.router, conversation_id=conversation_id)
+        plan = _plan(goal, self, name=name, credential_mapping=credential_mapping,
+                     adapt=adapt, customize=customize)
         payload = plan.as_dict()
         payload["target_instance"] = self.target
         if plan.artifact is not None:

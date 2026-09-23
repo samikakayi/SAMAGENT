@@ -466,6 +466,7 @@ class ToolRegistry:
         return self._workflow_call(lambda: self.workflows.plan_goal(
             str(arguments.get("goal", "")), name=str(arguments.get("name", "")),
             credential_mapping=arguments.get("credential_mapping") or None,
+            customize=bool(arguments.get("customize")),
         ))
 
     def _workflow_search(self, arguments: dict[str, Any], approved: bool) -> ToolResult:

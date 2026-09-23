@@ -17,6 +17,7 @@ from .api import (
     register_oversight_routes,
     register_local_request_guard,
     register_integration_routes,
+    register_n8n_runtime_routes,
     register_provider_routes,
     register_settings_routes,
     register_system_routes,
@@ -30,6 +31,7 @@ from .capabilities import CapabilityRegistry
 from .config import Settings
 from .dpi import ensure_dpi_awareness
 from .integrations import IntegrationHealth
+from .n8n_runtime import ManagedN8nRuntime
 from .db import Database
 from .models import AdapterRegistry
 from .policy import RiskPolicy
@@ -116,7 +118,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     voice = VoiceService(settings, secret_store)
     replay = BarReplayResearch(trading.market_data, trading.tradingview)
     # Workflow Intelligence: SAM reasons and gates, n8n executes.
-    workflow_intelligence = WorkflowIntelligence(settings)
+    workflow_intelligence = WorkflowIntelligence(settings, router=router)
 
     def rebuild_adapters() -> None:
         """Pick up a new credential without restarting the process."""
@@ -202,13 +204,17 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     # One health view over every outside connection, sharing the secret store
     # and the n8n client that already exist rather than opening its own.
     integrations = IntegrationHealth(settings, secret_store, database, workflow_intelligence)
+    # The one n8n SAM installed. It knows a single location and a single
+    # command; nothing a caller sends can change either.
+    n8n_runtime = ManagedN8nRuntime(database)
     application.state.integrations = integrations
 
     services = AppServices(
         settings=settings, database=database, policy=policy, cancellation=cancellation,
         trading=trading, windows=windows, scanner=scanner, verifier=verifier,
         capabilities=capability_registry, tools=tools, secrets=secret_store,
-        provider_health=provider_health, integrations=integrations, router=router, agent=agent,
+        provider_health=provider_health, integrations=integrations,
+        n8n_runtime=n8n_runtime, router=router, agent=agent,
         task_store=task_store, orchestrator=orchestrator, agent_api=agent_api,
         voice=voice, replay=replay,
         apply_stored_credentials=apply_stored_credentials,
@@ -222,6 +228,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     register_workflow_routes(application, services)
     register_provider_routes(application, services)
     register_integration_routes(application, services)
+    register_n8n_runtime_routes(application, services)
     register_trading_routes(application, services)
     register_voice_routes(application, services)
     register_desktop_routes(application, services)

@@ -298,7 +298,8 @@ def test_an_adaptation_that_raises_risk_is_reported_as_raised(tmp_path):
         return workflow(GMAIL_TRIGGER, node("Run", "n8n-nodes-base.executeCommand", command="whoami"),
                         name="Totally harmless")
 
-    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()), adapt=sneaky)
+    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()),
+                     adapt=sneaky, customize=True)
 
     assert plan.artifact.inspection.risk.level is RiskLevel.CRITICAL
     assert plan.artifact.diff is not None and plan.artifact.diff.risk_changed
@@ -312,7 +313,8 @@ def test_an_adaptation_that_breaks_the_workflow_fails_validation(tmp_path):
     def broken(_redacted, _goal):
         return {"name": "Broken", "nodes": [{"name": "A", "type": ""}], "connections": {}}
 
-    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()), adapt=broken)
+    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()),
+                     adapt=broken, customize=True)
 
     assert plan.artifact.validation.ok is False
     assert plan.next_action == "fix_validation"
@@ -324,7 +326,7 @@ def test_an_adapter_that_returns_nonsense_is_discarded_not_obeyed(tmp_path):
                          workflow(GMAIL_TRIGGER, node("Save", "n8n-nodes-base.googleDrive")))}
 
     plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()),
-                     adapt=lambda *_: "I have decided to import everything")
+                     adapt=lambda *_: "I have decided to import everything", customize=True)
 
     assert plan.artifact.inspection.node_types == ("n8n-nodes-base.gmailTrigger",
                                                    "n8n-nodes-base.googleDrive")
@@ -338,7 +340,8 @@ def test_an_adapter_that_raises_leaves_the_original_untouched(tmp_path):
     def explode(*_):
         raise RuntimeError("model died")
 
-    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()), adapt=explode)
+    plan = plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()),
+                     adapt=explode, customize=True)
 
     assert plan.artifact.validation.ok is True
     assert any("could not be read" in line for line in plan.adaptations)
@@ -352,12 +355,15 @@ def test_the_candidate_shown_to_an_adapter_is_redacted_first(tmp_path):
     entries = {"leaky": (summary("leaky", "Gmail invoices to Drive", ("gmail", "drive")), leaky)}
     seen: list[str] = []
 
-    def capture(redacted, _goal):
+    def capture(redacted, _goal, _inspection=None):
         import json
         seen.append(json.dumps(redacted))
         return redacted
 
-    plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()), adapt=capture)
+    # customize=True is the "please tailor this for me" path, which is what
+    # guarantees the adapter is actually called here rather than skipped.
+    plan_goal(GOAL, intelligence(tmp_path, Library(entries), FakeN8n()),
+              adapt=capture, customize=True)
 
     assert seen and "sk-LEAKEDSECRETVALUE" not in seen[0]
     assert "REDACTED" in seen[0]

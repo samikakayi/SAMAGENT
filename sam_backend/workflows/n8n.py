@@ -8,9 +8,9 @@ wherever the file said.
 Only the documented public API (v1) is used. That API has no endpoint for
 manually running a workflow, so SAM does not run one -- rather than reaching
 for the internal routes the editor UI uses, which are unsupported and change
-without notice. What it does have is create, get, list, update, delete,
-activate, deactivate, execution history and execution stop, and that is the
-whole surface offered here.
+without notice. What it does have is create, get, list, publish,
+unpublish, execution history and execution stop, and that is the whole
+surface offered here.
 """
 
 from __future__ import annotations
@@ -33,8 +33,11 @@ REQUIRED_SCOPES = frozenset({
     "workflow:list",        # status(), list_workflows()
     "workflow:read",        # get_workflow()
     "workflow:create",      # create_workflow()
-    "workflow:activate",    # set_active(True)
-    "workflow:deactivate",  # set_active(False)
+    # Publish/unpublish are the current endpoints; they carry the same two
+    # scopes the deprecated activate/deactivate aliases did, so migrating
+    # to them needs no change to an already-issued key.
+    "workflow:activate",    # set_active(True)  -> POST /workflows/{id}/publish
+    "workflow:deactivate",  # set_active(False) -> POST /workflows/{id}/unpublish
     "credential:list",      # list_credentials() -- names and types only
     "execution:list",       # executions()
 })
@@ -50,6 +53,8 @@ class N8nClient:
     def __init__(self, base_url: str, api_key: str | None, *, client_factory: Any = None) -> None:
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key
+        # None until one call proves which activation API this instance has.
+        self._publish_supported: bool | None = None
         self._client_factory = client_factory or (
             lambda: httpx.Client(timeout=TIMEOUT_SECONDS, trust_env=False, follow_redirects=False)
         )
@@ -150,9 +155,41 @@ class N8nClient:
                 "active": bool(created.get("active"))}
 
     def set_active(self, workflow_id: str, active: bool) -> dict[str, Any]:
-        verb = "activate" if active else "deactivate"
-        result = self._call("POST", f"/workflows/{workflow_id}/{verb}")
-        return {"id": str(result.get("id") or workflow_id), "active": bool(result.get("active", active))}
+        """Publish or unpublish, keeping SAM's own active/inactive vocabulary.
+
+        Current n8n names this publish/unpublish; `activate`/`deactivate` still
+        exist but are marked deprecated and, in 2.40.5, are literally aliases
+        that call the publish handler. So the supported path is used first and
+        the old one is only ever a fallback for an n8n too old to have it.
+        """
+        modern = "publish" if active else "unpublish"
+        legacy = "activate" if active else "deactivate"
+        if self._publish_supported is False:
+            return self._finish(workflow_id, active, self._call("POST", f"/workflows/{workflow_id}/{legacy}"))
+        try:
+            result = self._call("POST", f"/workflows/{workflow_id}/{modern}")
+        except WorkflowError as exc:
+            # Only a missing endpoint justifies reaching for the old name. An
+            # auth failure, a rejected scope or n8n's own validation are real
+            # answers, and silently retrying a different URL would turn a
+            # clear refusal into a confusing one.
+            if exc.code is not WorkflowErrorCode.NOT_FOUND:
+                raise
+            result = self._call("POST", f"/workflows/{workflow_id}/{legacy}")
+            # Reached only when the old endpoint answered where the new one
+            # 404'd, which is the one thing that actually proves the version.
+            # A 404 for a workflow that does not exist raises from the line
+            # above and never gets here.
+            self._publish_supported = False
+            return self._finish(workflow_id, active, result)
+        self._publish_supported = True
+        return self._finish(workflow_id, active, result)
+
+    @staticmethod
+    def _finish(workflow_id: str, active: bool, result: Any) -> dict[str, Any]:
+        result = result if isinstance(result, dict) else {}
+        return {"id": str(result.get("id") or workflow_id),
+                "active": bool(result.get("active", active))}
 
     def delete_workflow(self, workflow_id: str) -> dict[str, Any]:
         self._call("DELETE", f"/workflows/{workflow_id}")

@@ -163,6 +163,15 @@ class RiskPolicy:
                 "Activating starts schedules and exposes webhooks, so the workflow keeps acting after "
                 "this run ends." if turning_on else "Deactivating stops a running automation.",
             )
+        if tool_name in {"n8n_runtime_start", "n8n_runtime_stop"}:
+            starting = tool_name.endswith("start")
+            return PolicyDecision(
+                True, True, RiskLevel.MEDIUM,
+                "Starting the local n8n runtime launches a long-running server on this machine, "
+                "bound to loopback only." if starting else
+                "Stopping the local n8n runtime ends a server that may be mid-execution; its data "
+                "is preserved.",
+            )
         if tool_name == "stop_process":
             return PolicyDecision(True, True, RiskLevel.HIGH, "Stopping a process can lose unsaved work and requires explicit approval.")
         if tool_name == "window_action":
