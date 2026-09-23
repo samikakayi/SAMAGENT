@@ -955,3 +955,64 @@ def test_reading_status_never_reaches_the_network(tmp_path):
     cold.status()
 
     assert client.requested == [], "status asked GitHub for nothing"
+
+
+# --- a cache this build cannot read ---------------------------------------------
+#
+# The index is cached as JSON describing LibraryEntry fields. A cache written by
+# a different version of SAM parses fine and still describes entries this build
+# has no constructor for -- renaming one field would do it -- and that turned
+# every library call into an unhandled TypeError.
+
+
+def _cache(tmp_path, entries):
+    import time as clock
+
+    directory = tmp_path / "workflow-library"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "index.json").write_text(json.dumps({
+        "retrieved_at_epoch": clock.time(), "retrieved_at": "now",
+        "commit_sha": "abc", "data": entries,
+    }), encoding="utf-8")
+    return tmp_path
+
+
+FUTURE_ENTRY = {
+    "workflow_id": "0001_telegram", "filename": "0001_Telegram.json",
+    "path": "workflows/0001_Telegram.json", "category": "messaging",
+    "title": "Telegram", "services": ["telegram"], "trigger": "manual",
+    "size_bytes": 10, "a_field_a_later_version_added": True,
+}
+
+
+@pytest.mark.parametrize("entries, because", [
+    ([FUTURE_ENTRY], "an entry from a schema this build does not have"),
+    (["not an object"], "entries that are not objects"),
+    ([{"workflow_id": "x"}], "an entry missing required fields"),
+])
+def test_an_unreadable_cache_is_ignored_rather_than_crashing(tmp_path, entries, because):
+    body = workflow(MANUAL, node("Set", "n8n-nodes-base.set"))
+    provider, _client = library(_cache(tmp_path, entries), {"0001_Telegram": response(body)})
+
+    # Status must answer, and must not claim a library it cannot read.
+    reported = provider.status()
+    assert reported["state"] in {"LIBRARY_UNAVAILABLE", "LIBRARY_STALE_CACHE"}, because
+    assert reported["indexed_workflows"] == 0
+
+    # And search must fall through to upstream instead of raising TypeError.
+    found = provider.search("telegram")
+    assert found, "an unusable cache is refetched, not fatal"
+    assert provider.state.value == "LIBRARY_AVAILABLE"
+
+
+def test_an_unreadable_cache_with_no_upstream_reports_unavailable(tmp_path):
+    """Both gone is a real outage -- and still SAM's own error, not a TypeError."""
+    import httpx
+
+    provider, _client = library(_cache(tmp_path, [FUTURE_ENTRY]),
+                                {"git/trees": httpx.ConnectError("down")})
+
+    assert provider.status()["state"] == "LIBRARY_UNAVAILABLE"
+    with pytest.raises(WorkflowError) as raised:
+        provider.search("telegram")
+    assert raised.value.code is WorkflowErrorCode.NETWORK

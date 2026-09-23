@@ -130,6 +130,28 @@ class GitHubWorkflowLibrary:
     def state(self) -> LibraryState:
         return self._state
 
+    def _cached_entries(self) -> list[LibraryEntry] | None:
+        """The cached index, or nothing when this build cannot read it.
+
+        A cache written by another version of SAM parses as JSON and still
+        describes entries there is no constructor for here -- renaming one
+        field of LibraryEntry is enough. That raised TypeError out of every
+        library call, past `_index`'s except clause and past the API's, so a
+        routine upgrade answered /workflows/search with a 500. An unusable
+        cache is now treated exactly like an absent one: ignored and refetched.
+        """
+        cached = self._read_cache("index.json", INDEX_TTL_SECONDS)
+        if not cached:
+            return None
+        try:
+            return [LibraryEntry(**{**item, "services": tuple(item.get("services") or ())})
+                    for item in cached]
+        except (AttributeError, TypeError, ValueError):
+            # `_read_cache` has already called this fresh or stale from its
+            # timestamp; nothing readable came out of it, so neither is true.
+            self._state = LibraryState.UNAVAILABLE
+            return None
+
     def status(self) -> dict[str, Any]:
         if self._entries is None:
             # The cache, and only the cache. `_state` starts at UNAVAILABLE and
@@ -138,12 +160,9 @@ class GitHubWorkflowLibrary:
             # broken -- the first thing anyone sees in the panel. Reading the
             # cached index here fixes that without a status call ever blocking
             # on GitHub; `_read_cache` sets the state and timestamp as it goes.
-            cached = self._read_cache("index.json", INDEX_TTL_SECONDS)
+            cached = self._cached_entries()
             if cached:
-                self._entries = [
-                    LibraryEntry(**{**item, "services": tuple(item.get("services") or ())})
-                    for item in cached
-                ]
+                self._entries = cached
         entries = self._entries or []
         return {
             "state": self._state.value, "source_repository": SOURCE_REPOSITORY,
@@ -236,20 +255,18 @@ class GitHubWorkflowLibrary:
         if self._entries is not None and not refresh:
             return self._entries
         if not refresh:
-            cached = self._read_cache("index.json", INDEX_TTL_SECONDS)
+            cached = self._cached_entries()
             if cached:
-                self._entries = [LibraryEntry(**{**item, "services": tuple(item.get("services") or ())})
-                                 for item in cached]
+                self._entries = cached
                 return self._entries
         try:
             self._entries = self._build_index()
         except (WorkflowError, httpx.HTTPError, ValueError) as exc:
-            cached = self._read_cache("index.json", INDEX_TTL_SECONDS)
+            cached = self._cached_entries()
             if cached:
                 # Usable, but say so: stale is not the same as current.
                 self._state = LibraryState.STALE_CACHE
-                self._entries = [LibraryEntry(**{**item, "services": tuple(item.get("services") or ())})
-                                 for item in cached]
+                self._entries = cached
                 return self._entries
             self._state = LibraryState.UNAVAILABLE
             code = exc.code if isinstance(exc, WorkflowError) else WorkflowErrorCode.NETWORK
