@@ -784,3 +784,35 @@ def test_the_manual_microphone_still_works_with_hands_free_off():
     assert voice.listen_once(max_seconds=5)["text"] == "what is gold doing"
     assert voice.speak("Gold is trading quietly.")["ok"] is True
     assert voice.spoken == ["Gold is trading quietly."]
+
+
+def test_a_missing_speech_engine_is_reported_not_hidden():
+    """The dictation service exposes availability as a method.
+
+    A bound method is always truthy, so asking without calling it answered
+    "yes" even with no engine installed. Hands-free would start, listen to
+    nothing, and never say why -- when the honest answer is that the manual
+    microphone button still works.
+    """
+    from sam_backend.wake import LocalPhraseDetector
+
+    class NoEngine:
+        def available(self):
+            return False
+
+    class Engine:
+        def available(self):
+            return True
+
+    assert LocalPhraseDetector(shared=NoEngine()).available is False
+    assert LocalPhraseDetector(shared=Engine()).available is True
+
+
+def test_an_unavailable_engine_leaves_the_manual_button_working():
+    session = controller(detector=ScriptedDetector([], available=False))
+
+    state = session.start()
+
+    assert state["state"] == VoiceState.ERROR.value
+    assert "microphone button" in state["detail"], state["detail"]
+    assert session.wake.running is False, "it opened a device it cannot use"

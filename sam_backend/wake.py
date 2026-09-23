@@ -175,8 +175,9 @@ class LocalPhraseDetector(WakeDetector):
     Sam." A wake word that only sometimes works is worse than none, and a
     second copy of the same weights in memory would buy nothing.
 
-    It only ever sees a couple of seconds of audio that the energy gate has
-    already judged to be speech, so a silent room costs nothing at all.
+    It only ever sees one utterance, which the energy gate has already judged
+    to be speech and the ring buffer bounds to a few seconds, so a silent room
+    costs nothing at all.
     """
 
     def __init__(self, model_size: str = "small", *, shared: Any = None) -> None:
@@ -199,7 +200,13 @@ class LocalPhraseDetector(WakeDetector):
     @property
     def available(self) -> bool:
         if self.shared is not None:
-            return bool(getattr(self.shared, "available", False))
+            probe = getattr(self.shared, "available", False)
+            # The dictation service exposes this as a method, and a bound
+            # method is always truthy -- asking without calling it answers
+            # "yes" even when the package is missing and nothing could ever
+            # be heard. Hands-free would then start and stay silent forever
+            # instead of saying the microphone button still works.
+            return bool(probe() if callable(probe) else probe)
         try:
             import faster_whisper  # noqa: F401
         except Exception:  # noqa: BLE001
