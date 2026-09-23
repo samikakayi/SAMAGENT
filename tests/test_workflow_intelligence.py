@@ -817,3 +817,98 @@ def test_a_connection_to_a_node_that_really_is_missing_still_fails():
 
     assert result.ok is False
     assert any("error-handler-that-was-never-added" in error for error in result.errors)
+
+
+# --- the API mutation gate ------------------------------------------------------
+#
+# The panel has to be able to finish an import, and it must do so through the
+# approval records every other mutation uses -- not a second, softer gate.
+
+
+def test_an_import_asks_for_approval_and_then_completes(client, app):
+    intelligence = app.state.workflows
+    intelligence._n8n = FakeN8n()
+    from sam_backend.workflows import prepare
+
+    artifact = prepare(workflow(MANUAL, node("Set", "n8n-nodes-base.set")), PROVENANCE)
+    intelligence._remember(artifact)
+
+    asked = client.post("/api/workflows/import", json={"workflow_sha256": artifact.sha256}).json()
+    assert asked["approval_required"] is True
+    assert asked["approval_id"], "the panel needs a real approval to decide on"
+    assert asked["risk"]["level"] == "LOW"
+
+    done = client.post("/api/workflows/import", json={
+        "workflow_sha256": artifact.sha256, "approval_id": asked["approval_id"]}).json()
+
+    assert done["imported"] is True
+    assert done["active"] is False, "import must never activate"
+
+
+def test_an_approval_cannot_be_reused_for_a_different_action(client, app):
+    """An import approval is not an activation approval."""
+    intelligence = app.state.workflows
+    intelligence._n8n = FakeN8n()
+    from sam_backend.workflows import prepare
+
+    artifact = prepare(workflow(MANUAL, node("Set", "n8n-nodes-base.set")), PROVENANCE)
+    intelligence._remember(artifact)
+    asked = client.post("/api/workflows/import", json={"workflow_sha256": artifact.sha256}).json()
+
+    misused = client.post("/api/workflows/activate", json={
+        "workflow_id": "wf-1", "active": True, "approval_id": asked["approval_id"]})
+
+    assert misused.status_code == 409
+    assert "different action" in str(misused.json())
+
+
+def test_an_approval_is_single_use(client, app):
+    intelligence = app.state.workflows
+    intelligence._n8n = FakeN8n()
+    from sam_backend.workflows import prepare
+
+    artifact = prepare(workflow(MANUAL, node("Set", "n8n-nodes-base.set")), PROVENANCE)
+    intelligence._remember(artifact)
+    asked = client.post("/api/workflows/import", json={"workflow_sha256": artifact.sha256}).json()
+    body = {"workflow_sha256": artifact.sha256, "approval_id": asked["approval_id"]}
+
+    assert client.post("/api/workflows/import", json=body).json()["imported"] is True
+    replayed = client.post("/api/workflows/import", json=body)
+
+    assert replayed.status_code == 409, "a claimed approval must not authorise a second import"
+
+
+def test_activation_needs_its_own_approval(client, app):
+    intelligence = app.state.workflows
+    intelligence._n8n = FakeN8n()
+
+    asked = client.post("/api/workflows/activate", json={"workflow_id": "wf-1", "active": True}).json()
+    assert asked["approval_required"] is True
+
+    done = client.post("/api/workflows/activate", json={
+        "workflow_id": "wf-1", "active": True, "approval_id": asked["approval_id"]}).json()
+
+    assert done["active"] is True
+    assert intelligence._n8n.activated == [("wf-1", True)]
+
+
+def test_an_unknown_approval_id_is_refused(client, app):
+    app.state.workflows._n8n = FakeN8n()
+
+    refused = client.post("/api/workflows/activate", json={
+        "workflow_id": "wf-1", "active": True, "approval_id": "apr_nonexistent"})
+
+    assert refused.status_code == 404
+
+
+def test_the_read_routes_need_no_approval_and_no_n8n(client):
+    assert client.get("/api/workflows/status").status_code == 200
+    payload = client.get("/api/workflows/status").json()
+    assert payload["n8n"]["status"] == "NOT_CONFIGURED"
+
+
+def test_no_workflow_route_leaks_the_n8n_key(client, app):
+    app.state.settings.n8n_api_key = N8N_SENTINEL
+
+    for path in ("/api/workflows/status", "/api/settings", "/api/providers/status"):
+        assert N8N_SENTINEL not in client.get(path).text, path

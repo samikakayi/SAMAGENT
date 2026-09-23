@@ -173,6 +173,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     application.state.agent = agent
     application.state.router = router
     application.state.trading = trading
+    application.state.workflows = workflow_intelligence
     application.state.windows = windows
     application.state.cancellation = cancellation
     application.state.voice = voice
