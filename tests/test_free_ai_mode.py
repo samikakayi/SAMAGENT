@@ -215,7 +215,10 @@ def answering(monkeypatch, provider: str, handler):
 
     monkeypatch.setattr(httpx, "AsyncClient", Patched)
     monkeypatch.setattr("sam_backend.models.PROVIDER_RETRY_BACKOFF_SECONDS", 0.0)
-    settings = Settings(groq_api_key=GROQ_SENTINEL, gemini_api_key=GEMINI_SENTINEL)
+    # Every keyed provider needs one, or it short-circuits on NOT_CONFIGURED
+    # before the transport this helper exists to exercise.
+    settings = Settings(groq_api_key=GROQ_SENTINEL, gemini_api_key=GEMINI_SENTINEL,
+                        openrouter_api_key="sk-or-v1-TRANSPORTSENTINELabcdefghij0123456789")
     return AdapterRegistry(settings).get(provider), calls
 
 
@@ -782,3 +785,48 @@ def test_an_explicit_choice_is_untouched_outside_free(tmp_path, profile):
     chain = asyncio.run(routed(router, provider="openrouter", model="anthropic/claude-sonnet-4"))
 
     assert chain == ["openrouter/anthropic/claude-sonnet-4"]
+
+
+# --- a provider's error body is not guaranteed to be an object ------------------
+#
+# Found against the live Gemini endpoint: Google answers some errors with a JSON
+# *array* -- [{"error": {...}}] -- and the adapter assumed a mapping. `.get` on a
+# list raises AttributeError, which `except ValueError` does not catch, so it
+# escaped the adapter entirely. The orchestrator only handles ModelError, so a
+# real run would have died unclassified rather than falling back.
+
+@pytest.mark.parametrize("provider", ["groq", "gemini", "openrouter", "litellm"])
+def test_a_list_shaped_error_body_is_still_classified(monkeypatch, provider):
+    """Every provider shares this adapter, so every provider shared the crash."""
+    body = [{"error": {"code": 404, "message": "This model is no longer available."}}]
+    adapter, _ = answering(monkeypatch, provider, lambda request: httpx.Response(
+        404, json=body, request=request))
+
+    with pytest.raises(ModelError) as raised:
+        asyncio.run(adapter.complete([{"role": "user", "content": "hi"}], [], "retired-model"))
+
+    # A ModelError, not an AttributeError leaking out of the transport.
+    assert raised.value.category is ErrorCategory.UNKNOWN
+    assert "no longer available" in str(raised.value), "the provider's reason should survive"
+
+
+@pytest.mark.parametrize("body", [
+    [{"error": {"message": "listed"}}],       # what Google actually sends
+    [],                                        # empty array
+    ["just a string"],                        # array of non-objects
+    {"error": "a bare string, not an object"},
+    {"error": None},
+    "not json at all",
+    42,
+])
+def test_no_error_body_shape_can_crash_the_adapter(monkeypatch, body):
+    """The transport must always produce a ModelError, whatever arrives."""
+    def handler(request):
+        if isinstance(body, (dict, list)):
+            return httpx.Response(500, json=body, request=request)
+        return httpx.Response(500, text=str(body), request=request)
+
+    adapter, _ = answering(monkeypatch, "groq", handler)
+
+    with pytest.raises(ModelError):
+        asyncio.run(adapter.complete([{"role": "user", "content": "hi"}], [], "m"))
