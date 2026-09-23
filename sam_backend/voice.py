@@ -504,6 +504,10 @@ class MicrophoneStream:
             self._stream.close()
             self._stream = None
 
+    def pending(self) -> int:
+        """Frames captured but not yet read: zero means the reader has caught up."""
+        return self._queue.qsize()
+
     def frames(self, timeout: float = 0.5) -> Iterator[Any]:
         while True:
             try:
@@ -682,14 +686,26 @@ class VoiceService:
         device: int | None = None,
         language: str | None = None,
         on_event: Callable[[VoiceEvent], None] | None = None,
+        threshold: float | None = None,
+        min_speech_frames: int = 1,
     ) -> dict[str, Any]:
-        """Capture one utterance: wait for speech, stop on silence, transcribe."""
+        """Capture one utterance: wait for speech, stop on silence, transcribe.
+
+        `threshold` and `min_speech_frames` exist for hands-free. With nobody
+        at the keyboard to press a button, a fixed gate and a single loud frame
+        were enough to "capture" a fan surge or a click -- four times out of
+        four in a silent room, 0.8 to 9.3 seconds of nothing -- which the Sorani
+        provider, having no silence filter, then transcribed into words nobody
+        said. The defaults leave push-to-talk exactly as it was.
+        """
         import numpy
 
         silence = (silence_ms if silence_ms is not None else int(getattr(self.settings, "voice_silence_ms", 800) or 800)) / 1000
+        gate = 0.006 if threshold is None else float(threshold)
         emit = on_event or (lambda event: None)
         collected: list[Any] = []
         speech_started = False
+        voiced_frames = 0
         last_voice = time.monotonic()
         deadline = time.monotonic() + max_seconds
 
@@ -700,21 +716,47 @@ class VoiceService:
                 if now > deadline:
                     break
                 energy = rms_energy(frame)
-                voiced = energy > 0.006
+                voiced = energy > gate
                 if voiced:
                     if not speech_started:
                         speech_started = True
                         emit(VoiceEvent("speech_start", {"energy": energy}))
+                    voiced_frames += 1
                     last_voice = now
                 if speech_started:
                     collected.append(frame)
                     if not voiced and now - last_voice >= silence:
+                        if voiced_frames < min_speech_frames:
+                            # A blip, not an utterance: forget it and keep waiting.
+                            collected.clear()
+                            speech_started = False
+                            voiced_frames = 0
+                            continue
                         emit(VoiceEvent("speech_end", {"seconds": len(collected) * FRAME_MS / 1000}))
                         break
+        if collected and voiced_frames < min_speech_frames:
+            collected.clear()
 
         if not collected:
             return {"text": "", "captured": False, "reason": "No speech was detected before the timeout."}
         audio = numpy.concatenate(collected).astype("float32")
+        return self.transcribe_captured(audio, language=language, on_event=on_event)
+
+    def transcribe_captured(
+        self,
+        audio: Any,
+        *,
+        language: str | None = None,
+        on_event: Callable[[VoiceEvent], None] | None = None,
+    ) -> dict[str, Any]:
+        """Transcribe speech that has already been captured, in the command language.
+
+        `listen_once` ends here, and so does a hands-free command spoken in
+        the same breath as the wake phrase: that audio was captured by the
+        wake listener, and must be read by the recogniser the user configured
+        -- the Sorani provider for Sorani -- not by the English wake pass.
+        """
+        emit = on_event or (lambda event: None)
         seconds = round(len(audio) / SAMPLE_RATE, 2)
         spoken_language = language or getattr(self.settings, "voice_language", None)
         emit(VoiceEvent("transcribing", {"seconds": seconds}))

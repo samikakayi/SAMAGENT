@@ -25,12 +25,25 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .wake import LocalPhraseDetector, VoiceState, VoiceStatus, WakeWordService
+from .wake import (
+    FRAME_MS,
+    POST_WAKE_MAX_FRAMES,
+    POST_WAKE_MIN_SPEECH_FRAMES,
+    POST_WAKE_ONSET_CAP_FRAMES,
+    LocalPhraseDetector,
+    VoiceState,
+    VoiceStatus,
+    WakeDetection,
+    WakeWordService,
+)
 
 # Bounds on one spoken turn. A microphone that records without end is a
 # different product, and a worse one.
 MAX_COMMAND_SECONDS = 20.0
 SPEECH_START_TIMEOUT = 5.0
+# How long to wait for the listener to finish capturing what followed the
+# phrase: its own bounds, plus room for the examination that preceded them.
+POST_WAKE_WAIT_SECONDS = (POST_WAKE_MAX_FRAMES + POST_WAKE_ONSET_CAP_FRAMES) * FRAME_MS / 1000 + 10.0
 
 
 class VoiceConversationController:
@@ -129,19 +142,23 @@ class VoiceConversationController:
     # -- one session --------------------------------------------------------
     def _on_wake(self) -> None:
         if self._busy.is_set():
+            # Left unclaimed, so the listener carries nothing forward for it.
             return
-        threading.Thread(target=self.run_session, name="sam-voice-turn", daemon=True).start()
+        detection = self.wake.take_detection()
+        threading.Thread(target=self.run_session, kwargs={"detection": detection},
+                         name="sam-voice-turn", daemon=True).start()
 
-    def run_session(self) -> dict[str, Any]:
+    def run_session(self, detection: WakeDetection | None = None) -> dict[str, Any]:
         """Wake acknowledged: capture, answer, speak, then offer a follow-up."""
         if self._busy.is_set():
             return self.describe()
         self._busy.set()
         try:
             self._set(VoiceState.WAKE_DETECTED, "Yes?")
-            outcome = self._turn()
+            outcome = self._turn(detection=detection)
             deadline = time.monotonic() + self.continuation_seconds
-            while outcome.get("spoke") and self.continuation_seconds > 0 and time.monotonic() < deadline:
+            while (outcome.get("spoke") and self.continuation_seconds > 0 and time.monotonic() < deadline
+                   and not self.wake.stopped):
                 # A follow-up needs no wake phrase, but it does need speech:
                 # silence simply lets the window close.
                 self._set(VoiceState.LISTENING, "Listening for a follow-up…",
@@ -150,16 +167,32 @@ class VoiceConversationController:
                 if not outcome.get("captured"):
                     break
                 deadline = time.monotonic() + self.continuation_seconds
-            self._set(VoiceState.WAKE_LISTENING, f"Waiting for {self.wake.phrase}…",
-                      continuation_active=False)
+            if self.wake.stopped:
+                # Switched off while this session was running: say so, rather
+                # than claiming to wait for a phrase nobody is listening for.
+                self._set(VoiceState.OFF, "Hands-free voice is switched off.", continuation_active=False)
+            else:
+                self._set(VoiceState.WAKE_LISTENING, f"Waiting for {self.wake.phrase}…",
+                          continuation_active=False)
             return self.describe()
         finally:
             self._busy.clear()
 
-    def _turn(self, *, follow_up: bool = False) -> dict[str, Any]:
-        if not follow_up:
-            self._set(VoiceState.LISTENING, "Listening…")
-        heard = self._capture()
+    def _turn(self, *, follow_up: bool = False, detection: WakeDetection | None = None) -> dict[str, Any]:
+        heard = self._after_phrase(detection) if detection is not None else None
+        if heard is not None and heard.get("abandoned"):
+            return {"captured": False, "spoke": False}
+        if heard is None:
+            if self.wake.stopped:
+                # Switched off: no new capture, not even a follow-up.
+                return {"captured": False, "spoke": False}
+            if not follow_up and detection is None:
+                self._set(VoiceState.LISTENING, "Listening…")
+            heard = self._capture()
+            if self.wake.stopped:
+                # Switched off while that capture was running: whatever it
+                # heard arrived after the user said stop, and is not acted on.
+                return {"captured": False, "spoke": False}
         if not heard.get("captured"):
             if not follow_up:
                 self._set(VoiceState.WAKE_LISTENING, "I did not catch that.",
@@ -188,6 +221,46 @@ class VoiceConversationController:
         spoke = self._speak(reply)
         return {"captured": True, "spoke": True, "reply": reply, "spoken": spoke}
 
+    def _after_phrase(self, detection: WakeDetection) -> dict[str, Any] | None:
+        """The command spoken in the same breath as the phrase, if there was one.
+
+        The wake listener has already captured it on the stream that heard the
+        phrase; this reads it in the command language. None means "ask for the
+        command the ordinary way": nothing followed the phrase, or what did
+        could not be read -- in which case the reason is shown, and the user
+        gets a second chance rather than a session that silently vanishes.
+        """
+        self._set(VoiceState.LISTENING, "Listening…")
+        if not detection.wait(POST_WAKE_WAIT_SECONDS):
+            return None
+        if detection.interrupted or self.wake.stopped:
+            # Switched off, or silenced, part-way through the command. Half a
+            # sentence is not a smaller request, it can be a different one, so
+            # nothing is transcribed and nothing is asked.
+            detection.release()
+            return {"captured": False, "abandoned": True}
+        if not detection.speech:
+            return None
+        audio = detection.audio
+        # Transcribed once, then gone: the loop keeps text, never audio.
+        detection.release()
+        if audio is None:
+            return None
+        self._set(VoiceState.TRANSCRIBING, "Getting that down…")
+        try:
+            heard = self.voice.transcribe_captured(audio, language=self.language)
+        except Exception as exc:  # noqa: BLE001 - a provider failure is a state
+            heard = {"text": "", "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            del audio
+        if str(heard.get("text") or "").strip():
+            return {**heard, "captured": True}
+        why = str(heard.get("error") or heard.get("reason") or "").strip()
+        self._set(VoiceState.LISTENING,
+                  f"{why[:120]} Please say it again." if why else "I did not catch that. Please say it again.",
+                  last_error=why[:200])
+        return None
+
     def _capture(self) -> dict[str, Any]:
         """One utterance, bounded, through the voice service that already exists.
 
@@ -201,6 +274,11 @@ class VoiceConversationController:
                 max_seconds=MAX_COMMAND_SECONDS,
                 device=getattr(self.settings, "voice_input_device", None),
                 language=self.language,
+                # The same bar the wake listener uses for this room, and a
+                # syllable of voice, so a click after an answer is not sent to
+                # be transcribed into a question nobody asked.
+                threshold=self.wake.command_threshold,
+                min_speech_frames=POST_WAKE_MIN_SPEECH_FRAMES,
             )
         except Exception as exc:  # noqa: BLE001 - a lost device is a state
             return {"captured": False, "reason": f"{type(exc).__name__}: {exc}"}
