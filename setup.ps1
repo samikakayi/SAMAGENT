@@ -99,7 +99,7 @@ if ($InstallDesktopAutomation) {
 }
 
 if ($InstallLocalVoice) {
-    & $VenvPython -m pip install faster-whisper silero-vad onnxruntime piper-tts
+    & $VenvPython -m pip install faster-whisper silero-vad onnxruntime piper-tts sounddevice
     if ($LASTEXITCODE -ne 0) { throw "Local Voice installation did not complete successfully." }
 }
 
