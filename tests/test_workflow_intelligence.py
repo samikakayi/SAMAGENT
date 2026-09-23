@@ -912,3 +912,46 @@ def test_no_workflow_route_leaks_the_n8n_key(client, app):
 
     for path in ("/api/workflows/status", "/api/settings", "/api/providers/status"):
         assert N8N_SENTINEL not in client.get(path).text, path
+
+
+def test_status_reads_the_cache_rather_than_calling_a_working_library_unavailable(tmp_path):
+    """A fresh process has a good index on disk; the panel said UNAVAILABLE.
+
+    `_state` started at UNAVAILABLE and only moved once something loaded the
+    index, so the first thing a user saw in the Workflow Intelligence panel
+    reported a working capability as broken -- until an unrelated search
+    happened to fix it. Status now consults the cache, and only the cache: a
+    status panel must not block on GitHub.
+    """
+    body = workflow(MANUAL, node("Set", "n8n-nodes-base.set"))
+    warm, client = library(tmp_path, {"0001_Telegram": response(body)})
+    assert warm.search("telegram"), "the index is built and cached"
+
+    # A second provider over the same cache directory, as a restart would be.
+    cold = GitHubWorkflowLibrary(tmp_path, client_factory=lambda: client)
+    reported = cold.status()
+
+    assert reported["state"] == "LIBRARY_AVAILABLE"
+    assert reported["indexed_workflows"] == warm.status()["indexed_workflows"]
+    assert reported["indexed_workflows"] > 0
+    assert cold.search("telegram"), "and searching still works afterwards"
+
+
+def test_status_says_unavailable_only_when_nothing_is_cached(tmp_path):
+    """Absent is a real answer; it just has to be true."""
+    cold = GitHubWorkflowLibrary(tmp_path, client_factory=lambda: FakeLibraryClient({}))
+
+    reported = cold.status()
+
+    assert reported["state"] == "LIBRARY_UNAVAILABLE"
+    assert reported["indexed_workflows"] == 0
+
+
+def test_reading_status_never_reaches_the_network(tmp_path):
+    """Otherwise a status panel would hang whenever GitHub is slow."""
+    client = FakeLibraryClient({})
+    cold = GitHubWorkflowLibrary(tmp_path, client_factory=lambda: client)
+
+    cold.status()
+
+    assert client.requested == [], "status asked GitHub for nothing"

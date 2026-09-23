@@ -131,6 +131,19 @@ class GitHubWorkflowLibrary:
         return self._state
 
     def status(self) -> dict[str, Any]:
+        if self._entries is None:
+            # The cache, and only the cache. `_state` starts at UNAVAILABLE and
+            # used to stay there until something else loaded the index, so a
+            # fresh process reported a perfectly good 2000-workflow library as
+            # broken -- the first thing anyone sees in the panel. Reading the
+            # cached index here fixes that without a status call ever blocking
+            # on GitHub; `_read_cache` sets the state and timestamp as it goes.
+            cached = self._read_cache("index.json", INDEX_TTL_SECONDS)
+            if cached:
+                self._entries = [
+                    LibraryEntry(**{**item, "services": tuple(item.get("services") or ())})
+                    for item in cached
+                ]
         entries = self._entries or []
         return {
             "state": self._state.value, "source_repository": SOURCE_REPOSITORY,
