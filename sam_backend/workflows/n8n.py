@@ -23,6 +23,21 @@ from .models import N8nExecutionStatus, WorkflowError, WorkflowErrorCode
 
 TIMEOUT_SECONDS = 25.0
 MAX_RESPONSE_BYTES = 2_000_000
+
+# Exactly the n8n API key scopes the calls below need, and nothing else.
+# Declared here rather than in a settings file because this class is the only
+# thing that talks to n8n: if a method is added, the scope it needs is added
+# on the same screen, and the health panel can tell an operator whether their
+# key is broader than the product has any use for.
+REQUIRED_SCOPES = frozenset({
+    "workflow:list",        # status(), list_workflows()
+    "workflow:read",        # get_workflow()
+    "workflow:create",      # create_workflow()
+    "workflow:activate",    # set_active(True)
+    "workflow:deactivate",  # set_active(False)
+    "credential:list",      # list_credentials() -- names and types only
+    "execution:list",       # executions()
+})
 # Execution output goes in front of a model, so it is trimmed here rather than
 # wherever it happens to be rendered.
 MAX_OUTPUT_ITEMS = 5

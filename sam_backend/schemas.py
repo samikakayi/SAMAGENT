@@ -236,11 +236,26 @@ class TwoAnchorDrawRequest(BaseModel):
     layer: str | None = None
 
 
+class CredentialMetadata(BaseModel):
+    """The non-secret facts about a key, which only its issuer knows.
+
+    n8n's public API has no endpoint for reading an API key's own scopes or
+    expiry, so the moment the operator pastes the key is the only honest
+    opportunity to learn them. Recorded separately from the value, and only
+    these three fields -- anything else offered is ignored.
+    """
+
+    scopes: list[str] | None = Field(default=None, max_length=200)
+    created_at: str | None = Field(default=None, max_length=40)
+    expires_at: str | None = Field(default=None, max_length=40)
+
+
 class CredentialRequest(BaseModel):
     name: Literal["openrouter_api_key", "openai_api_key", "litellm_api_key",
                   "groq_api_key", "gemini_api_key", "n8n_api_key"]
     # The value is accepted, never echoed. Responses carry only a fingerprint.
     value: str = Field(min_length=8, max_length=400)
+    metadata: CredentialMetadata | None = None
 
 
 class GannDrawRequest(BaseModel):

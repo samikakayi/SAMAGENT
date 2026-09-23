@@ -16,6 +16,7 @@ from .api import (
     register_desktop_routes,
     register_oversight_routes,
     register_local_request_guard,
+    register_integration_routes,
     register_provider_routes,
     register_settings_routes,
     register_system_routes,
@@ -28,6 +29,7 @@ from .cancellation import CancellationManager
 from .capabilities import CapabilityRegistry
 from .config import Settings
 from .dpi import ensure_dpi_awareness
+from .integrations import IntegrationHealth
 from .db import Database
 from .models import AdapterRegistry
 from .policy import RiskPolicy
@@ -197,11 +199,16 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
 
     register_local_request_guard(application, settings)
 
+    # One health view over every outside connection, sharing the secret store
+    # and the n8n client that already exist rather than opening its own.
+    integrations = IntegrationHealth(settings, secret_store, database, workflow_intelligence)
+    application.state.integrations = integrations
+
     services = AppServices(
         settings=settings, database=database, policy=policy, cancellation=cancellation,
         trading=trading, windows=windows, scanner=scanner, verifier=verifier,
         capabilities=capability_registry, tools=tools, secrets=secret_store,
-        provider_health=provider_health, router=router, agent=agent,
+        provider_health=provider_health, integrations=integrations, router=router, agent=agent,
         task_store=task_store, orchestrator=orchestrator, agent_api=agent_api,
         voice=voice, replay=replay,
         apply_stored_credentials=apply_stored_credentials,
@@ -214,6 +221,7 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     register_settings_routes(application, services)
     register_workflow_routes(application, services)
     register_provider_routes(application, services)
+    register_integration_routes(application, services)
     register_trading_routes(application, services)
     register_voice_routes(application, services)
     register_desktop_routes(application, services)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from ..integrations import clear_metadata, record_metadata
 from ..schemas import CredentialRequest
 from ..secrets import ollama_status, openai_compatible_status, openrouter_status, start_ollama
 from .services import AppServices
@@ -128,9 +129,18 @@ def register_provider_routes(application: FastAPI, sv: AppServices) -> None:
             raise HTTPException(400, str(exc)) from exc
         apply_stored_credentials()
         rebuild_adapters()
+        recorded: dict[str, Any] = {}
+        if payload.metadata is not None:
+            # Scope and expiry are what let the health panel say "this key can
+            # do more than SAM uses" or "this expires in six days". They are
+            # not secret, and they are kept apart from the value that is.
+            recorded = record_metadata(database, payload.name,
+                                       payload.metadata.model_dump(exclude_none=True))
+        sv.integrations.invalidate()
         database.add_audit(
             "credentials", "success", f"Stored {payload.name} in the local secret store",
-            actor="user", details={"name": payload.name, "fingerprint": stored["fingerprint"]},
+            actor="user", details={"name": payload.name, "fingerprint": stored["fingerprint"],
+                                   "metadata_recorded": sorted(recorded)},
         )
         # The response carries presence and fingerprint only, never the value.
         status = await openrouter_status(
@@ -145,6 +155,10 @@ def register_provider_routes(application: FastAPI, sv: AppServices) -> None:
         removed = secret_store.clear(name)
         apply_stored_credentials()
         rebuild_adapters()
+        # Scope and expiry described the key that just went away; leaving them
+        # behind would let the health panel describe a credential nobody has.
+        clear_metadata(database, name)
+        sv.integrations.invalidate()
         database.add_audit("credentials", "success" if removed else "failed",
                            f"Cleared {name}", actor="user", details={"name": name})
         return {"cleared": removed, "name": name, "credentials": secret_store.public_status()}

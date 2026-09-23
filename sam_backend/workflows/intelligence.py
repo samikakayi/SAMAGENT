@@ -91,6 +91,31 @@ class WorkflowIntelligence:
         self._remember(artifact)
         return self._describe(artifact)
 
+    def plan_goal(self, goal: str, *, name: str = "",
+                  credential_mapping: dict[str, str] | None = None,
+                  adapt: Any = None) -> dict[str, Any]:
+        """Carry a plain-language goal as far as a reviewable artifact.
+
+        Imported here rather than at module scope because the planner needs
+        this class: the facade owns the artifact store, and a plan is only
+        worth anything if its hash is one `artifact()` can later hand back.
+        """
+        from .goals import plan_goal as _plan
+
+        plan = _plan(goal, self, name=name, credential_mapping=credential_mapping, adapt=adapt)
+        payload = plan.as_dict()
+        payload["target_instance"] = self.target
+        if plan.artifact is not None:
+            payload["approval_fingerprint"] = approval_fingerprint(
+                workflow_sha=plan.artifact.sha256, operation="workflow_import", target=self.target)
+            payload["importable"] = (
+                plan.artifact.validation.ok and not plan.artifact.unresolved_credentials)
+        return payload
+
+    def remember_artifact(self, artifact: WorkflowArtifact) -> None:
+        """Hold a prepared artifact so an approval can be bound to its hash."""
+        self._remember(artifact)
+
     def _remember(self, artifact: WorkflowArtifact) -> None:
         now = time.time()
         self._artifacts = {

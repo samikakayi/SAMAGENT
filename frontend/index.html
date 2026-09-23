@@ -602,11 +602,21 @@
 <div class="sam-action-row"><input type="password" id="groq-key-input" placeholder="Groq API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><input type="password" id="gemini-key-input" placeholder="Gemini API key" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px"><button class="primary-button" type="button" id="free-keys-save-btn">Configure</button></div>
 <p class="p-note">The key is sent to the local backend only, stored outside the web root, and never returned to this page.</p>
 </div></div>
+<div class="trade-card" id="card-integration-health"><div class="trade-card-header"><h3>Integration Health</h3><button class="secondary-button" type="button" id="integration-refresh-btn">Refresh</button></div><div class="trade-card-body">
+<p class="p-note" id="integration-summary">Integration health has not been checked yet.</p>
+<div id="integration-list"></div>
+<p class="p-note" id="integration-note"></p>
+<p class="p-note">States are cached and only re-checked when you press Refresh, so this panel never spends a provider&#39;s free quota to look current. Credential values are never shown here.</p>
+</div></div>
 <div class="trade-card" id="card-workflow-intelligence"><div class="trade-card-header"><h3>Workflow Intelligence</h3><button class="secondary-button" type="button" id="wf-refresh-btn">Refresh</button></div><div class="trade-card-body">
 <div class="level-row"><span class="level-label">Workflow library</span><span class="badge badge-subtle" id="wf-library-state">UNKNOWN</span></div>
 <p class="p-note" id="wf-library-detail">The workflow library has not been read yet.</p>
 <div class="level-row"><span class="level-label">n8n instance</span><span class="badge badge-subtle" id="wf-n8n-state">UNKNOWN</span></div>
 <p class="p-note" id="wf-n8n-detail"></p>
+<h4>Create from a goal</h4>
+<div class="sam-action-row"><input class="text-field" type="text" id="wf-goal" placeholder="Describe what you want automated, e.g. watch Gmail for invoices and save them to Drive" autocomplete="off" style="flex:1;min-width:260px"><button class="primary-button" type="button" id="wf-goal-btn">Plan it</button></div>
+<div id="wf-goal-plan"></div>
+<h4>Or search the library yourself</h4>
 <div class="sam-action-row"><input class="text-field" type="text" id="wf-query" placeholder="What should the automation do? e.g. gmail drive invoice" autocomplete="off" style="flex:1;min-width:220px"><select class="text-field" id="wf-trigger" style="min-width:140px"><option value="">Any trigger</option><option value="scheduled">Scheduled</option><option value="webhook">Webhook</option><option value="triggered">Triggered</option><option value="manual">Manual</option></select><button class="primary-button" type="button" id="wf-search-btn">Search</button></div>
 <div id="wf-results"></div>
 <div id="wf-inspection"></div>
@@ -1258,6 +1268,7 @@
     <script src="./app.js" defer></script>
     <script src="./panels.js" defer></script>
     <script src="./routing-panel.js" defer></script>
+    <script src="./integration-health.js" defer></script>
     <script src="./workflow-intelligence.js" defer></script>
     <script src="./agent-panel.js" defer></script>
   </body>

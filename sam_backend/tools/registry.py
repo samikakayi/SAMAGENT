@@ -90,6 +90,7 @@ class ToolRegistry:
             "run_python": self._run_python,
             "open_url": self._open_url,
             "web_search": self._web_search,
+            "workflow_goal_plan": self._workflow_goal_plan,
             "workflow_search": self._workflow_search,
             "workflow_inspect": self._workflow_inspect,
             "workflow_prepare": self._workflow_prepare,
@@ -459,6 +460,13 @@ class ToolRegistry:
             return ToolResult(True, action())
         except WorkflowError as exc:
             return ToolResult(False, None, str(exc), )
+
+    def _workflow_goal_plan(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
+        """Plan only. The plan names the next step; it never takes it."""
+        return self._workflow_call(lambda: self.workflows.plan_goal(
+            str(arguments.get("goal", "")), name=str(arguments.get("name", "")),
+            credential_mapping=arguments.get("credential_mapping") or None,
+        ))
 
     def _workflow_search(self, arguments: dict[str, Any], approved: bool) -> ToolResult:
         return self._workflow_call(lambda: self.workflows.search(
