@@ -51,9 +51,15 @@
     // should have to wonder whether SAM is listening.
     bar.hidden = !(live || current === "ERROR");
     const phrase = state?.wake_phrase || "Hey SAM";
-    label.textContent = current === "WAKE_LISTENING"
-      ? `Waiting for ${phrase}…`
-      : (state?.detail || WORDING[current] || current);
+    // The speech model takes a while to load the first time, and until it has,
+    // saying the phrase does nothing. Claiming to be waiting for it would send
+    // somebody off to repeat themselves at a microphone that cannot hear yet.
+    const warming = current === "WAKE_LISTENING" && state?.wake && state.wake.ready === false;
+    label.textContent = warming
+      ? "Getting ready to listen…"
+      : current === "WAKE_LISTENING"
+        ? `Waiting for ${phrase}…`
+        : (state?.detail || WORDING[current] || current);
     if (dot) dot.style.opacity = live ? "1" : "0.35";
     if (toggle) {
       toggle.textContent = live ? "Stop" : "Start";
