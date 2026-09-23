@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -103,6 +104,11 @@ class ManagedN8nRuntime:
                                 or DEFAULT_ROOT / "n8n-runtime")
         self.data_dir = Path(data_dir or os.getenv(DATA_ENV) or DEFAULT_ROOT / "n8n-data")
         self.port = int(port)
+        # Deciding whether to launch and launching are one step. Two callers
+        # both saw STOPPED and both spawned; one won the port and the other
+        # died on it, telling its caller STOPPED while n8n was starting fine.
+        # Held across the decision only -- never across the wait for health.
+        self._start_lock = threading.Lock()
 
     # -- what is installed --------------------------------------------------
     @property
@@ -280,39 +286,45 @@ class ManagedN8nRuntime:
         }
 
     def start(self, *, timeout: float = START_TIMEOUT_SECONDS) -> RuntimeStatus:
-        current = self.status()
-        if current.state is RuntimeState.RUNNING:
-            return current
-        if current.state in (RuntimeState.NOT_INSTALLED, RuntimeState.PORT_CONFLICT,
-                             RuntimeState.UNKNOWN_PROCESS):
-            # Nothing to start, or something else owns the port. Either way
-            # SAM does not get to force it.
-            return current
-        if current.state is RuntimeState.UNHEALTHY:
-            # An owned process is already coming up. Launching a second one
-            # only produces a process that dies on the taken port and a
-            # STOPPED verdict for an instance that was about to work.
-            return self._await_health(timeout, self._read_record(),
-                                      "The managed n8n was already starting")
-        if not self.data_dir.exists():
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-
-        # Fixed executable, fixed arguments. No shell, and nothing here comes
-        # from a caller.
-        command = ["node", str(self.entrypoint), "start"]
-        try:
-            process = subprocess.Popen(  # noqa: S603 - argument vector is constant
-                command, cwd=str(self.runtime_dir), env=self._environment(),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, shell=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except OSError as exc:
-            return RuntimeStatus(RuntimeState.STOPPED, record=self._read_record(), url=self.url,
-                                 detail=f"Could not launch the managed n8n: {exc}")
-
-        record = self._write_record(pid=process.pid, last_started_at=_now())
-        return self._await_health(timeout, record, f"n8n {record.version} started", process=process)
+        process = None
+        with self._start_lock:
+            current = self.status()
+            if current.state is RuntimeState.RUNNING:
+                return current
+            if current.state in (RuntimeState.NOT_INSTALLED, RuntimeState.PORT_CONFLICT,
+                                 RuntimeState.UNKNOWN_PROCESS):
+                # Nothing to start, or something else owns the port. Either way
+                # SAM does not get to force it.
+                return current
+            if current.state is RuntimeState.UNHEALTHY:
+                # An owned process is already coming up -- possibly one this
+                # caller's twin launched a moment ago. Launching a second only
+                # produces a process that dies on the taken port and a STOPPED
+                # verdict for an instance that was about to work.
+                record = self._read_record()
+                note = "The managed n8n was already starting"
+            else:
+                if not self.data_dir.exists():
+                    self.data_dir.mkdir(parents=True, exist_ok=True)
+                # Fixed executable, fixed arguments. No shell, and nothing here
+                # comes from a caller.
+                command = ["node", str(self.entrypoint), "start"]
+                try:
+                    process = subprocess.Popen(  # noqa: S603 - argument vector is constant
+                        command, cwd=str(self.runtime_dir), env=self._environment(),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL, shell=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except OSError as exc:
+                    return RuntimeStatus(RuntimeState.STOPPED, record=self._read_record(),
+                                         url=self.url,
+                                         detail=f"Could not launch the managed n8n: {exc}")
+                record = self._write_record(pid=process.pid, last_started_at=_now())
+                note = f"n8n {record.version} started"
+        # Waiting happens outside the lock, so the second caller is not blocked
+        # for the whole startup -- it takes the branch above and waits too.
+        return self._await_health(timeout, record, note, process=process)
 
     def _await_health(self, timeout: float, record: RuntimeRecord, started_note: str,
                       *, process: Any = None) -> RuntimeStatus:
