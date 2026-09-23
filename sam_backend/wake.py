@@ -372,10 +372,12 @@ class WakeWordService:
     def resume(self, cooldown: float = ECHO_COOLDOWN_SECONDS) -> None:
         """Listen again, after a pause long enough to miss its own echo.
 
-        The pause is only owed to SAM's own voice. After a command the user has
-        stopped talking, so waiting would just be latency.
+        The pause is only owed to SAM's own voice reaching a live microphone.
+        After a command the user has stopped talking, and when hands-free is
+        off nothing is listening at all -- waiting in either case would just be
+        latency charged to every spoken reply.
         """
-        if cooldown > 0:
+        if cooldown > 0 and self.running:
             time.sleep(cooldown)
         self._buffer.clear()
         self._last_detection = time.monotonic()

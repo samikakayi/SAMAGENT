@@ -747,3 +747,40 @@ def test_nothing_is_examined_while_the_model_is_loading():
 
     assert detector.examined == 0, "a loading model was asked to transcribe on the audio thread"
     assert fired == [], "it woke on a model that had not loaded"
+
+
+def test_speaking_costs_nothing_when_nothing_is_listening():
+    """The echo cooldown is owed to a live microphone, not to every reply.
+
+    `voice.speak` tells the wake listener to stand down whoever called it,
+    which means the manual voice endpoint pays for that too. With hands-free
+    off there is no microphone open and no echo to outlast, so waiting would
+    be a second charged to every spoken answer for nothing.
+    """
+    voice = FakeVoice()
+    session = controller(enabled=False)
+    voice.on_speaking = session._while_speaking
+    assert session.wake.running is False
+
+    started = time.monotonic()
+    voice.speak("Gold is trading quietly.")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < ECHO_COOLDOWN_SECONDS / 2, (
+        f"waited {elapsed:.2f}s for an echo that could not happen")
+
+
+def test_the_manual_microphone_still_works_with_hands_free_off():
+    """Hands-free is an addition, not a replacement.
+
+    Push-to-talk has to keep working exactly as it did, including for people
+    who never switch the wake word on.
+    """
+    voice = FakeVoice(["what is gold doing"])
+    session = controller(enabled=False, voice=voice)
+
+    assert session.start()["state"] == VoiceState.OFF.value
+    # The capture path the manual button uses is untouched and still returns.
+    assert voice.listen_once(max_seconds=5)["text"] == "what is gold doing"
+    assert voice.speak("Gold is trading quietly.")["ok"] is True
+    assert voice.spoken == ["Gold is trading quietly."]
