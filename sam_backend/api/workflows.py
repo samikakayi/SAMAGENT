@@ -24,6 +24,12 @@ class PrepareRequest(BaseModel):
     credential_mapping: dict[str, str] | None = None
 
 
+class GoalRequest(BaseModel):
+    goal: str = Field(min_length=1, max_length=1000)
+    name: str | None = Field(default=None, max_length=200)
+    credential_mapping: dict[str, str] | None = None
+
+
 class ImportRequest(BaseModel):
     workflow_sha256: str = Field(min_length=64, max_length=64)
     # Returned by the first call, which creates the approval. Sent back once a
@@ -127,6 +133,18 @@ def register_workflow_routes(application: FastAPI, sv: AppServices) -> None:
     async def workflow_prepare(payload: PrepareRequest) -> dict[str, Any]:
         return await asyncio.to_thread(lambda: answer(lambda: workflows.prepare_workflow(
             payload.workflow_id, name=payload.name or "",
+            credential_mapping=payload.credential_mapping)))
+
+    @application.post("/api/workflows/goal")
+    async def workflow_goal(payload: GoalRequest) -> dict[str, Any]:
+        """Take a plain-language goal as far as a reviewable, hashed artifact.
+
+        Creates nothing. The plan ends at `next_action`, and the only action it
+        can name is asking for the approval that /import already requires --
+        so the read path never grows a way to write.
+        """
+        return await asyncio.to_thread(lambda: answer(lambda: workflows.plan_goal(
+            payload.goal, name=payload.name or "",
             credential_mapping=payload.credential_mapping)))
 
     @application.get("/api/workflows/n8n/workflows")

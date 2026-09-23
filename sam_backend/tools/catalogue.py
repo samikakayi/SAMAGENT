@@ -57,6 +57,11 @@ def tool_specs(registry: Any) -> list[dict[str, Any]]:
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
         }, ["code"])),
         ("open_url", "Open an http(s) URL in the user's default browser.", _schema({"url": {"type": "string"}}, ["url"])),
+        ("workflow_goal_plan", "Turn a plain-language automation goal into one reviewable plan: searches the library, ranks and inspects candidates, adapts or generates a workflow, then validates, risk-classifies and hashes it. Creates nothing in n8n -- importing stays a separate, approved step.", _schema({
+            "goal": {"type": "string"},
+            "name": {"type": "string"},
+            "credential_mapping": {"type": "object"},
+        }, ["goal"])),
         ("workflow_search", "Search the public n8n automation library by goal, service or category. Returns a handful of summaries, never whole workflows.", _schema({
             "query": {"type": "string"},
             "category": {"type": "string"}, "service": {"type": "string"},
@@ -250,6 +255,8 @@ def tool_manifests(registry: Any) -> list[dict[str, Any]]:
         "web_search": "network",
         # Reading the library and analysing JSON are network/local reads.
         # Creating or activating something in n8n changes a live system.
+        # Planning reads the library and analyses JSON; it changes nothing.
+        "workflow_goal_plan": "network",
         "workflow_search": "network", "workflow_inspect": "network",
         "workflow_prepare": "network", "workflow_run_status": "network",
         "workflow_import": "destructive_actions", "workflow_activate": "destructive_actions",

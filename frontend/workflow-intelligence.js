@@ -233,6 +233,123 @@
     }
   }
 
+  // -- create from goal -----------------------------------------------------
+  // One request carries the whole read half of the loop: search, rank,
+  // inspect, adapt or generate, validate, risk, hash. What comes back is a
+  // plan, never a change -- importing is still the separate approved step it
+  // always was, and this panel cannot skip it.
+  async function planGoal() {
+    const goal = $("wf-goal")?.value?.trim() || "";
+    const root = $("wf-goal-plan");
+    if (!goal) {
+      root?.replaceChildren(element("p", "p-note", "Describe what you want automated first."));
+      return;
+    }
+    if (root) root.replaceChildren(element("p", "p-note", "Reading the library and planning…"));
+    try {
+      const plan = await json("/api/workflows/goal", {
+        method: "POST",
+        body: JSON.stringify({ goal, name: $("wf-name")?.value?.trim() || undefined }),
+      });
+      renderPlan(plan);
+    } catch (error) {
+      if (root) root.replaceChildren(element("p", "p-note", error.message));
+    }
+  }
+
+  // "Prepared" until n8n has it, "Imported — Inactive" once it does, and
+  // "Active" only after a separate activation. Nothing is ever called
+  // "Running" here: only an execution record could justify that word.
+  function renderPlan(plan) {
+    const root = $("wf-goal-plan");
+    if (!root) return;
+    root.replaceChildren();
+
+    if (plan.next_action === "clarify") {
+      root.appendChild(element("p", "p-note", plan.blockers?.[0] || "That goal needs more detail."));
+      return;
+    }
+
+    const prepared = plan.prepared || {};
+    const risk = prepared.inspection?.risk || {};
+    root.appendChild(element("h4", null,
+      plan.origin === "library" ? "Best match from the library" : "Written by SAM for this goal"));
+    root.appendChild(element("p", "p-note", plan.selection_reason || ""));
+
+    const rows = [
+      ["Status", "Prepared"],
+      ["Workflow", prepared.name],
+      ["Risk", risk.level],
+      ["Nodes", prepared.inspection?.node_count],
+      ["Credentials needed",
+        (prepared.credentials || []).map((c) => c.credential_type).join(", ") || "none"],
+      ["Valid", prepared.validation?.ok ? "yes" : "no"],
+      ["Workflow hash", prepared.sha256],
+      ["Target instance", plan.target_instance],
+    ];
+    for (const [label, value] of rows) {
+      const row = element("div", "level-row");
+      const cell = label === "Risk"
+        ? element("span", `badge ${RISK_CLASS[value] || "badge-subtle"}`, value || "?")
+        : element("span", "level-value", value ?? "—");
+      row.append(element("span", "level-label", label), cell);
+      root.appendChild(row);
+    }
+
+    for (const line of plan.adaptations || []) root.appendChild(element("p", "p-note", line));
+    for (const line of prepared.diff?.summary || []) root.appendChild(element("p", "p-note", `• ${line}`));
+    for (const line of plan.blockers || []) root.appendChild(element("p", "p-note", `Blocked: ${line}`));
+    for (const note of prepared.notes || []) root.appendChild(element("p", "p-note", note));
+
+    // Why "Activate" is not offered yet, said before it is missed.
+    if (plan.activation?.reason) {
+      root.appendChild(element("p", "p-note", plan.activation.reason));
+    }
+
+    if (plan.candidates?.length > 1) {
+      root.appendChild(element("p", "p-note", "Also considered: " + plan.candidates.slice(1, 4)
+        .map((c) => `${c.title} (${c.score})`).join(", ")));
+    }
+
+    // Two deliberate clicks, because the backend wants two calls: the first
+    // raises a real approval record and answers with what is about to happen,
+    // the second claims that exact approval. The button never sends both at
+    // once -- the point of the gate is that somebody read the risk and the
+    // target instance in between.
+    let approval = null;
+    const importButton = element("button", "primary-button",
+      plan.importable ? "Import to n8n (inactive)" : "Cannot import yet");
+    importButton.type = "button";
+    importButton.disabled = !plan.importable;
+    importButton.addEventListener("click", async () => {
+      importButton.disabled = true;
+      try {
+        const result = await json("/api/workflows/import", {
+          method: "POST",
+          body: JSON.stringify(approval
+            ? { workflow_sha256: prepared.sha256, approval_id: approval.approval_id }
+            : { workflow_sha256: prepared.sha256 }),
+        });
+        if (result.approval_required) {
+          approval = result;
+          root.appendChild(element("p", "p-note",
+            `Approval required (${result.risk_level}): ${result.reason} ` +
+            `This will create ${result.name} in ${result.target_instance}, inactive.`));
+          importButton.textContent = "Confirm import (inactive)";
+          importButton.disabled = false;
+          return;
+        }
+        root.appendChild(element("p", "p-note",
+          `Imported as ${result.workflow_id} — Inactive. Activation is a separate decision.`));
+        await refreshRuns();
+      } catch (error) {
+        root.appendChild(element("p", "p-note", error.message));
+        importButton.disabled = false;
+      }
+    });
+    root.appendChild(importButton);
+  }
+
   // -- runs -----------------------------------------------------------------
   async function refreshRuns() {
     const root = $("wf-runs");
@@ -259,12 +376,15 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
+    $("wf-goal-btn")?.addEventListener("click", planGoal);
+    $("wf-goal")?.addEventListener("keydown", (event) => { if (event.key === "Enter") planGoal(); });
     $("wf-search-btn")?.addEventListener("click", search);
     $("wf-query")?.addEventListener("keydown", (event) => { if (event.key === "Enter") search(); });
     $("wf-refresh-btn")?.addEventListener("click", () => { refreshStatus(); refreshRuns(); });
     refreshStatus();
   });
 
-  window.SAMWorkflows = { search, inspectWorkflow, prepareWorkflow, refreshStatus, refreshRuns,
-    prepared: () => prepared, renderResults, renderInspection, renderPrepared };
+  window.SAMWorkflows = { search, inspectWorkflow, prepareWorkflow, planGoal, refreshStatus,
+    refreshRuns, prepared: () => prepared, renderResults, renderInspection, renderPrepared,
+    renderPlan };
 })();

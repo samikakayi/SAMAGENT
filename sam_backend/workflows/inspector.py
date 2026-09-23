@@ -354,3 +354,52 @@ def inspect(workflow: dict[str, Any], *, subworkflows_resolved: bool = True) -> 
         code_previews=tuple(previews[:10]),
         notes=tuple(notes),
     )
+
+
+# What activation would actually do, per trigger family. The manual trigger is
+# the interesting one: n8n refuses to activate a workflow that has only that,
+# and the public API has no endpoint to run one on demand, so a workflow can be
+# perfectly valid, imported, and still have no supported way to start. Saying
+# so before the attempt is the difference between an explanation and an opaque
+# HTTP 400 from n8n's own validator.
+_MANUAL_TRIGGERS = frozenset({"manualtrigger", "executeworkflowtrigger"})
+_WEBHOOK_TRIGGERS = frozenset({"webhook", "chattrigger", "formtrigger"})
+_SCHEDULE_TRIGGERS = frozenset({"scheduletrigger", "cron", "interval"})
+
+
+def activation(inspection: WorkflowInspection) -> dict[str, Any]:
+    """Whether this workflow can be activated, and what happens if it is."""
+    shorts = {_short_type(trigger) for trigger in inspection.triggers}
+    if not shorts:
+        return {
+            "can_activate": False, "kind": "none",
+            "reason": "This workflow has no trigger node, so n8n has nothing to activate.",
+            "manual_run_supported": False,
+        }
+    if shorts <= _MANUAL_TRIGGERS:
+        return {
+            "can_activate": False, "kind": "manual",
+            "reason": ("This workflow only starts manually. n8n refuses to activate a manual-only "
+                       "workflow, and its public API has no endpoint for running one on demand, so "
+                       "SAM cannot start it either -- open it in the n8n editor and press Execute."),
+            "manual_run_supported": False,
+        }
+    if shorts & _WEBHOOK_TRIGGERS:
+        return {
+            "can_activate": True, "kind": "webhook",
+            "reason": ("Activating publishes a webhook URL on the n8n instance. Anything that can "
+                       "reach that URL can start this workflow."),
+            "manual_run_supported": False,
+        }
+    if shorts & _SCHEDULE_TRIGGERS:
+        return {
+            "can_activate": True, "kind": "schedule",
+            "reason": "Activating starts a schedule; the workflow then runs unattended until deactivated.",
+            "manual_run_supported": False,
+        }
+    return {
+        "can_activate": True, "kind": "polling",
+        "reason": ("Activating starts a trigger that polls or listens against a third-party service, "
+                   "using whichever credential is attached to it."),
+        "manual_run_supported": False,
+    }

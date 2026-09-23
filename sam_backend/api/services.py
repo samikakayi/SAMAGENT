@@ -32,6 +32,7 @@ from ..tasks import TaskStore
 from ..tools import ToolRegistry
 from ..trading.replay import BarReplayResearch
 from ..trading.service import TradingService
+from ..integrations import IntegrationHealth
 from ..verification import VerificationEngine
 from ..voice import VoiceService
 from ..workflows import WorkflowIntelligence
@@ -52,6 +53,7 @@ class AppServices:
     tools: ToolRegistry
     secrets: SecretStore
     provider_health: ProviderHealth
+    integrations: IntegrationHealth
     router: ModelRouter
     agent: AgentService
     task_store: TaskStore
