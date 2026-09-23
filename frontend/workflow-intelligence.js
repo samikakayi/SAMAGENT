@@ -311,11 +311,42 @@
         .map((c) => `${c.title} (${c.score})`).join(", ")));
     }
 
+    // Two deliberate clicks, because the backend wants two calls: the first
+    // raises a real approval record and answers with what is about to happen,
+    // the second claims that exact approval. The button never sends both at
+    // once -- the point of the gate is that somebody read the risk and the
+    // target instance in between.
+    let approval = null;
     const importButton = element("button", "primary-button",
-      plan.importable ? "Approve & Import (inactive)" : "Cannot import yet");
+      plan.importable ? "Import to n8n (inactive)" : "Cannot import yet");
     importButton.type = "button";
     importButton.disabled = !plan.importable;
-    importButton.addEventListener("click", () => importWorkflow(prepared.sha256));
+    importButton.addEventListener("click", async () => {
+      importButton.disabled = true;
+      try {
+        const result = await json("/api/workflows/import", {
+          method: "POST",
+          body: JSON.stringify(approval
+            ? { workflow_sha256: prepared.sha256, approval_id: approval.approval_id }
+            : { workflow_sha256: prepared.sha256 }),
+        });
+        if (result.approval_required) {
+          approval = result;
+          root.appendChild(element("p", "p-note",
+            `Approval required (${result.risk_level}): ${result.reason} ` +
+            `This will create ${result.name} in ${result.target_instance}, inactive.`));
+          importButton.textContent = "Confirm import (inactive)";
+          importButton.disabled = false;
+          return;
+        }
+        root.appendChild(element("p", "p-note",
+          `Imported as ${result.workflow_id} — Inactive. Activation is a separate decision.`));
+        await refreshRuns();
+      } catch (error) {
+        root.appendChild(element("p", "p-note", error.message));
+        importButton.disabled = false;
+      }
+    });
     root.appendChild(importButton);
   }
 

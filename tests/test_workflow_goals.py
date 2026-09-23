@@ -601,3 +601,18 @@ def test_an_ambiguous_goal_is_answered_not_rejected(client, app):
 
 def test_the_goal_route_refuses_an_empty_goal(client):
     assert client.post("/api/workflows/goal", json={"goal": ""}).status_code == 422
+
+
+def test_only_recognised_services_are_reported_as_services():
+    """Calling every leading keyword a 'service' would be a small, useful lie."""
+    reading = read_goal(GOAL, known_services=frozenset({"gmail"}))
+
+    assert reading.services == ("gmail",)
+    assert "invoices" in reading.keywords and "invoices" not in reading.services
+
+
+def test_no_service_vocabulary_means_no_services_claimed():
+    reading = read_goal(GOAL, known_services=frozenset())
+
+    assert reading.services == ()
+    assert reading.keywords, "the keywords are still what the search uses"

@@ -176,11 +176,11 @@ def read_goal(goal: str, known_services: frozenset[str] | None = None) -> GoalRe
             trigger = name
             break
 
+    # Only words that match a vocabulary SAM actually has are called services.
+    # Returning the leading keywords here instead would put "invoices" and
+    # "them" under a heading that says SAM recognised an integration, which is
+    # a small lie that a reviewer would reasonably rely on.
     services = tuple(word for word in keywords if known_services and word in known_services)
-    if not services:
-        # Without a vocabulary to check against, the keywords are the best
-        # available guess and are labelled as such rather than as findings.
-        services = keywords[:3]
 
     fields = tuple((match.group(1), match.group(2)) for match in _FIELD_ASSIGNMENT.finditer(text))[:10]
 
