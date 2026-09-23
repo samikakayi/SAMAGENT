@@ -85,6 +85,36 @@ _CREDENTIAL_NOISE = re.compile(
 )
 
 
+def _provider_message(response: Any, fallback: str) -> str:
+    """Pull the provider's own explanation out of an error body of any shape.
+
+    There is no agreed shape for these. Google answers some errors with a JSON
+    *array* -- `[{"error": {...}}]` -- where the code assumed a mapping, and
+    `.get` on a list raises AttributeError, which the transport's `except
+    ValueError` did not catch. It escaped the adapter entirely, so a caller
+    that only handles ModelError saw an unclassified crash instead of a
+    fallback. Every provider shares this adapter, so every provider shared it.
+
+    Reading a message is a convenience; failing to read one must never be worse
+    than the error being reported.
+    """
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 - a body that will not parse tells us nothing
+        return fallback
+    for candidate in (body if isinstance(body, list) else [body]):
+        if not isinstance(candidate, dict):
+            continue
+        error = candidate.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(error, str) and error:
+            return error
+        if candidate.get("message"):
+            return str(candidate["message"])
+    return fallback
+
+
 def sanitize_provider_message(message: str, limit: int = 300) -> str:
     """Strip anything credential-shaped out of a provider's own error text.
 
@@ -349,11 +379,7 @@ class ChatCompletionsAdapter:
         except (httpx.HTTPError, ValueError) as exc:
             message = str(exc)
             if isinstance(exc, httpx.HTTPStatusError):
-                try:
-                    error = exc.response.json().get("error") or {}
-                    message = str(error.get("message") or message)
-                except ValueError:
-                    pass
+                message = _provider_message(exc.response, message)
             category = classify_exception(exc)
             if category is ErrorCategory.RATE_LIMIT and re.search(r"per[-_ ]day|daily", message, re.IGNORECASE):
                 # "free-models-per-day" will not clear in seconds: it is quota
