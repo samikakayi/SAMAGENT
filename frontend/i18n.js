@@ -90,6 +90,12 @@
     "voice.noSpeech": "هیچ قسەیەک نەبیسترا",
     "voice.recognizeFailed": "ناسینەوە سەری نەگرت",
     "voice.speakFailed": "وەڵامەکە نەخوێندرایەوە",
+    "handsFree.stopped": "گوێ لە {phrase} ناگیرێت: گوێگرەکە وەستاوە",
+    "handsFree.modelFailed": "لەوانەیە {phrase} نەبیسترێت: مۆدێلی ناسینەوەی قسە هەڵەیەکی ڕاگەیاند",
+    "handsFree.listenerError": "گوێگر",
+    "handsFree.modelError": "مۆدێلی قسە",
+    "handsFree.stoppedHint": "Start دابگرە تا دیسان گوێ بگرێت. ئەگەر دیسان وەستا، سام دووبارە دەستپێبکەرەوە.",
+    "handsFree.modelHint": "ئەگەر ئەمە لانەچوو، سام دووبارە دەستپێبکەرەوە.",
   };
 
   const EN = {
@@ -167,6 +173,12 @@
     "voice.noSpeech": "No speech was heard",
     "voice.recognizeFailed": "Speech was not recognised",
     "voice.speakFailed": "The reply could not be spoken",
+    "handsFree.stopped": "Not listening for {phrase}: the listener stopped",
+    "handsFree.modelFailed": "{phrase} may not be heard: the speech model reported an error",
+    "handsFree.listenerError": "Listener",
+    "handsFree.modelError": "Speech model",
+    "handsFree.stoppedHint": "Press Start to listen again. If it stops again, restart SAM.",
+    "handsFree.modelHint": "If this does not clear, restart SAM.",
   };
 
   const I18N = {

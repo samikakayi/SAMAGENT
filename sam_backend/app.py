@@ -51,7 +51,43 @@ from .workflows import WorkflowIntelligence
 from .windows_control import WindowsController
 
 
+def import_numpy_before_any_thread() -> None:
+    """Import numpy once, here, before anything can import it concurrently.
+
+    The SAM started at 03:16:58 came up with a dead wake listener ("cannot
+    import name '__cpu_features__' from partially initialized module
+    'numpy._core._multiarray_umath'") and a /api/trading/status that answered
+    500 (MetaTrader5 missing `shutdown`), until a restart. numpy's first import
+    had been taken by several threads at once, by two routes: faster_whisper on
+    the wake warm thread through `import numpy`, and MetaTrader5 on a request
+    thread through its C `import_array()`, which imports
+    `numpy._core._multiarray_umath` directly. Module locks are taken child
+    first, so the two routes lock numpy's modules in opposite orders; the
+    import system breaks that deadlock by handing one thread a half-built
+    module, and numpy's core refuses to initialise twice ("cannot load module
+    more than once per process"), so numpy stays broken for the whole process.
+
+    Measured in fresh processes: those two imports started 0-0.4 s apart failed
+    1 run in 40 with exactly those errors, and four threads entering numpy by
+    different submodules at once failed 30 in 30; with numpy imported first,
+    0 in 190. Once numpy is whole in sys.modules, every later route finds it
+    there and takes no lock, so numpy is the one import this needs: six
+    MetaTrader5 imports racing only each other failed 0 in 30. It costs about
+    0.16 s of startup. Nothing heavier is imported for it, since most installs
+    never use the local voice or a broker.
+    """
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        # A requirement, but its absence is for the features that use it to
+        # report, not a reason for the server not to start.
+        pass
+
+
 def create_app(settings: Settings | None = None, adapters: AdapterRegistry | None = None) -> FastAPI:
+    # First, on the thread that builds the app: the lifespan, the wake
+    # listener and every request thread come after.
+    import_numpy_before_any_thread()
     ensure_dpi_awareness()
     settings = settings or Settings.from_env()
     settings.prepare()
