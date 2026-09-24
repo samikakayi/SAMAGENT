@@ -33,6 +33,7 @@ from typing import Any, AsyncIterator
 from ..events import Error, Transcript
 from ..textnorm import fix_letters, is_arabic_script, normalize_ckb
 from . import fastpath, ladders, taint
+from .library_context import add_to_messages, library_block, sources_line
 from .llm import LLMError, LLMResponse, ToolCall
 from .llm_local import LOCAL_PROVIDER
 from .outcome import own_sentence, tool_sentence
@@ -83,7 +84,7 @@ class AnswerText(str):
       description="Attach more of SAM's tools to your next step when none of the tools you have fits: files, "
                   "run_powershell, run_python, screen_look, click, type_text, press_keys, screen_act, open_url, "
                   "fetch_page, build_project, chart_state, strategy_save, strategy_list, strategy_get, theory_info, "
-                  "knowledge_add, knowledge_list, forget. Name the ones you need.",
+                  "knowledge_add, knowledge_list, knowledge_remove, forget. Name the ones you need.",
       params={"type": "object", "properties": {
           "tools": {"type": "array", "items": {"type": "string"}, "description": "tool names you need"},
           "need": {"type": "string", "description": "what you want to do, if unsure which tool"}}},
@@ -261,7 +262,14 @@ class Responder:
         last: tuple[str, dict[str, Any], dict[str, Any]] | None = None
         extra: set[str] = set()
         completed = False
-        block = ""                              # grounding text for the local-brain number check
+        # Trading/strategy questions: the user's own books in the prompt (library_context.py).
+        passages: list[dict[str, Any]] = []
+        block = ""
+        if intent is None:
+            block, passages = await library_block(self.app, text, mode)
+            if block:
+                add_to_messages(messages, block)
+                scope.mark("knowledge_search")        # the passages are the user's files: data
 
         def emit(piece: str, **mark: Any) -> str:
             if not parts:
@@ -350,6 +358,7 @@ class Responder:
                         yield emit(piece)
                     # After a tool ran, its honest outcome beats "no model".
                     message = SORANI_CUT_OFF if said else (SORANI_NO_MODEL if last is None else outcome())
+                    passages = []                      # no model answer: nothing was answered from the books
                     self.app.bus.publish(Error(where="conversation", message_ckb=SORANI_NO_MODEL,
                                                detail=self.app.redact(str(err))[:300]))
                     yield emit(message)
@@ -395,6 +404,9 @@ class Responder:
         finally:
             self.active_turns = max(0, int(getattr(self, "active_turns", 1) or 1) - 1)
             reply_text = " ".join(parts).strip()
+            if reply_text and passages and said:
+                # the pages for the panel, under the answer; never spoken (not a chunk)
+                reply_text += "\n\n" + sources_line(passages)
             if reply_text:
                 self.app.bus.publish(Transcript(role="assistant", text=reply_text, source=source,
                                                 conversation_id=conversation_id))

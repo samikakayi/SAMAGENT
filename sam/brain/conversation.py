@@ -33,6 +33,7 @@ from ..textnorm import normalize_ckb
 from .budget import DEFAULTS as BUDGET_DEFAULTS
 from .budget import BackgroundBudget, quota_reason
 from .confirm import ASK_AGAIN_CKB
+from .library_context import DEFAULTS as LIBRARY_DEFAULTS
 from .llm import LLMError
 from .responder import (ACKS_DO, ACKS_LOOK, CORE_TOOLS, SORANI_CUT_OFF, SORANI_DONE, SORANI_NO_MODEL,
                         SORANI_NOT_DONE, SORANI_NOT_UNDERSTOOD, Responder, clean_tool_args, more_tools)
@@ -525,6 +526,7 @@ CREATE TABLE IF NOT EXISTS brain_conversation_state (
 def register(app: Any) -> None:
     app.config.register_defaults(DEFAULTS)
     app.config.register_defaults(BUDGET_DEFAULTS)
+    app.config.register_defaults(LIBRARY_DEFAULTS)
     app.db.ensure_schema("brain", BRAIN_MIGRATIONS)
     app.conversation = Conversation(app)
     app.conversation.attach()

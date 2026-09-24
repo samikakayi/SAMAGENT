@@ -1133,7 +1133,7 @@ and the tool schemas stay in Ollama's prompt cache. **Server** `sam/brain/local_
 started on demand only when nothing listens on `llm.local.host` (SAM v1's `ollama serve` on 11434 is shared,
 never stopped), `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` (never DETACHED_PROCESS), env OLLAMA_HOST /
 OLLAMA_MODELS, never OLLAMA_IGPU_ENABLE, log `%LOCALAPPDATA%\SAM2\logs\ollama.log`; stopped (process tree) on
-quit if SAM started it. Settings (`sam/config.py` `LOCAL_BRAIN_DEFAULTS`): `llm.local.enabled` True,
+quit if SAM started it, and inside a kill-on-close Job Object so a crash never leaves it running (section 11). Settings (`sam/config.py` `LOCAL_BRAIN_DEFAULTS`): `llm.local.enabled` True,
 `.model` "qwen3:8b", `.fallback_models` ["qwen3.5:4b"], `.host` "127.0.0.1:11434", `.ollama_exe` "" (=
 SAM_HOME/tools/ollama*/ollama.exe, then %LOCALAPPDATA%\Programs\Ollama, PATH), `.models_dir` "" (=
 <data>/ollama-models when it exists), `.keep_alive` "5m", `.num_ctx` 8192, `.max_tokens` 1024, `.timeout_s` 150,
@@ -1178,8 +1178,9 @@ draw_levels (analyze_market draw levels on the chart's symbol), clear_drawings, 
 questions, negations, past tense, conditions, «و»/"and" joining actions, orders and unknown words go to the
 model. Tolerates KurdishTTS STT spellings («نەخنەشکی زێڕ چەندە»), Arabic letters, word-final ه, clitics
 («ترەیدینگ ڤیوم بۆ بکەرەوە»). Corpus `tests/fastpath_corpus.py`: 290 labelled rows (146 commands, 144
-non-commands): precision 1.00, recall 0.99; the 67 held-out rows written before tuning scored precision 1.00,
-recall 0.87 on the first run (0.95 after three fixes). Usage counted as provider `fastpath`, model = intent.
+non-commands): on OUR corpus precision 1.00, recall 0.99; the 67 held-out rows written before tuning scored
+precision 1.00, recall 0.87 on the first run (0.95 after three fixes). These are corpus numbers, not a
+population estimate: an independent reviewer's adversarial set fired on 21 of 64 negatives (section 11). Usage counted as provider `fastpath`, model = intent.
 Test helper `brain_app(..., fastpath=False)`: model-loop tests keep the fast path off.
 `outcome.tool_sentence` fix: `data.cancelled` means "stopped" only when it is `True` (cancel_alert's count made
 «هەموو ئاگادارکردنەوەکان هەڵبوەشێنەوە» answer «ڕاگیرا.»).
@@ -1190,3 +1191,82 @@ Test helper `brain_app(..., fastpath=False)`: model-loop tests keep the fast pat
 **Voice defaults.** `voice.tts_provider` = "kurdishtts" (Gemini TTS is the fallback; `TtsRouter.order`).
 "Automatic" never picks Live: `voice.auto_live` False (True restores "Live after a passing self-test");
 `VoiceEngine.live_wanted()`; the automatic self-test (3 Gemini TTS requests) runs only when Live can be used.
+
+---------------------------------------------------------------------------------------------------
+
+## 11. Final stage: review fixes and integration (2026-09-25)
+
+Compatible additions after the review of sections 9-10; everything above still holds.
+
+**Fast path (`sam/brain/intents.py`).** One alert never means every alert: `ALL` is only
+all/every/«هەموو»/«هەمووی» (not "the"/"my"), and "stop" is no longer a cancel verb («stop the alarm» goes to
+the model). A bare number is a timeframe only in `tv_set_chart` next to a timeframe word (`TF_WORDS`:
+timeframe/«تایمفرەیم»/«کاتی»): "draw support at 60" / «هێڵی پشتگیری لە ٦٠ بکێشە» / "gold 240" go to the
+model; "draw levels on H4" / "4 hours" / «١٥ خولەک» still match. A mangled price word is a spelling heard
+from STT (`MANGLED_PRICE`: «نەخنەشکی») or one letter from «نرخی»; "how much gold" / «چەند زێڕ» need a price
+word; «زێڕ بە چەند مامەڵە دەکرێت» / «پێم بڵێ ...» are price questions (the phrasing the local brain answered
+from memory in the live run). English "analysis"/"analyze" without an instrument needs a verb and an object
+(market/chart); only clear/clean/wipe/«پاک بکەرەوە» clear "the chart". Corpus: the reviewer's 77 rows are
+`REVIEW_HELD_OUT` (first run 21/64 negatives fired, precision 0.38 on that adversarial set; now 0/64, recall
+13/13) plus 30 `REVIEW_PROBES`; the whole corpus (397 rows) scores precision 1.00, recall 0.99 -- on our corpus.
+
+**cancel_alert** asks first (`ctx.confirm`, «هەر N ئاگادارکردنەوە چالاکەکەت هەڵبوەشێنمەوە؟», the list on the
+card) when `alert_id` is all and more than one alert is active; a no cancels nothing (`declined`). Timeout 30 s.
+
+**Local brain in a turn (`responder.py`, `llm.py`).** `LLMClient.chat(..., on_local=cb)`: `cb(cold: bool)` runs
+right before the local brain answers (`LocalRung.local_cold()` = the model is not in memory,
+`announce_local`). A voice round that falls to a COLD local brain mid-turn (every cloud rung failed, or the
+round's deadline cut a slow healthy one) speaks `LOCAL_ACK_CKB` at once (`Responder._ask_announcing`), once per
+turn. After a tool whose own Sorani result is complete (`outcome.own_sentence`), the wording round runs with
+`local=False`: if no cloud model can word it, that sentence is said at once instead of a 150 s local round.
+Read-type results (lists, pages, search) may still go to the local brain, announced when cold. A local answer
+with no tool call to an action command that claims it is done or echoes the command (qwen3:8b: «نۆتپاد
+ئامادەیە»), that states a price-like number (3+ digits) neither the user, a tool nor the system prompt (time,
+facts, this turn's library passages) gave it (qwen3:8b: «زێڕ ئێستا لە ٤٢٦٩ دەبێت»), or that briefly states
+something only a tool can know (alerts, windows, the chart, drawings, files; «ئاگادارکردنەوەکان بۆ زێڕ
+نەداناوە» with no list_alerts call) is replaced by `LOCAL_NOT_DONE_CKB` («ببورە، ئەمەم نەکرد؛ ...»). Every local
+request (`LocalRung._local_request`) keeps only `llm.local.history_messages` (default 0) messages before the
+current user message (`llm_local.trim_history`; a worker's goal + tool rounds are never cut; measured: with the
+last exchange kept, qwen3:8b copied it -- after «نرخی زێڕ و زیو» it answered an alert question and a window
+count with the gold price, in 3 live runs) and gets `LOCAL_RULES` at the end of the system message (the per-turn part:
+Ollama's cached prefix is unchanged): tools are the only source of prices/chart/windows/alerts, never a value
+from earlier messages. Live run 2026-09-25 before this: after ten fast-path answers in the same conversation
+(tool turns are not replayed, so the history showed plain question -> answer pairs) qwen3:8b answered two
+commands from memory with no tool call. The persona's stable rules name the local brain too. After local tool
+calls every call's own sentence is said (`_local_outcome` over the round's calls; «نرخی زێڕ و زیو» made two
+get_price calls and only the last was said). No warm-up while a turn runs (`Conversation.active_turns`) or a
+local answer is being generated (`LocalRung._local_inflight`): Ollama has one slot, and in the live run a 98 s
+voice-prompt warm-up pushed a typed library answer past the 150 s local timeout.
+
+**Ollama server (`local_server.py`).** The server SAM starts is created suspended and put into a Job Object with
+KILL_ON_JOB_CLOSE (SAM's process holds the only handle). Live check `acceptance/ollama_orphan.py` (spare port
+11437, empty model folder, SAM stand-in killed with TerminateProcess): the server was gone and the port closed
+1.2 s later; v1's server on 11434 untouched. Port 11434 stays shared with v1 on purpose (a second resident
+~5 GB model on a PC that had ~2 GB free; v1 is retired by install.ps1).
+
+**Library (`sam/knowledge/library.py`).** Page text is redacted (`app.redact`: known key values + key shapes)
+before chunking, and search results are redacted again (older passages): a key pasted into the user's notes
+never reaches `kb_chunks`, the panel's search box, `passages_for` or a model.
+
+**Brain + library (`sam/brain/library_context.py`).** For a question about a trading idea, strategy, theory
+or the user's books (`is_library_question`: a question/explain request AND a non-generic glossary term or a
+strategy/theory/book word; prices, commands and small talk excluded), the turn adds
+`passages_for(k=conversation.library.k 3, max_chars=conversation.library.max_chars 1500,
+min_score=conversation.library.min_score 0.5)` as a DATA block to the per-turn part of the system prompt (the
+turn's taint scope is marked). Voice is told to name only the book title; text to cite «title», page N. The
+panel's Transcript gets `sources_line(passages)` («پەیوەندیدار لە کتێبخانەکەت: «Title»، لاپەڕە ١٢؛ ...») under
+the answer; it is never a yielded chunk, so it is never spoken. Setting `conversation.library.enabled` (True).
+`more_tools` names `knowledge_remove` too; the persona names knowledge_add/list/remove and run_python.
+
+**run_python (`sam/hands/python_sandbox.py`).** Code the scan judged safe (it runs without asking) runs at LOW
+integrity (`CreateProcessAsUser` with SAM's token lowered to S-1-16-4096; the run folder is labelled Low; TEMP,
+TMP and MPLCONFIGDIR point into it), in a job with `ActiveProcessLimit` 2 (launcher + interpreter; Windows'
+console host is not counted) and UI limits (clipboard, other windows, desktop, logoff, system settings).
+Measured: a write to the user's folders raises PermissionError, the run folder works, numpy runs; cap 2 ->
+`cmd` refused 8/8, cap 3 -> `cmd` starts. Approved code (the scan asked, the user said yes) runs with the
+user's token. Setting `python.sandbox` (True); the result says `sandbox`: low_integrity | none (the fallback
+when the sandbox cannot be set up is logged). Scan: holes found by an adversarial pass are closed
+(`numpy.ctypeslib`, `from numpy import ctypeslib`, `DataSource`, pandas readers on computed paths/URLs,
+`allow_pickle`, `read_pickle`, clipboard, sympy's eval-based `sympify`; sympy left the allowlist).
+
+**Dependencies.** `pypdf==6.19.0` is in requirements.txt.
