@@ -1,370 +1,198 @@
-# SAM — local desktop AI agent for Windows
+<div dir="rtl" lang="ckb">
 
-SAM is a local-first, realtime Windows AI agent with a polished browser-based
-desktop UI. It can chat in Sorani Kurdish or English, remember approved context,
-plan work, edit a selected workspace, run PowerShell and Python, automate an
-isolated browser, inspect Windows, control a verified TradingView Desktop
-window, and analyze read-only MetaTrader 5 data. All computer actions pass
-through a deterministic policy and audit layer.
+# SAM 2 — یاریدەدەری دەنگیی سۆرانی و شیکەرەوەی ترەیدینگ
 
-AUTO routing prefers an available local Ollama model and can fall back only to
-cloud providers that you explicitly configure. LiteLLM, OpenRouter, and direct
-OpenAI adapters are included; no credential is bundled or returned by the API.
+SAM 2 لە سەرەتاوە دووبارە دروست کراوەتەوە. بە کوردیی سۆرانی قسەت لەگەڵ دەکات، کۆمپیوتەرەکەت بۆ بەڕێوە دەبات،
+چارتەکانی **TradingView Desktop** شی دەکاتەوە و هێڵیان لەسەر دەکێشێت، و ستراتیژی و تیۆرییەکانی ترەیدینگت لە بیر دەمێنێت.
 
-## What is included
+## SAM 2 چی دەکات؟
 
-- Conversation history and durable memory in local SQLite.
-- Workspace-aware listing, searching, reading, atomic writes, exact text edits,
-  and deletion.
-- PowerShell/terminal and Python execution with timeouts, bounded output, a
-  reduced environment, and approval gates.
-- Browser navigation plus optional isolated browser automation.
-- Windows application launching.
-- Structured planning and a bounded multi-step tool loop.
-- **Autonomous runs**: give SAM a goal and it inspects the project, plans,
-  edits files, runs the project's own tests, diagnoses failures, re-plans, and
-  retries until the work is verified or it can honestly say it is stuck. Live
-  progress appears in the **Autopilot** panel.
-- Project intelligence: a cached map of structure, dependencies, commands, API
-  routes, test suites and git state.
-- Verification engine that runs a project's declared test/build/lint checks and
-  parses the result, so "done" is proven rather than asserted.
-- Capability discovery for installed developer tools and reachable model
-  providers.
-- Approval cards that show the exact operation, risk, reason, and arguments.
-- Redacted, hash-linked audit records.
-- Responsive UI, keyboard navigation, light/dark themes, and optional browser
-  speech recognition and text-to-speech.
-- Cost-aware AUTO/LOCAL_ONLY/CLOUD_ONLY/MANUAL routing through Ollama,
-  LiteLLM, OpenRouter, and direct OpenAI adapters.
-- Realtime microphone input with interim transcripts, browser VAD, barge-in,
-  sentence-chunk speech output, and four listening modes.
-- Read-only MT5 OHLCV/ticks, deterministic multi-timeframe analysis, theory
-  comparison, setup state, journal, and monitor.
-- TradingView process/window/symbol/price observation plus guarded controls.
-- Setup, launch, diagnostics, and automated tests.
+- **قسەکردن:** بە سۆرانی قسەی لەگەڵ دەکەیت و بە دەنگ وەڵامت دەداتەوە. دەتوانیت بنووسیشیت.
+- **کۆمپیوتەر:** بەرنامە دەکاتەوە (کرۆم، ئێج، ترەیدینگ ڤیو، تێلێگرام، MetaTrader 5، VS Code، نۆتپاد…)،
+  پەنجەرەکان ڕێک دەخات، دەنووسێت، کرتە دەکات، فایل و وێب بەکاردەهێنێت، و دەتوانێت پرۆژەیەکی بچووک (وەک ماڵپەڕێک) دروست بکات.
+- **ترەیدینگ:** چارتی TradingView شی دەکاتەوە، هێڵی پشتگیری و بەرگری، زۆن، چوونەژوورەوە و ستۆپ و ئامانج دەکێشێت و
+  دەیانسڕێتەوە؛ نرخ، قەبارە (ڤۆلیوم) و مۆمەکان لە MetaTrader 5 چاودێری دەکات و ئاگادارت دەکاتەوە.
+- **بیرەوەری:** ستراتیژی و تیۆرییەکانت، و ئەو شتانەی پێی دەڵێیت «لە بیرت بێت»، تەنها لەسەر ئەم کۆمپیوتەرە هەڵدەگرێت.
+- **هەرگیز ئۆردەر ناکات:** نە کڕین، نە فرۆشتن، نە داخستنی پۆزیشن.
 
-## Safety by default
+## چۆن دەستی پێ بکەم؟
 
-SAM intentionally does **not** have unrestricted administrator access.
+- دوو کرتە لەسەر ئایکۆنی **SAM** لە دێسکتۆپ یان لە Start بکە. پیلێکی بچووک لە ناوەڕاستی سەرەوەی شاشە دەردەکەوێت و پانێڵەکەش دەکرێتەوە.
+- SAM لەگەڵ چوونەژوورەوەی ویندۆز خۆی دەست پێ دەکات (تەنها پیلەکە دەردەکەوێت، بەبێ پانێڵ).
+- ئەگەر SAM پێشتر کراوەتەوە، کرتەکردنەوە لەسەر ئایکۆنەکە تەنها پانێڵەکەی پیشان دەداتەوە؛ SAMی دووەم دروست نابێت.
+- بۆ داخستن: کرتەی ڕاست لەسەر پیلەکە یان ئایکۆنی SAM لە تاسکبار (tray) ← **داخستن**.
 
-- The API listens on `127.0.0.1` by default.
-- SAM should be run as a standard Windows user, never as Administrator.
-- Deletes, overwrites, arbitrary Python, unknown app launches, writes outside
-  the workspace, package installs, credential access, system changes, external
-  messages/uploads, and irreversible actions require a specific approval.
-- Elevation, opaque/encoded execution, destructive disk commands, credential
-  dumping, and disabling security controls are blocked in safe mode.
-- Approval is single-use and bound to one normalized tool request. Chat text is
-  never treated as approval.
-- Secret-looking values are redacted from logs and refused as durable memory.
+## چۆن قسەی لەگەڵ بکەم؟
 
-Read [Security model](docs/SECURITY.md) before enabling broad control. An
-approved arbitrary process still runs with your Windows account's permissions;
-use Windows Sandbox or a VM for untrusted code.
+1. کورتەڕێگای گوێگرتن دابگرە (بە بنەڕەت **Ctrl+Alt+Space**؛ ئەگەر بەرنامەیەکی تر گرتبووی، SAM خۆی **Win+Alt+Space** بەکاردەهێنێت — کورتەڕێگای ڕاستەقینە لە **ڕێکخستنەکان** دەبینیت)، یان **کرتە** لەسەر پیلەکە بکە. دەنووسێت «گوێ دەگرم».
+2. بە ئاسایی قسە بکە. SAM تا ماوەیەک گوێ دەگرێت، پاشان خۆی دەخەوێت؛ بۆ دەستپێکردنەوە دووبارە کرتە بکە.
+3. دەتوانیت بنووسیشیت: دوو کرتە لەسەر پیلەکە ← **گفتوگۆ**.
 
-## Quick start (Windows PowerShell)
+نموونە:
 
-### 1. Prerequisites
+- «ترەیدینگ ڤیو بکەرەوە»
+- «گۆڵد لەسەر ١٥ خولەک پیشان بدە»
+- «هێڵی پشتگیری و بەرگری بکێشە» — «هێڵەکانت بسڕەوە»
+- «زێڕ شی بکەرەوە بە ستراتیژییەکەم»
+- «ئەگەر زێڕ گەیشتە ٢٧٠٠ ئاگادارم بکەرەوە»
+- «بوەستە» (هەموو کارەکان ڕادەگرێت)
 
-- Windows 10 or 11.
-- Python 3.11 or newer.
-- Ollama for fully local chat. Install it from
-  [ollama.com/download/windows](https://ollama.com/download/windows), then leave
-  it running in the background.
+کارە مەترسیدارەکان (سڕینەوە، ناردنی پەیام، داخستنی پەنجەرە…): SAM پێشتر پرسیارت لێ دەکات. بڵێ **«بەڵێ»**
+یان کرتە لە **بەڵێ** بکە. ئەگەر لە ماوەی ٢٠ چرکەدا وەڵام نەدەیتەوە، کارەکە **ناکرێت**.
 
-### 2. Install SAM
+## کلیلی Gemini چۆن دابنێم؟ (بۆ دەنگی زیندوو و بینینی شاشە)
 
-Open PowerShell in this folder and run:
+1. بڕۆ بۆ <https://aistudio.google.com/apikey> و بە هەژماری Google ـەکەت بچۆ ژوورەوە.
+2. **Create API key** دابگرە و کلیلەکە کۆپی بکە (بە `AIza` یان `AQ.` دەست پێ دەکات).
+3. لە SAM: کرتەی ڕاست لەسەر پیلەکە ← **ڕێکخستنەکان** ← بەشی **کلیلەکانی API**.
+4. لە خانەی **Gemini (گووگڵ)** کلیلەکە بلکێنە ← **پاشەکەوت** ← پاشان **تاقیکردنەوە**. کە نووسی «کار دەکات»، تەواوە.
 
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\setup.ps1
-```
+- کلیلەکە بە پاراستنی ویندۆز (DPAPI) تەنها لەسەر ئەم کۆمپیوتەرە هەڵدەگیرێت و هەرگیز پیشان نادرێتەوە.
+- هەموو کلیلەکانی پێشووت (Groq، OpenRouter، KurdishTTS، OmniRoute) وەک خۆیان کار دەکەن؛ پێویست ناکات دووبارە دایانبنێیتەوە.
+- بەبێ کلیلی Gemini ـیش SAM کار دەکات (دەنگی زنجیرەیی بە KurdishTTS و Groq/OmniRoute).
 
-If Ollama is not installed, the setup script can install it through `winget`
-only when you explicitly request that extra action:
+## تێبینیی پاراستنی نهێنی
 
-```powershell
-.\setup.ps1 -InstallOllama -PullRecommendedModel
-```
+- SAM تەنها **پلانی بەخۆڕایی** بەکاردەهێنێت و هیچ پارەدانێک چالاک ناکات.
+- لە پلانی بەخۆڕایی Gemini، لەوانەیە Google ئەو شتانەی دەینێریت (دەنگ، نووسین، وێنەی شاشە) بۆ باشترکردنی
+  بەرهەمەکانی بەکاربهێنێت و لەوانەیە مرۆڤ بیانبینێت. زانیاریی هەستیار وەک وشەی نهێنی و ژمارەی هەژمار مەڵێ و مەنووسە.
+  SAM پێش ناردنی وێنەی شاشە، خانەی وشەی نهێنی و بەشی هەژماری MT5 دادەپۆشێت.
+- کلیلەکان تەنها بۆ خاوەنی خۆیان دەنێردرێن و لە هیچ لۆگێکدا نانووسرێن.
 
-The recommended default is `qwen3.5:4b` (about 3.4 GB). It was selected after
-local Sorani and tool-calling smoke tests. On a smaller machine, use
-`qwen3.5:2b`:
+## TradingView
 
-```powershell
-ollama pull qwen3.5:2b
-```
+- SAM لە ڕێگەی دەرگایەکی ناوخۆیی (`127.0.0.1:9222`) لەگەڵ TradingView Desktop ـی خۆت کار دەکات. ئەمە
+  **ئۆتۆماتیکردنێکی نافەرمی و ناوخۆیی**ـە بۆ بەرنامەکەی خۆت، نەک API ـی فەرمیی TradingView.
+- SAM تەنها ئەو هێڵانە دەسڕێتەوە کە خۆی کێشاونی؛ دەست لە هێڵەکانی تۆ نادات.
+- ئەگەر TradingView بەبێ ئەو دەرگایە کراوەتەوە، SAM پێش دووبارە کردنەوەی پرسیارت لێ دەکات.
+- ئەو دەرگایە تا داخستنی TradingView کراوە دەمێنێت، تەنانەت دوای داخستنی SAM. ماڵپەڕەکان ناتوانن
+  بەکاری بهێنن (Host و Origin ڕەت دەکرێنەوە)، بەڵام هەر بەرنامەیەکی تری سەر ئەم کۆمپیوتەرە دەتوانێت. ئەگەر
+  متمانەت بە هەموو بەرنامەکانی سەر کۆمپیوتەرەکەت نییە، دوای کارەکەت TradingView دابخە.
 
-Then set `SAM_MODEL=qwen3.5:2b` in `.env`.
+## سەلامەتیی ترەیدینگ
 
-If `winget` is unavailable, SAM also recognizes the official standalone
-Windows build at `tools\ollama-v<version>\ollama.exe`. The bundled start script
-starts and stops that portable service with SAM; it never requires
-Administrator rights. Portable identity files and model blobs stay under
-`data\ollama-user` and `data\ollama-models`.
+- SAM **هەرگیز** ئۆردەر ناکات، ناگۆڕێت و دایناخات — نە لە MetaTrader 5، نە لە TradingView. تەنها شیکردنەوە، کێشان و ئاگادارکردنەوە.
+- وەڵامەکانی تەنها «چاوەڕێ بکە»، «ترەید نییە» یان «ستاپ» ـن و هەرگیز «ئێستا بیکڕە» نین.
+- شیکردنەوەکان ئامۆژگاریی دارایی نین؛ بڕیار هەر بە دەستی خۆتە.
 
-### 3. Start SAM
+## داتاکانی SAMی کۆن (v1)
 
-```powershell
-.\start.ps1
-```
+لە یەکەم دەستپێکردندا SAM 2 داتاکانی v1 دەخوێنێتەوە بەبێ ئەوەی فایلی v1 بگۆڕێت: ئەو ستراتیژییانەی تاقیکردنەوە
+ئۆتۆماتیکییەکان دروستیان کردبوو وەک **ئەرشیف** دێن (چالاک نین)، و ستاپ و ژۆرناڵ و گفتوگۆکان لە ئەرشیفێکدا دەمێننەوە.
+هیچ پەیامێک کە شتێکی وەک کلیلی تێدابێت ناهێنرێت.
 
-Open <http://127.0.0.1:8765>. Press `Ctrl+C` in PowerShell to stop SAM.
+## ئەگەر کێشە هەبوو
 
-To start without opening a browser:
+- لۆگی دەستپێکردن: `%LOCALAPPDATA%\SAM\sam.log` — لۆگی وردەکاری: `%LOCALAPPDATA%\SAM2\logs\sam2.log`. هیچ کلیلێک لە لۆگەکاندا نییە.
+- لابردنی ئایکۆنەکان: `scripts\uninstall.ps1` (خودی SAM و داتاکانی دەست لێ نادرێن).
 
-```powershell
-.\start.ps1 -NoBrowser
-```
+</div>
 
-### 4. Use SAM as a desktop program (optional)
+---
 
-```powershell
-.\install-desktop.ps1
-```
+# SAM 2 — English
 
-This adds a **SAM** icon to the desktop and the Start menu. It opens SAM in a
-window of its own (no browser tabs), starts it quietly with no console window,
-and puts a tray icon next to the clock to open, restart or quit it. Closing
-the window does not stop SAM, so "Hey SAM" keeps listening. SAM also starts in
-the background when you sign in to Windows; pass `-NoAutostart` to skip that.
-The desktop program uses port 8877. `.\uninstall-desktop.ps1` removes the
-shortcuts.
+SAM 2 is a from-scratch rebuild of a Sorani-speaking desktop voice agent and trading analyst for one
+Windows 11 PC. It talks naturally (Gemini Live native audio, or a cascade STT → text LLM → TTS), controls the
+desktop, analyses and draws on **TradingView Desktop** charts, monitors MetaTrader 5 data, and remembers the
+user's trading strategies. Free tiers only; SAM never places, modifies or closes orders.
 
-## First conversation
+Design: [`docs/DESIGN.md`](docs/DESIGN.md). Module interfaces: [`docs/CONTRACTS.md`](docs/CONTRACTS.md).
 
-Try:
+## Architecture
 
-> Inspect this workspace, create a short plan, and tell me what you would do.
+One process (Python 3.13): the PySide6 UI on the main thread, one asyncio core loop on its own thread
+(`sam.bridge.CoreThread`; core modules never import Qt).
 
-Then try a bounded edit:
+| package | role |
+| --- | --- |
+| `sam/app.py`, `config.py`, `secrets.py`, `db.py`, `events.py`, `timing.py` | core services: settings, DPAPI key store (v1-compatible `data/secrets.json`), SQLite `data/sam2.sqlite3` (WAL, FTS5 trigram), event bus, per-stage timings |
+| `sam/brain/` | tool registry (one definition → Gemini + OpenAI schemas), confirmation broker (voice/click, 20 s → no), LLM ladders with 429 fallback, persona, conversation, memory, multi-step worker |
+| `sam/voice/` | Live voice (Gemini Live) and the cascade fallback, hotkey, self-test |
+| `sam/hands/` | apps (Start-menu index + Sorani aliases), windows, UI Automation, OCR, screen + vision, PowerShell/files policy, web |
+| `sam/trading/` | TradingView CDP bridge (draw/clear own drawings), MT5 feed (read-only), analysis engine, strategy cards, monitor/alerts |
+| `sam/ui/` | island pill (top centre), panel (chat, strategies, monitoring, activity, settings), tray |
+| `sam/migrate_v1.py` | one-time, read-only import of SAM v1's database |
+| `sam/omniroute.py` | starts the local OmniRoute gateway when installed and down (never stops it) |
+| `SAM.pyw` | pythonw launcher: single instance, early OmniRoute start, logging without a console |
 
-> Create `hello.txt` in the workspace with a short greeting.
+`SAM_HOME` is the folder holding `.env` and `data/` (keys, key store, database). Logs live outside it:
+`%LOCALAPPDATA%\SAM2\logs\sam2.log` (app) and `%LOCALAPPDATA%\SAM\sam.log` (launcher).
 
-SAM may create a new workspace file directly. Overwriting or deleting an
-existing file creates an approval card. Review the exact path and arguments,
-then approve or deny it from the Approvals panel.
-
-## How to talk to SAM now
-
-1. Start SAM with `.\start.ps1` and open <http://127.0.0.1:8765>.
-2. Click the microphone beside the message box.
-3. Allow microphone access when Edge or Chrome asks.
-4. Speak in Sorani Kurdish or English. In the default **Push to talk** mode,
-   click the microphone again (or pause) and the recognized sentence is sent.
-5. Turn on **Read replies aloud** in **Settings → Voice** for spoken answers.
-
-The microphone can transcribe immediately, but normal open-ended AI replies
-also require one available chat model. If the sidebar says **No chat model
-available**, run `.\setup.ps1 -InstallOllama -PullRecommendedModel`, restart
-SAM, and refresh the page. Deterministic market-data status and analysis remain
-available without a chat model.
-
-Voice modes are **Push to talk**, **Conversation**, **Always listening**, and
-**Wake word**. The defaults are recognition locale `ckb-IQ` and wake word
-`SAM`. Speaking while SAM reads a reply triggers barge-in: speech output and
-the cancellable active task stop before the next utterance is accepted.
-
-Browser recognition may use the browser vendor's service. Optional
-faster-whisper, Silero VAD, and Piper packages can be installed with
-`.\setup.ps1 -InstallLocalVoice`, but stay reported as **unconfigured** until
-their models and voice are configured.
-
-## Model configuration
-
-Edit `.env`, then restart SAM.
-
-### AUTO routing with Ollama (recommended local-first default)
-
-```dotenv
-SAM_PROVIDER=auto
-SAM_MODEL_MODE=AUTO
-SAM_MODEL=qwen3.5:4b
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-```
-
-List downloaded models with `ollama list`. SAM also discovers them through
-Ollama's local `/api/tags` endpoint.
-
-### OpenAI (optional cloud boundary)
-
-```dotenv
-SAM_PROVIDER=openai
-OPENAI_API_KEY=your_key_here
-OPENAI_MODEL=gpt-5-mini
-OPENAI_BASE_URL=https://api.openai.com/v1
-```
-
-The OpenAI adapter uses the Responses API with custom function tools and
-`store=false`. Keep `.env` private. For long-term use, prefer injecting the key
-from Windows Credential Manager rather than storing it in a file.
-
-When a cloud provider is active, chat context and non-sensitive tool results may
-leave the machine. SAM blocks known secret paths from cloud context by default,
-but no classifier is perfect—do not ask a cloud model to inspect secrets.
-
-### LiteLLM gateway (optional)
-
-Install and start the local gateway in a second PowerShell:
+## Install and run
 
 ```powershell
-.\setup.ps1 -InstallLiteLLM
-.\start-litellm.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -DryRun   # show what would happen
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1           # venv (Python 3.13) + requirements + icon + shortcuts
+powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1         # remove the shortcuts only
 ```
 
-`litellm-config.yaml` defines `sam-fast`, `sam-strong`, and `sam-vision`
-aliases backed by local Ollama by default. Change the underlying routes only
-after securely configuring the corresponding provider credentials.
+The installer is idempotent. It creates/repairs `.venv` with Python 3.13 (a venv made by another Python is
+moved aside, never deleted), installs `requirements.txt`, writes `%LOCALAPPDATA%\SAM\sam.ico`, and makes
+Desktop `SAM.lnk`, Start-menu `SAM.lnk` and Startup `SAM (background).lnk` →
+`.venv\Scripts\pythonw.exe SAM.pyw --home <SAM_HOME> [--background]` (these replace v1's shortcuts of the
+same names). `-SamHome`, `-NoAutostart`, `-SkipPip`, `-SkipCheck` are available.
 
-### OpenRouter (optional cloud boundary)
-
-Inject `OPENROUTER_API_KEY` into the SAM process environment. Keep
-`SAM_PROVIDER=auto` for fallback routing or select `openrouter` manually. The
-adapter uses the OpenAI-compatible chat endpoint, tool calling, app attribution
-headers, and returned usage/cost data. Daily and monthly cloud budgets are
-visible in Settings.
-
-## Trading brain and desktop control
-
-The **Market** panel reads exact provider candles and quotes from the installed
-MetaTrader 5 terminal. It separates facts, observations, theory interpretation,
-setup/confirmation, invalidation, and risk/reward. Missing requirements produce
-`WAIT`, `WATCH`, or `NO_TRADE`; the UI never fills entry, stop, targets,
-confidence, or sweep labels with placeholders.
-
-Deterministic modules cover indicators, swing/market structure, HH/HL/LH/LL,
-BOS/CHOCH/MSS, scored S/R, liquidity/equal highs/equal lows/sweeps, FVG,
-supply/demand candidates, candlestick observations, volume profile, VWAP,
-sessions/DST, statistics, multi-timeframe entry gating, theory registry,
-versioned custom theories, setup monitoring, self-check, and a journal.
-Order-flow, footprint, CVD, DOM, tape, macro calendar, rates, and sentiment are
-capability-gated and never inferred from ordinary OHLC candles.
-
-The **TradingView** panel observes the native window handle, title, symbol,
-quote, geometry, monitor, and foreground state. Computer Control and Screen
-Access are separate switches and are OFF by default. Symbol changes require
-native-title confirmation. The installed TradingView build does not expose the
-interval through its title/accessibility surface, so timeframe commands return
-`PARTIAL` until independently verified. Drawing stays partial until chart
-price-to-screen calibration is verified.
-
-The MetaTrader integration is **market-data read-only**. Live broker order
-placement is not implemented.
-
-## Workspace
-
-The default controlled workspace is `workspace/` inside this project. Change it
-in `.env` with an absolute path:
-
-```dotenv
-SAM_WORKSPACE=D:\Projects\MyProject
-```
-
-Choose a narrow project directory. Do not use a drive root, your entire user
-profile, `C:\Windows`, or `Program Files`. Changes outside the configured root
-require approval, and protected operations remain blocked.
-
-## Voice
-
-Use the microphone button in the composer and enable spoken replies in
-Settings. Voice uses browser Web Speech plus a local audio analyser for
-activity/silence detection. Availability and where recognition is processed
-depend on the installed browser; typed chat always works.
-
-## Browser automation
-
-Opening an ordinary `http` or `https` page is a normal action. Interactions that
-can create external side effects—clicking, typing, submitting, uploading, or
-sending—require approval. Browser automation uses a fresh isolated profile and
-does not inherit the primary browser's cookies, password manager, or sign-in.
-
-## Permissions and approvals
-
-Each approval contains:
-
-- Tool and normalized arguments.
-- Working directory or destination.
-- Risk level and policy reason.
-- Expiration time and one-time request fingerprint.
-
-Approve only when the operation exactly matches your intent. A changed,
-expired, replayed, or cross-session request is rejected. There is deliberately
-no global “approve everything” switch.
-
-Permission presets never remove hard blocks or approval for destructive work:
-
-- **Guarded** (default): approve terminal commands and high-risk actions; allow
-  ordinary reads and new workspace files.
-- **Strict**: also approve new files, navigation, and read-only browser runs.
-- **Trusted workspace**: allow commands classified as safe inside the selected
-  workspace; overwrites, deletes, installs, system changes, external side
-  effects, and opaque commands still require approval or remain blocked.
-
-## Audit and memory data
-
-Runtime data is stored in `data/sam.sqlite3`. The UI exposes a read-only audit
-viewer and memory controls. Do not edit the database while SAM is running.
-
-Back up the database by stopping SAM and copying the file. To start with a fresh
-state, stop SAM and move the database elsewhere; keeping the old file makes the
-operation recoverable.
-
-## Tests
-
-```powershell
-.\run-tests.ps1
-```
-
-The suite checks workspace containment, dangerous command decisions, approval
-binding/replay protection, secret redaction, memory/database behavior, routing
-and budgets, trading types/indicators/analysis/capability guards, custom theory
-versioning, voice/trading API declarations, and API health.
-
-## Troubleshooting
-
-**The UI says Ollama is offline**
-
-Start Ollama, then verify:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:11434/api/tags
-```
-
-Download at least one tool-capable model:
-
-```powershell
-ollama pull qwen3.5:4b
-```
-
-**Port 8765 is already in use**
-
-```powershell
-.\start.ps1 -Port 8877
-```
-
-**Microphone input is unavailable**
-
-Use current Microsoft Edge or Chrome, grant microphone permission to the local
-page, and check Windows **Settings → Privacy & security → Microphone**.
-
-**A command was blocked**
-
-Open the audit panel. Opaque, encoded, elevated, credential-dumping, or
-disk/security-destructive commands cannot be approved in safe mode. Rewrite the
-request as a narrow, transparent action. Do not disable the safety layer to run
-untrusted code.
+`SAM.pyw` flags: `--background` (sign-in start: island only; sets `SAM_BACKGROUND=1`), `--home PATH`,
+`--no-omniroute`, `--write-icon PATH`; anything else (`--no-ui`, `--console`, `--check`, `--after-pid N`)
+is passed to `python -m sam`. A second launch asks the running SAM to show its panel and exits.
+`--quit` asks a running SAM 2 to shut down cleanly (the same path as tray Quit: it stops listening, closes
+the TradingView and MT5 connections and the database) and waits up to 30 s; exit code 0 = stopped.
+Start-up shows the island first and starts the packages behind it (measured on this PC: island visible
+0.5–0.8 s after launch, core ready 1.1–2.1 s, ~215 MB working set when idle).
 
 ## Development
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-python -m sam_backend --host 127.0.0.1 --port 8765
+scripts\dev.ps1                 # run from source with SAM_HOME (default %USERPROFILE%\Desktop\SAM-Agent), log to the console
+scripts\dev.ps1 -NoUi           # core only
+scripts\dev.ps1 -Check          # load every package and print a status (booleans only, never key values)
+scripts\dev.ps1 -Test           # pytest
+scripts\dev.ps1 -Acceptance -Only launcher
 ```
 
-The frontend has no build step and is served from `frontend/`. API endpoints are
-documented by FastAPI at <http://127.0.0.1:8765/api/docs> while SAM is running.
+Or directly: `.venv\Scripts\python.exe -m sam --console --home C:\Users\samit\Desktop\SAM-Agent`.
 
-See [Architecture](docs/ARCHITECTURE.md) for the component map and extension
-rules.
+## Tests
+
+```powershell
+.venv\Scripts\python.exe -m pytest --basetemp work\pytest-me -p no:cacheprovider
+```
+
+Tests never use the network, the speakers, the microphone, the real `SAM_HOME` or live apps (Qt runs
+offscreen; keys are fakes with the real shapes). Per package: `tests/test_<package>_*.py`.
+
+## Acceptance (live, on this PC)
+
+```powershell
+.venv\Scripts\python.exe acceptance\run_all.py --home C:\Users\samit\Desktop\SAM-Agent [--only launcher] [--list]
+```
+
+`run_all.py` runs every `acceptance/<module>_*.py` one at a time with `SAM_HOME` set and prints a table;
+the redacted report goes to `work/acceptance/<timestamp>.json`. A script passes with exit code 0, is
+skipped with 77, and may refine the result with a JSON object (`ok`, `skipped`, `summary`, `checks`) written
+to `$SAM_ACCEPTANCE_OUT` or printed last; `acceptance/_common.py` implements this. Live scripts must clean up
+(drawings, symbol/timeframe), never place orders, never play audio and never print a key.
+The launcher's own checks: `launcher_env` (venv, imports, OmniRoute, installer dry run, current shortcuts),
+`launcher_migrate_v1` (real v1 DB → temp SAM 2 DB), `launcher_startup` (island time, RAM, no console,
+second-launch behaviour; uses a temp home unless `SAM_ACCEPTANCE_REAL_HOME=1`).
+
+## Configuration
+
+Keys are pasted in Settings (stored with DPAPI in `<SAM_HOME>\data\secrets.json`, the same file and names as
+v1) or come from the process environment / `<SAM_HOME>\.env`, which is never copied into child processes.
+See [`.env.example`](.env.example) for every variable name SAM 2 reads. Everything else is a setting in the
+database (`settings` table; defaults in `sam/config.py`), editable in the Settings page.
+
+## Privacy and safety
+
+- Free tiers only; on Gemini's free tier Google may use submitted content to improve its products.
+- Keys are only sent to their own provider and are redacted from logs, the database, the UI and tool results.
+- Risky actions need a spoken "بەڵێ" or a click within 20 s (default no); trading orders, disabling security
+  tools, credential exfiltration and mass deletion are blocked outright. Text read from screens, files and
+  web pages is treated as data, never as instructions.
+- TradingView support is an unofficial local automation of the user's own desktop app (Chrome DevTools
+  protocol on 127.0.0.1 only); SAM removes only drawings it created. The DevTools port stays open until
+  TradingView itself is closed (also after SAM quits): web pages cannot use it (bad Host headers and foreign
+  Origins are refused, checked 2026-09-24), but any local program can, so close TradingView when you are done
+  if you do not trust every program on this PC.
