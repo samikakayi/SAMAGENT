@@ -80,6 +80,7 @@ def register_conversation_routes(application: FastAPI, sv: AppServices) -> None:
         try:
             return await agent.chat(
                 payload.message, conversation_id=payload.conversation_id, provider=payload.provider, model=payload.model,
+                input_mode=payload.input_mode,
             )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
@@ -93,6 +94,7 @@ def register_conversation_routes(application: FastAPI, sv: AppServices) -> None:
             try:
                 result = await agent.chat(
                     payload.message, conversation_id=payload.conversation_id, provider=payload.provider, model=payload.model,
+                    input_mode=payload.input_mode,
                 )
                 yield "event: result\ndata: " + json.dumps(result, ensure_ascii=False, default=str) + "\n\n"
             except Exception as exc:
@@ -113,6 +115,7 @@ def register_conversation_routes(application: FastAPI, sv: AppServices) -> None:
                 await websocket.send_json({"type": "status", "status": "thinking"})
                 result = await agent.chat(
                     payload.message, conversation_id=payload.conversation_id, provider=payload.provider, model=payload.model,
+                    input_mode=payload.input_mode,
                 )
                 await websocket.send_json({"type": "result", **result})
         except WebSocketDisconnect:

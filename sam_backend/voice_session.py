@@ -298,7 +298,9 @@ class VoiceConversationController:
             import asyncio
 
             async def run():
-                return await self.agent.chat(text, conversation_id=None)
+                # Marked as spoken so the model knows it is reading a
+                # transcript that may be misheard. The mark changes nothing else.
+                return await self.agent.chat(text, conversation_id=None, input_mode="voice")
 
             try:
                 asyncio.get_running_loop()

@@ -660,6 +660,10 @@
       provider: state.settings.provider || state.health?.provider || undefined,
       model: state.settings.model || state.health?.model || undefined,
       conversation_id: state.conversationId || undefined,
+      // Read before voiceTurn is reset below: the server shows the model a
+      // spoken turn as a transcript, so it can allow for a mishearing instead
+      // of assuming the user typed it (and that SAM has no voice).
+      input_mode: state.voiceTurn ? "voice" : "text",
     };
 
     const speakReply = Boolean(state.settings.voice_output) || Boolean(state.voiceTurn);

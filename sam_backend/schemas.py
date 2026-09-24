@@ -33,6 +33,10 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     provider: Literal["auto", "ollama", "litellm", "openrouter", "openai"] | None = None
     model: str | None = None
+    # "voice" when the message is a speech transcript. It only tells the model
+    # the words were recognised rather than typed; it grants nothing. Older
+    # clients that never send it are typing, which is what the default says.
+    input_mode: Literal["text", "voice"] = "text"
 
 
 class DirectToolRequest(BaseModel):
