@@ -230,10 +230,20 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
             return "cascade"  # the name «سام» is checked on the transcript before any model hears it
         if mode == "live":
             return "live"
-        # auto: Live only after a passing self-test (design 2.1). Not run yet,
-        # inconclusive or failed -> the cascade, whose Sorani STT is measured.
+        # auto = the cascade. The user's real test (2026-09-24): Live heard
+        # «سڵاو سام چۆنی» as Korean and answered in English, then Italian -- Live
+        # is an explicit choice only. ``voice.auto_live`` (off) restores the old
+        # rule: Live after a passing self-test (design 2.1).
+        if not self.app.config.get("voice.auto_live", False):
+            return "cascade"
         verdict = selftest_verdict(self.app.config.get("voice.selftest"))
         return "live" if verdict == "pass" else "cascade"
+
+    def live_wanted(self) -> bool:
+        """The user's settings can put Live to use (it was chosen explicitly,
+        or "auto" may pick it): only then is a Gemini self-test worth its quota."""
+        mode = str(self.app.config.get("voice.engine", "auto") or "auto")
+        return mode == "live" or (mode == "auto" and bool(self.app.config.get("voice.auto_live", False)))
 
     def live_text_trusted(self) -> bool:
         """Live's own transcript may replace STT only after a passing self-test."""
@@ -602,7 +612,8 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         ``voice.selftest_min_interval_s`` (a day): it spends 3 Gemini TTS
         requests, and on 2026-09-24 the self-test plus the phrase prewarm used
         up the free TTS quota before the user's first sentence. Never while
-        Gemini TTS rests after a quota error."""
+        Gemini TTS rests after a quota error, and only while the settings can
+        use Live at all (``live_wanted``: "auto" no longer picks Live)."""
         await asyncio.sleep(first_delay_s)
         while True:
             result = self.app.config.get("voice.selftest")
@@ -611,7 +622,7 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
             last = float(result.get("at") or 0) if isinstance(result, dict) else 0.0
             recent = time.time() - last < interval
             due = verdict == "none" or (verdict == "inconclusive" and not recent)
-            if due and self.app.secrets.has("gemini_api_key") and not self.muted \
+            if due and self.live_wanted() and self.app.secrets.has("gemini_api_key") and not self.muted \
                     and not rests(self.app).resting("gemini_tts"):
                 try:
                     await self.run_selftest()

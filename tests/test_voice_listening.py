@@ -82,6 +82,7 @@ async def voice(make_app, monkeypatch):
     async def build(*, gemini=False, llm_log=None, stt=None, enrolled_pitch=None, client=None, llm=None):
         app = make_app(env_text=f"GEMINI_API_KEY={FAKE_GEMINI}\n" if gemini else "")
         if gemini:
+            app.config.set("voice.auto_live", True)   # these tests drive Live through "auto" (off by default)
             app.config.set("voice.selftest", {"ok": True, "cer": 0.1, "at": 1.0})
         app.bus.bind_loop(asyncio.get_running_loop())
         events = []

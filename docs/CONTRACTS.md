@@ -1013,7 +1013,7 @@ dialog also opens when the user says «دەنگم بناسە». `CascadeVoice.su
 
 ---------------------------------------------------------------------------------------------------
 
-## 10. Local brain, no-AI fast path (brain, 2026-09-25)
+## 10. Local brain, no-AI fast path, voice defaults (brain, 2026-09-25)
 
 The user's decisions after the first real test: every free quota was used up in one evening, Gemini Live
 heard «سڵاو سام چۆنی» as Korean (answered in English, then Italian), and an A/B listening test preferred
@@ -1091,3 +1091,7 @@ recall 0.87 on the first run (0.95 after three fixes). Usage counted as provider
 Test helper `brain_app(..., fastpath=False)`: model-loop tests keep the fast path off.
 `outcome.tool_sentence` fix: `data.cancelled` means "stopped" only when it is `True` (cancel_alert's count made
 «هەموو ئاگادارکردنەوەکان هەڵبوەشێنەوە» answer «ڕاگیرا.»).
+
+**Voice defaults.** `voice.tts_provider` = "kurdishtts" (Gemini TTS is the fallback; `TtsRouter.order`).
+"Automatic" never picks Live: `voice.auto_live` False (True restores "Live after a passing self-test");
+`VoiceEngine.live_wanted()`; the automatic self-test (3 Gemini TTS requests) runs only when Live can be used.

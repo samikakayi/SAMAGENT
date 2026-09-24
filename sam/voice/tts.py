@@ -417,7 +417,7 @@ class TtsRouter:
         return self.cache.register(phrases) if self.cache is not None else 0
 
     def order(self) -> list[Any]:
-        first = str(self.app.config.get("voice.tts_provider", "gemini"))
+        first = str(self.app.config.get("voice.tts_provider", "kurdishtts"))
         names = [first] + [n for n in self.providers if n != first]
         return [self.providers[n] for n in names if n in self.providers]
 

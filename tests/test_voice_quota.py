@@ -76,6 +76,7 @@ async def gather_audio(router, text):
 
 def gemini_app(make_app):
     app = make_app(env_text=f"GEMINI_API_KEY={FAKE_GEMINI}\n")
+    app.config.set("voice.tts_provider", "gemini")   # these tests: Gemini first (the default is KurdishTTS first)
     app.bus.bind_loop(asyncio.get_running_loop())
     return app
 

@@ -55,8 +55,12 @@ async def voice(make_app, monkeypatch):
 
     async def build(*, gemini=False, llm=None, stt=None, tts=None, client=None, hotkey_ok=True, selftest_ok=True):
         app = make_app(env_text=f"GEMINI_API_KEY={FAKE_GEMINI}\n" if gemini else "")
+        if gemini:
+            # These tests drive Live through "auto": the old rule (Live after a
+            # passing self-test) is kept behind voice.auto_live, off by default
+            # since the user's real test (test_automatic_never_picks_live_by_default).
+            app.config.set("voice.auto_live", True)
         if gemini and selftest_ok:
-            # "Automatic" uses Live only after a passing self-test (design 2.1).
             app.config.set("voice.selftest", {"ok": True, "cer": 0.1, "at": 1.0})
         app.bus.bind_loop(asyncio.get_running_loop())
         events = []
@@ -152,6 +156,33 @@ async def test_engine_choice_rules(voice):
     app2.config.set("voice.selftest", {"ok": True})
     eng2.live_degraded = True
     assert eng2.choose_engine() == "cascade"
+
+
+async def test_automatic_never_picks_live_by_default(voice):
+    """The user's real test (2026-09-24): Live heard «سڵاو سام چۆنی» as Korean
+    and answered in English, then Italian. "Automatic" is the cascade even with
+    a key and a passing self-test; Live stays an explicit choice, and the
+    automatic self-test (3 Gemini TTS requests) runs only when Live can be used."""
+    app, eng, *_ = await voice(gemini=True)
+    app.config.reset("voice.auto_live")                 # the shipped default
+    assert app.config.get("voice.auto_live") is False and app.config.get("voice.engine") == "auto"
+    app.config.set("voice.selftest", {"ok": True, "cer": 0.05, "at": 1.0})
+    assert eng.choose_engine() == "cascade" and not eng.live_wanted()
+    app.config.set("voice.engine", "live")               # explicit choice still works
+    assert eng.choose_engine() == "live" and eng.live_wanted()
+    app.config.set("voice.engine", "auto")
+    app.config.set("voice.selftest", None)
+    runs = []
+
+    async def fake_selftest():
+        runs.append(1)
+        return {"ok": True}
+
+    eng.run_selftest = fake_selftest
+    with pytest.raises(asyncio.TimeoutError):          # never due while Live cannot be used
+        await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 0.2)  # noqa: SLF001
+    assert runs == []
+    assert app.config.get("voice.tts_provider") == "kurdishtts"   # the user's A/B choice
 
 
 async def test_automatic_selftest_runs_at_most_once_a_day(voice):

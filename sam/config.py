@@ -147,11 +147,18 @@ def build_defaults(env: Callable[[str], str | None]) -> dict[str, Any]:
         # --- confirm (brain/confirm.py) ---
         "confirm.timeout_s": 20,
         # --- voice (sam/voice) ---
+        # auto = the cascade. The user's real test on 2026-09-24: Gemini Live heard
+        # «سڵاو سام چۆنی» as Korean and answered in English, then Italian, so Live is
+        # an explicit choice only ("voice.auto_live" re-enables the old rule:
+        # Live after a passing self-test).
         "voice.engine": "auto",            # auto|live|cascade
+        "voice.auto_live": False,
         "voice.live_model": "gemini-3.8-live",
         "voice.live_fallback_model": "gemini-3.1-flash-live-preview",
         "voice.voice_name": "Kore",
-        "voice.tts_provider": "gemini",    # gemini|kurdishtts
+        # The user's A/B listening test (2026-09-24) chose KurdishTTS's voice over
+        # Gemini's: KurdishTTS speaks first, Gemini TTS is the fallback.
+        "voice.tts_provider": "kurdishtts",  # kurdishtts|gemini
         "voice.tts_model": "gemini-3.8-flash-lite-tts",
         "voice.stt_provider": "kurdishtts",  # kurdishtts|gemini
         "voice.stt_fallback_model": "gemini-3.5-flash-lite",

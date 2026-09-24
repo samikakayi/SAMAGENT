@@ -28,7 +28,11 @@ def app(make_app):
 
 @pytest.fixture
 def gemini_app(make_app):
-    return make_app(env_text=ENV + f"GEMINI_API_KEY={FAKE_GEMINI}\n")
+    app = make_app(env_text=ENV + f"GEMINI_API_KEY={FAKE_GEMINI}\n")
+    # These tests exercise "Gemini first, KurdishTTS as fallback" (still a user
+    # choice); the shipped default is the reverse (test_default_tts_order_*).
+    app.config.set("voice.tts_provider", "gemini")
+    return app
 
 
 def pcm(seconds: float, value: int = 300) -> bytes:
@@ -304,3 +308,12 @@ async def test_tts_router_splits_long_text_into_capped_requests(gemini_app):
 async def test_tts_router_order_without_gemini_key(app):
     router = TtsRouter.default(app)
     assert [p.provider for p in router.order() if p.configured()] == ["kurdishtts"]
+
+
+def test_default_tts_order_is_kurdishtts_then_gemini(make_app):
+    """The user's A/B listening test (2026-09-24) chose KurdishTTS's voice:
+    it speaks first by default, Gemini TTS only when KurdishTTS cannot."""
+    app = make_app(env_text=ENV + f"GEMINI_API_KEY={FAKE_GEMINI}\n")
+    assert app.config.get("voice.tts_provider") == "kurdishtts"
+    router = TtsRouter.default(app)
+    assert [p.provider for p in router.order()] == ["kurdishtts", "gemini"]
