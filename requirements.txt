@@ -37,6 +37,10 @@ winrt-Windows.Globalization==3.2.1
 winrt-Windows.Foundation==3.2.1
 winrt-Windows.Foundation.Collections==3.2.1
 
+# Knowledge library: the PDF text layer (pure Python; sam/knowledge/extract.py). DOCX is read with
+# the standard library, scanned pages with the Windows OCR above.
+pypdf==6.19.0
+
 # zoneinfo has no IANA database on Windows without this (Asia/Baghdad,
 # America/Los_Angeles for Gemini's daily quota reset).
 tzdata==2026.4

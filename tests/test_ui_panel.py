@@ -25,9 +25,10 @@ def panel(controller):
     return p
 
 
-def test_panel_builds_all_five_sorani_tabs(panel):
+def test_panel_builds_all_sorani_tabs(panel):
     assert list(panel.pages) == list(PAGES)
-    assert [panel.nav[k].text() for k in PAGES] == ["گفتوگۆ", "ستراتیژییەکان", "چاودێری", "چالاکی", "ڕێکخستنەکان"]
+    assert [panel.nav[k].text() for k in PAGES] == ["گفتوگۆ", "ستراتیژییەکان", "کتێبخانە", "چاودێری", "چالاکی",
+                                                    "ڕێکخستنەکان"]
     assert panel.layoutDirection() == Qt.LayoutDirection.RightToLeft
     for key in PAGES:
         panel.show_page(key)

@@ -57,9 +57,11 @@ MORE_TOOLS = "more_tools"
 # list_alerts / cancel_alert joined it in the acceptance review: "cancel my gold
 # alert" needed a more_tools round first, and when that round found no model
 # the user heard «تەواو بوو.» while the alert stayed active.
+# knowledge_search joined when the user's library of books arrived (sam/knowledge,
+# 2026-09-25): questions about his own documents must find their pages at once.
 CORE_TOOLS = ["open_app", "tv_open", "tv_set_chart", "analyze_market", "draw_on_chart", "clear_my_drawings",
               "get_price", "set_alert", "list_alerts", "cancel_alert", "web_search", "remember", "recall",
-              "delegate_task", "window_control", "system_control", "stop_all"]
+              "knowledge_search", "delegate_task", "window_control", "system_control", "stop_all"]
 SHORT_REPLY_CHARS = 40
 
 
@@ -74,9 +76,9 @@ class AnswerText(str):
 
 @tool(MORE_TOOLS,
       description="Attach more of SAM's tools to your next step when none of the tools you have fits: files, "
-                  "run_powershell, screen_look, click, type_text, press_keys, screen_act, open_url, fetch_page, "
-                  "build_project, chart_state, strategy_save, strategy_list, strategy_get, theory_info, forget. "
-                  "Name the ones you need.",
+                  "run_powershell, run_python, screen_look, click, type_text, press_keys, screen_act, open_url, "
+                  "fetch_page, build_project, chart_state, strategy_save, strategy_list, strategy_get, theory_info, "
+                  "knowledge_add, knowledge_list, forget. Name the ones you need.",
       params={"type": "object", "properties": {
           "tools": {"type": "array", "items": {"type": "string"}, "description": "tool names you need"},
           "need": {"type": "string", "description": "what you want to do, if unsure which tool"}}},

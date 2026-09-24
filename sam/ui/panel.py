@@ -1,9 +1,9 @@
 """The panel: SAM's main window (dark, right-to-left, Sorani first).
 
-Sidebar (right side in RTL) with the brand orb, the five sections and live
+Sidebar (right side in RTL) with the brand orb, the six sections and live
 component status dots; the body is a stack of pages:
-گفتوگۆ (chat) · ستراتیژییەکان (strategies) · چاودێری (alerts) · چالاکی
-(activity + timings) · ڕێکخستنەکان (settings).
+گفتوگۆ (chat) · ستراتیژییەکان (strategies) · کتێبخانە (the knowledge library) ·
+چاودێری (alerts) · چالاکی (activity + timings) · ڕێکخستنەکان (settings).
 
 Closing the window only hides it: SAM keeps running in the island and tray.
 """
@@ -22,6 +22,7 @@ from . import theme
 from .orb import orb_icon, orb_pixmap
 from .pages.activity import ActivityPage
 from .pages.chat import ChatPage
+from .pages.library import LibraryPage
 from .pages.monitor import MonitorPage
 from .pages.settings import SettingsPage
 from .pages.strategies import StrategiesPage
@@ -29,9 +30,9 @@ from .strings import en, state_word, tr, tr_or
 from .widgets import A_RIGHT, StatusDot
 from .win32 import bring_to_front, dark_title_bar
 
-PAGES = ("chat", "strategies", "monitor", "activity", "settings")
-NAV_ICONS = {"chat": "chat", "strategies": "strategies", "monitor": "monitor", "activity": "activity",
-             "settings": "settings"}
+PAGES = ("chat", "strategies", "library", "monitor", "activity", "settings")
+NAV_ICONS = {"chat": "chat", "strategies": "strategies", "library": "library", "monitor": "monitor",
+             "activity": "activity", "settings": "settings"}
 # ComponentStatus.component -> sidebar row
 COMPONENT_ROWS = {"voice": "voice", "live": "voice", "cascade": "voice", "brain": "brain", "omniroute": "omniroute",
                   "tradingview": "tradingview", "mt5": "mt5"}
@@ -206,6 +207,7 @@ class Panel(QWidget):
         self.pages: dict[str, Any] = {
             "chat": ChatPage(app, bridge),
             "strategies": StrategiesPage(app, bridge),
+            "library": LibraryPage(app, bridge),
             "monitor": MonitorPage(app, bridge),
             "activity": ActivityPage(app, bridge),
             "settings": SettingsPage(app, bridge),

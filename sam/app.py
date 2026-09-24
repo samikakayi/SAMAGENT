@@ -45,6 +45,7 @@ PACKAGES: tuple[str, ...] = (
     "sam.brain.memory",        # app.memory      (brain builder)
     "sam.brain.persona",       # app.persona     (brain builder)
     "sam.hands",               # app.hands       (hands builder)
+    "sam.knowledge",           # app.knowledge + knowledge_* tools + run_python (knowledge builder)
     "sam.trading.chart_tools", # app.trading.tv  (chart bridge builder)
     "sam.trading.tools",       # app.trading.mt5/engine/theories/strategies/monitor (engine builder)
     "sam.brain.worker",        # app.worker      (brain builder)
@@ -101,6 +102,7 @@ class App:
         self.worker: Any = None
         self.voice: Any = None
         self.hands: Any = None
+        self.knowledge: Any = None        # sam.knowledge.library.Library (knowledge builder)
         self.trading = TradingSlots()
         self.ui: Any = None
         self.loop: asyncio.AbstractEventLoop | None = None

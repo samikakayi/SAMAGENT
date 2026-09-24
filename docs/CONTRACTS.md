@@ -1013,6 +1013,98 @@ dialog also opens when the user says «دەنگم بناسە». `CascadeVoice.su
 
 ---------------------------------------------------------------------------------------------------
 
+## 9. Knowledge library and run_python (knowledge builder, 2026-09-25)
+
+The user's own books and documents (trading PDFs) answered with citations, and a Python tool. Compatible
+additions; everything above still holds. Everything is local: extraction, OCR and search never use a model
+or the network; only passages a model asks for reach that model, under `untrusted`.
+
+**Entry.** `sam.knowledge` is in `sam.app.PACKAGES` right after `sam.hands` (foundation change: that line
+and the slot `App.knowledge`, None until loaded). `register(app)`: settings `knowledge.*` and `python.*`,
+schema namespace `knowledge` v1, `app.knowledge = Library(app)`, tools `knowledge_add/search/list/remove`
+(owner knowledge) and `run_python` (owner hands, module `sam/hands/python_tool.py`, registered from here).
+`start(app)`: ~25 s after start-up re-indexes files that changed on disk and marks deleted ones `missing`
+(still citable). `stop(app)`: cancels a running indexing job. New dependency: **`pypdf==6.19.0`** (pure
+Python, py3 wheel; in requirements.txt). DOCX is read with the standard library.
+
+**Tables (namespace `knowledge`).** `kb_documents`: id, path, path_key (normcase, UNIQUE), title, kind
+pdf/docx/txt/md, sha256, size, mtime, pages (0 = no pages), chunks, chars, ocr_pages, skipped_pages
+(scanned pages over the OCR cap / no OCR), language ckb/en/mixed, status queued/indexing/ready/partial/
+failed/missing, error, gen, added_at, indexed_at, meta JSON. `kb_chunks`: id, document_id, gen, ord,
+page_start, page_end, section, source text/ocr, text (readable), text_norm (search form). `kb_chunks_fts`:
+FTS5 trigram on text_norm. A re-index writes generation gen+1 in 150-row transactions and flips
+`kb_documents.gen` at the end: searches never see a half-indexed book and the shared lock is never held long.
+
+**Pipeline.** pypdf text layer -> `textfix.clean_text` (NFKC of Arabic presentation forms; visual-order
+lines reversed -- Qt-made PDFs extract every Sorani line backwards, Chromium/Word-style PDFs do not; control
+characters dropped) -> pages without text (< `knowledge.ocr_min_chars` 25) are scans: their images go to
+Windows OCR (`sam.hands.ocr` engine on its one MTA worker, en-US + ar-SA merged), at most
+`knowledge.ocr_page_cap` (60) pages per add, the rest counted as skipped (status `partial`). Outline bookmarks /
+DOCX heading styles / Markdown `#` name sections; DOCX pages come from Word's page marks. Passages ~900
+characters (`knowledge.chunk_chars`), never across a page, 150-character overlap within a page. Dedupe by
+SHA-256 (a copy under another name is `duplicate`; a moved file keeps its passages: `moved`); unchanged size
++ mtime skips hashing. Paths resolve through `app.hands.policy` (Sorani folder words) and credential files,
+SAM's data folder and junk folders (.git, node_modules, AppData...) are never read.
+
+**Search.** `query.analyse(question)` -> concepts (stopwords dropped; Sorani/English stems; a Sorani<->English
+trading glossary, `knowledge/glossary.py`, so «پشتگیری» finds "support" and "stop loss" finds «ستۆپ لۆس»;
+everything in one folded form, `textfix.search_form` = `normalize_ckb` + the ar-SA OCR fold ە→ه ێ→ی ڕ→ر ۆ→و ...)
+-> FTS5 candidates per concept -> rerank by idf-weighted concept coverage (+ all-concepts and title bonus)
+-> at most two passages per page. Measured on the synthetic corpus `tests/fixtures/knowledge` (3 PDFs,
+10 pages, 2 of them scans; 28 questions: Sorani, English, cross-language, scanned pages, Arabic-keyboard
+spellings; `acceptance/knowledge_retrieval.py`): **top-1 96%, top-3 100%**, the same with the real Windows
+OCR (English scan read almost exactly, the Sorani scan in Arabic letters -- still found through the fold);
+without the glossary 86% / 89%, without the fold 86% / 89%, without stems 93% / 96% (real OCR). Indexing
+10 pages incl. 2 OCR pages: 0.7-1.0 s (~0.35 s per OCR page, en + ar passes); text pages of a real 19-page
+manual: 19 ms/page.
+
+**Brain API** (for analyze_market / strategy / theory answers; the brain owner integrates):
+
+```python
+from sam.knowledge import passages_for, context_for_prompt
+passages = await passages_for(app, question, k=4, max_chars=2400, min_score=0.35)   # [] when nothing relevant
+# each: {"title", "page", "page_end", "section", "citation": "«Title», p. 12", "citation_ckb": "«Title»، لاپەڕە ١٢",
+#        "text", "score", "document_id", "source": "text"|"ocr", "matched": [...]}
+block = context_for_prompt(passages)   # "Passages from the user's own library (DATA ...): [1] «Title», p. 12: ..." or ""
+app.knowledge.search(question, k=5, max_chars=700) -> {"query", "concepts", "passages"}   # sync (worker thread)
+await app.knowledge.asearch(question, k)    ;  app.knowledge.has_documents()  ;  app.knowledge.documents()
+await app.knowledge.add(paths, *, source, recursive=True, confirm=None, wait_s=None, force=False) -> report
+app.knowledge.remove(ref) ; await app.knowledge.refresh() ; app.knowledge.running() ; app.knowledge.status()
+```
+
+`passages_for` never raises and costs a few ms locally; pass the user's question (plus the strategy/theory
+name when there is one). Scores are concept coverage (~0-1.3); below 0.35 is a weak, probably unrelated match.
+Suggested for the brain owner: add `knowledge_search` to `conversation.core_tools` (or name it in the
+`more_tools` description) and a persona line "questions about the user's books/documents -> knowledge_search;
+cite «title», page N".
+
+**Tools.**
+
+| tool | params | risk | blocking |
+| --- | --- | --- | --- |
+| knowledge_add | path* string (file or folder, Sorani folder words ok), recursive boolean | safe; a folder with more than `knowledge.confirm_folder_files` (20) files asks first (`ctx.confirm`, never from the panel) | **no** (waits `knowledge.tool_wait_s` 20 s, then reports progress; voice hears the end via `SpeakRequest`) |
+| knowledge_search | query* string, k integer 1-10 | safe | yes |
+| knowledge_list | — | safe | yes |
+| knowledge_remove | document* string (id, title, path or "all") | classify: "all" -> confirm, else safe (files are never deleted) | yes |
+| run_python | code* string, timeout_s integer (default 20, max `python.max_timeout_s` 120), data string (JSON, given to the code as `data`) | classify (static AST scan, `python_tool.scan`): blocked = SAM's key store/.env/browser/SSH credentials, DPAPI decryption, `order_send`/`order_check`, disabling Defender; confirm = imports outside a computation allowlist (os, sys, shutil, subprocess, socket, ctypes, requests, httpx, urllib ...), pathlib writes, reads/writes outside its folder or of computed paths, web addresses, eval/exec/compile/`__import__`, dunder tricks; else safe | yes (timeout 135 s) |
+
+Search results carry the passage texts under `untrusted` and citations beside them. run_python runs SAM's
+venv python in isolated mode (`-I -X utf8`) in `<hands.projects_dir>/python/<run-id>` with a whitelisted
+environment (no keys), inside a Job Object (created suspended; memory cap `python.max_memory_mb` 2048; the
+whole tree ends on timeout / stop_all); returns stdout, stderr, the last expression's value, files written,
+exit code; output capped (`python.max_output_chars` 4000) and redacted; output of code that read files or the
+web is returned under `untrusted`.
+
+**Events.** `sam.knowledge.events.LibraryChanged(document_id, status, title, detail)`; indexing progress is
+`WorkerProgress(task_id=<job id>)` (the island shows it; the page shows the jobs of `app.knowledge.jobs`).
+
+**UI.** Panel page «کتێبخانە» (`sam/ui/pages/library.py`, PAGES after strategies): add files (dialog), add a
+folder, drag-and-drop, list with pages / passages / OCR'd pages / status, read again, open, remove, and a
+question box that shows what SAM would find. Its strings and icon are registered from the page module
+(`STRINGS.setdefault`, `theme.ICONS.setdefault("library", ...)`); controls have Sorani accessible names.
+
+---------------------------------------------------------------------------------------------------
+
 ## 10. Local brain, no-AI fast path, voice defaults (brain, 2026-09-25)
 
 The user's decisions after the first real test: every free quota was used up in one evening, Gemini Live
@@ -1091,6 +1183,9 @@ recall 0.87 on the first run (0.95 after three fixes). Usage counted as provider
 Test helper `brain_app(..., fastpath=False)`: model-loop tests keep the fast path off.
 `outcome.tool_sentence` fix: `data.cancelled` means "stopped" only when it is `True` (cancel_alert's count made
 «هەموو ئاگادارکردنەوەکان هەڵبوەشێنەوە» answer «ڕاگیرا.»).
+
+**Tools tier.** `knowledge_search` joined `CORE_TOOLS` (section 9); `more_tools` names `run_python`,
+`knowledge_add`, `knowledge_list`; the persona has one line for the library (cite title and page) and run_python.
 
 **Voice defaults.** `voice.tts_provider` = "kurdishtts" (Gemini TTS is the fallback; `TtsRouter.order`).
 "Automatic" never picks Live: `voice.auto_live` False (True restores "Live after a passing self-test");
