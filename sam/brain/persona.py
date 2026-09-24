@@ -32,6 +32,12 @@ log = logging.getLogger("sam.persona")
 
 Mode = Literal["voice", "text", "worker"]
 SORANI_ANCHOR = "RESPOND IN CENTRAL KURDISH (SORANI), ARABIC SCRIPT"
+# Everything after this line changes from turn to turn (time, memory, the
+# conversation). The local brain moves it next to the user's words so the
+# stable instruction + tool schemas stay in Ollama's prompt cache: on this PC
+# qwen3:8b read a 4.1k-token prompt at ~48 tok/s (86 s) but a cached prefix in
+# 1-2 s (measured 2026-09-24, lead scratchpad sam2/localbrain).
+CONTEXT_HEADING = "Current context (changes every turn):"
 BUDGETS: dict[str, int] = {"voice": 1500, "text": 1800, "worker": 2200}
 
 _WEEKDAYS_CKB = ("دووشەممە", "سێشەممە", "چوارشەممە", "پێنجشەممە", "هەینی", "شەممە", "یەکشەممە")
@@ -239,8 +245,9 @@ class Persona:
         if mode != "worker":
             fixed.append(_EXAMPLES)
         header = [f"Now: {self.now_en()}.", self._user_line()]
-        base = "\n\n".join(p for p in fixed if p) + "\n\n" + " ".join(p for p in header if p)
-        left = budget - estimate_tokens(base)
+        fixed_text = "\n\n".join(p for p in fixed if p)
+        header_text = CONTEXT_HEADING + "\n" + " ".join(p for p in header if p)
+        left = budget - estimate_tokens(fixed_text + "\n\n" + header_text)
 
         # Dynamic parts by priority; each gets a character allowance from the
         # remaining token budget (Sorani text ~2.2 chars per token).
@@ -255,7 +262,6 @@ class Persona:
         if tools_text:
             if estimate_tokens(tools_text) > left * 0.6:
                 tools_text = self._tools(describe=False)
-            sections.append(tools_text)
             left -= estimate_tokens(tools_text)
         for builder, share in ((self._facts, 0.4), (self._strategies, 0.5), (lambda n: self._conversation(mode, n), 1.0)):
             allowance = int(max(0, left) * share * 2.2)
@@ -266,7 +272,10 @@ class Persona:
                     continue
                 sections.append(text)
                 left -= cost
-        return base + ("\n\n" + "\n\n".join(sections) if sections else "")
+        # Stable text first, the per-turn context last (after CONTEXT_HEADING):
+        # the local brain keeps the stable part cached (llm_ollama.split_context).
+        static = fixed_text + ("\n\n" + tools_text if tools_text else "")
+        return static + "\n\n" + header_text + ("\n\n" + "\n\n".join(sections) if sections else "")
 
 
 def _clip_lines(text: str, max_chars: int) -> str:
@@ -293,4 +302,5 @@ def register(app: Any) -> None:
     app.persona = Persona(app)
 
 
-__all__ = ["Persona", "build_system_instruction", "estimate_tokens", "register", "SORANI_ANCHOR", "BUDGETS"]
+__all__ = ["Persona", "build_system_instruction", "estimate_tokens", "register", "SORANI_ANCHOR", "BUDGETS",
+           "CONTEXT_HEADING"]

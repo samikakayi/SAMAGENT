@@ -256,6 +256,7 @@ STRINGS: dict[str, tuple[str, str]] = {
     "a11y.mt5.check": ("پشکنینی مێتاتڕەیدەر", "Check MetaTrader 5"),
     # --- statuses -------------------------------------------------------------------------------------
     "status.ok": ("کار دەکات", "OK"),
+    "status.local_brain": ("مێشکی ناوخۆیی", "Local brain"),
     "status.degraded": ("لاوازە", "Degraded"),
     "status.down": ("کار ناکات", "Down"),
     "status.unconfigured": ("ڕێکنەخراوە", "Not configured"),
@@ -264,6 +265,7 @@ STRINGS: dict[str, tuple[str, str]] = {
     "status.connected": ("پەیوەستە", "Connected"),
     "status.not_connected": ("پەیوەست نییە", "Not connected"),
     "comp.voice": ("دەنگ", "Voice"),
+    "comp.brain": ("مێشک", "Brain"),
     "comp.omniroute": ("OmniRoute", "OmniRoute"),
     "comp.tradingview": ("ترەیدینگ ڤیو", "TradingView"),
     "comp.mt5": ("MT5", "MT5"),

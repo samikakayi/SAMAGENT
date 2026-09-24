@@ -290,7 +290,28 @@ class Conversation(Responder):
     def _on_voice_state(self, event: VoiceState) -> Any:
         if event.state == "sleeping" and self.conversation_id is not None:
             return self.on_sleep()
+        if event.state == "listening":
+            self.prewarm_local_brain()
         return None
+
+    def prewarm_local_brain(self, mode: str = "voice") -> Any:
+        """The user starts talking while no cloud rung can answer: load the
+        local model and read SAM's stable prompt into its cache now, while
+        they speak (load 8 s + a cold 4.1k-token prompt 86 s on this PC,
+        llm_ollama.py), instead of after the transcript. Returns the task."""
+        llm = self.app.llm
+        try:
+            if llm.cloud_usable(self._ladder(mode)) or not llm.local_ready():
+                return None
+            system = self.app.persona.system_instruction(mode) if self.app.persona is not None else ""
+            messages = [{"role": "system", "content": system}, {"role": "user", "content": "."}] if system else None
+            task = llm.prewarm_local(messages, self._tools_for_round(set()))
+            if task is not None and not task.done():
+                self.app.spawn(task, "local-brain-warm")    # tracked: cancelled on quit
+            return task
+        except Exception:  # noqa: BLE001 - a warm-up is optional
+            log.debug("local brain warm-up not started", exc_info=True)
+            return None
 
     # -- older turns -> summary ------------------------------------------------------------------
     def _summary_upto(self, conversation_id: int) -> int:
@@ -343,7 +364,8 @@ class Conversation(Responder):
                         [{"role": "system", "content": SUMMARY_PROMPT},
                          {"role": "user", "content": (f"Previous summary: {previous}\n\n" if previous else "")
                           + "\n".join(lines)}],
-                        ladder=rungs, reasoning="low", timeout_s=BACKGROUND_TIMEOUT_S, retry_transient=False)
+                        ladder=rungs, reasoning="low", timeout_s=BACKGROUND_TIMEOUT_S, retry_transient=False,
+                        local=False)
                     summary = " ".join((response.text or "").split())[:800]
                 except LLMError as err:
                     self.budget.record("summary", "failed", err.kind)

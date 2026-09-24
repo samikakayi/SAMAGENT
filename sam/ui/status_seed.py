@@ -86,9 +86,24 @@ def _trading_events(app: Any) -> list[Any]:
     return events
 
 
+def _brain_event(app: Any) -> ComponentStatus | None:
+    """Cloud or local brain (``LLMClient.brain_mode``, sam/brain/llm_local.py):
+    no request, only the client's own memory of who answered last."""
+    llm = getattr(app, "llm", None)
+    mode = getattr(llm, "brain_mode", None)
+    if mode is None:
+        return None
+    if mode == "local":
+        return ComponentStatus(component="brain", state="degraded", detail="local: start-up snapshot")  # type: ignore[arg-type]
+    return ComponentStatus(component="brain", state="ok", detail="cloud: start-up snapshot")  # type: ignore[arg-type]
+
+
 async def snapshot(app: Any) -> list[Any]:
     """Current ``VoiceState`` + ``ComponentStatus`` events (runs on the core loop)."""
     events = _voice_events(app)
+    brain = _brain_event(app)
+    if brain is not None:
+        events.append(brain)
     omni = await _omniroute_event(app)
     if omni is not None:
         events.append(omni)

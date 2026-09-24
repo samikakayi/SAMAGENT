@@ -425,7 +425,7 @@ class Memory:
         try:
             response = await self.app.llm.chat(messages, ladder=ladder, json_schema=EXTRACT_SCHEMA,
                                                reasoning="low", timeout_s=20 if chosen else 45,
-                                               retry_transient=not chosen)
+                                               retry_transient=not chosen, local=False)
             payload = response.json()
         except LLMError as err:
             log.info("fact extraction failed: %s", err.kind)

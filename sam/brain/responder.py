@@ -30,9 +30,10 @@ from typing import Any, AsyncIterator
 
 from ..events import Error, Transcript
 from ..textnorm import fix_letters, is_arabic_script, normalize_ckb
-from . import ladders, taint
+from . import fastpath, ladders, taint
 from .llm import LLMError, LLMResponse, ToolCall
-from .outcome import tool_sentence
+from .llm_local import LOCAL_PROVIDER
+from .outcome import own_sentence, tool_sentence
 from .speech import SentenceChunker
 from .tools import ToolContext, ok, tool
 
@@ -43,6 +44,7 @@ SORANI_CUT_OFF = "ببورە، وەڵامەکەم پچڕا."
 SORANI_DONE = "تەواو بوو."
 SORANI_NOT_DONE = "ببورە، نەکرا."
 SORANI_NOT_UNDERSTOOD = "ببورە، تێنەگەیشتم. دەتوانیت جارێکی تر بیڵێیتەوە؟"
+LOCAL_ACK_CKB = "یەک چرکە، بە مێشکی ناوخۆیی بیری لێ دەکەمەوە."
 
 # Short acknowledgements spoken while tools run (cascade voice only).
 ACKS_DO = ("باشە.", "بەسەرچاو.", "ئێستا دەیکەم.", "با بیکەم.", "باشە، ئێستا.")
@@ -191,7 +193,9 @@ class Responder:
         self.app.bus.publish(Transcript(role="user", text=text, source=source, conversation_id=conversation_id))
         scope = taint.begin(text)
         mode = "text" if source == "text" else "voice"
-        messages = self._messages(conversation_id, text, mode)  # type: ignore[attr-defined]
+        # Common commands need no model at all (fastpath.py / intents.py).
+        intent = fastpath.intent_for(self.app, text)
+        messages = [] if intent is not None else self._messages(conversation_id, text, mode)  # type: ignore[attr-defined]
         max_rounds = max(1, int(self.app.config.get("conversation.max_tool_rounds", 6) or 6))
         streaming = bool(self.app.config.get("conversation.stream", False))
         acknowledge = mode == "voice" and bool(self.app.config.get("conversation.voice_ack", True))
@@ -221,6 +225,22 @@ class Responder:
         # A turn in progress: background model calls wait for a pause (budget.py).
         self.active_turns = int(getattr(self, "active_turns", 0) or 0) + 1
         try:
+            if intent is not None:
+                turn.mark("fastpath", intent=intent.name)
+                async for kind, piece in fastpath.run(self.app, intent, source=source):
+                    if kind == "ack":
+                        if acknowledge:
+                            yield emit(piece, ack=True)
+                        continue
+                    for chunk in chunker.feed(piece):
+                        yield emit(chunk)
+                for chunk in chunker.flush():
+                    yield emit(chunk)
+                completed = True
+                return
+            local_ack = await self._local_ack(mode) if acknowledge else ""
+            if local_ack:
+                yield emit(local_ack, ack=True)
             for round_no in range(max_rounds + 1):
                 tool_choice = "none" if round_no == max_rounds else None
                 after_tools = round_no > 0
@@ -286,6 +306,14 @@ class Responder:
                         last = (call.name, args if isinstance(args, dict) else {}, result)
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
                                      "content": json.dumps(result, ensure_ascii=False, default=str)})
+                own = self._local_outcome(response, last, extra)
+                if own:
+                    # The local brain picked the tool: its own Sorani result is the answer
+                    # (a second local round costs 3-10 s on this PC's CPU and says the same).
+                    said = True
+                    for piece in [*chunker.feed(own), *chunker.flush()]:
+                        yield emit(piece)
+                    break
             if not said:
                 # Never a blanket "done" when no tool ran.
                 yield emit(outcome())
@@ -298,6 +326,28 @@ class Responder:
                                                 conversation_id=conversation_id))
             if own_turn:
                 turn.finish(completed=completed)
+
+    async def _local_ack(self, mode: str) -> str:
+        """A spoken «one moment» when this turn will wait for a cold local
+        brain (no cloud rung can answer and the model is not loaded: ~10 s
+        to load, and a cold first prompt took 86 s on this PC)."""
+        llm = self.app.llm
+        try:
+            if llm.cloud_usable(self._ladder(mode)) or not llm.local_ready():
+                return ""
+            backend = llm.local_backend()
+            loaded = await backend.loaded() if hasattr(backend, "loaded") else []
+        except Exception:  # noqa: BLE001 - an acknowledgement is optional
+            return ""
+        return "" if loaded else LOCAL_ACK_CKB
+
+    @staticmethod
+    def _local_outcome(response: LLMResponse | None, last: Any, extra: set[str]) -> str:
+        """The tool's own Sorani sentence after a local-brain tool call ('' =
+        let the model word it: a list the user wants read, more tools needed)."""
+        if response is None or response.provider != LOCAL_PROVIDER or last is None or extra:
+            return ""
+        return own_sentence(*last) or ""
 
     async def _streamed_round(self, messages: list[dict[str, Any]], ladder: list[str], tools: list[dict[str, Any]],
                               tool_choice: str | None, turn: Any, chunker: SentenceChunker) -> AsyncIterator[Any]:
@@ -355,14 +405,14 @@ class Responder:
         try:
             return await self._ask(messages, refs, tools, None, turn,
                                    deadline_s=self._deadline("conversation.reword_deadline_s",
-                                                             ladders.REWORD_DEADLINE_S))
+                                                             ladders.REWORD_DEADLINE_S), local=False)
         except LLMError as err:
             log.info("rewording failed (%s); keeping the fast answer", err.kind)
             return None
 
     async def _ask(self, messages: list[dict[str, Any]], ladder: Any, tools: list[dict[str, Any]],
                    tool_choice: str | None, turn: Any, *, after: str | None = None,
-                   deadline_s: float | None = None) -> LLMResponse:
+                   deadline_s: float | None = None, local: bool | None = None) -> LLMResponse:
         """One non-streamed round. An answer with neither text nor a tool call
         is treated as a silent failure and the remaining rungs are asked once.
 
@@ -380,6 +430,8 @@ class Responder:
         kwargs = {"tools": tools, "tool_choice": tool_choice, "turn": turn, "timeout_s": self._llm_timeout(),
                   "rung_timeouts": ladders.rung_caps(), "deadline_s": deadline_s, "retry_transient": False,
                   "reasoning": str(self.app.config.get("conversation.reasoning", "minimal") or "minimal")}
+        if local is not None:
+            kwargs["local"] = local
         response = await self._chat_reserving(messages, refs, kwargs)
         if (response.text or "").strip() or response.tool_calls:
             return response
@@ -411,7 +463,8 @@ class Responder:
                 log.info("skipping %s: %.1f s left for the slow rungs", ref, left)
                 break
             try:
-                return await self.app.llm.chat(messages, ladder=[ref], **{**kwargs, "deadline_s": left})
+                # never the local brain here: the fast rungs after the head have not been asked yet
+                return await self.app.llm.chat(messages, ladder=[ref], **{**kwargs, "deadline_s": left, "local": False})
             except LLMError as err:
                 log.info("%s gave no answer (%s); next rung", ref, self.app.redact(str(err))[:160])
         left = float(deadline_s) - (time.monotonic() - started)

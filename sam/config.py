@@ -74,6 +74,30 @@ def _env_models(env: Callable[[str], str | None]) -> dict[str, str]:
     }
 
 
+# The local brain (sam/brain/llm_ollama.py, llm_local.py, local_server.py):
+# Ollama on this PC, the implicit last rung of every ladder. Measured
+# 2026-09-24 on CPU (the Radeon 890M crashes Ollama's Vulkan loader): qwen3:8b
+# answers a Sorani command in 2.6-9.2 s once warm (prompt cache), qwen3.5:4b in
+# 13-19 s (no prefix reuse); a cold first answer ~1.5 min (busy PC).
+LOCAL_BRAIN_DEFAULTS: dict[str, Any] = {
+    "llm.local.enabled": True,
+    "llm.local.model": "qwen3:8b",
+    "llm.local.fallback_models": ["qwen3.5:4b"],   # used when the main model is not installed
+    "llm.local.host": "127.0.0.1:11434",
+    "llm.local.ollama_exe": "",        # empty = SAM_HOME/tools/ollama*/ollama.exe, then the Ollama install / PATH
+    "llm.local.models_dir": "",        # empty = <data>/ollama-models when it exists, else Ollama's default
+    "llm.local.keep_alive": "5m",      # the model stays loaded a few minutes after use
+    "llm.local.num_ctx": 8192,         # SAM's prompt is ~4.1k tokens before history
+    "llm.local.max_tokens": 1024,      # 8 tok/s on CPU: an unbounded reply could run for minutes
+    "llm.local.timeout_s": 150,        # a cold first answer took 8 s load + 86 s prompt (busy PC)
+    "llm.local.temperature": 0.3,
+    "llm.local.think": False,          # Qwen3 would think before every tool call
+    "llm.local.vision": False,         # qwen3:8b has no vision; images never go to the local rung
+    "llm.local.stop_on_quit": True,    # only a server SAM started itself
+    "llm.local.prewarm": True,         # load the model while the cloud rests, before the user waits for it
+}
+
+
 def build_defaults(env: Callable[[str], str | None]) -> dict[str, Any]:
     """Every known setting with its default. Model refs are "provider:model".
 
@@ -117,6 +141,9 @@ def build_defaults(env: Callable[[str], str | None]) -> dict[str, Any]:
         "providers.groq.base_url": env("GROQ_BASE_URL") or "https://api.groq.com/openai/v1",
         "providers.openrouter.base_url": env("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1",
         "providers.omniroute.base_url": env("LITELLM_BASE_URL") or "http://127.0.0.1:20128/v1",
+        **LOCAL_BRAIN_DEFAULTS,
+        # --- no-AI fast path (brain/fastpath.py): common commands without a model ---
+        "brain.fastpath.enabled": True,
         # --- confirm (brain/confirm.py) ---
         "confirm.timeout_s": 20,
         # --- voice (sam/voice) ---
@@ -269,4 +296,5 @@ class Config:
         return {k: self.get(k) for k in sorted(keys)}
 
 
-__all__ = ["Config", "resolve_home", "parse_env_file", "build_defaults", "REPO_ROOT", "DB_FILENAME"]
+__all__ = ["Config", "resolve_home", "parse_env_file", "build_defaults", "REPO_ROOT", "DB_FILENAME",
+           "LOCAL_BRAIN_DEFAULTS"]

@@ -42,7 +42,9 @@ log = logging.getLogger("sam.llm")
 
 ErrorKind = Literal["rate_limit", "auth", "quota", "bad_request", "not_found", "server", "network",
                     "timeout", "unconfigured", "exhausted", "cancelled"]
-PROVIDERS = ("omniroute", "groq", "openrouter", "gemini")
+# "ollama" is the local brain (llm_ollama.py): never in a ladder setting, it is
+# the implicit last rung of every ladder (llm_local.py).
+PROVIDERS = ("omniroute", "groq", "openrouter", "gemini", "ollama")
 MIN_MAX_TOKENS = 4096
 
 
@@ -170,8 +172,12 @@ def split_ref(ref: str) -> tuple[str, str]:
     return provider, model
 
 
-class LLMClient:
-    """Ladder-based client. ``backends`` may be injected (tests: fakes)."""
+from .llm_local import LocalRung  # noqa: E402 - imports nothing from here at import time
+
+
+class LLMClient(LocalRung):
+    """Ladder-based client. ``backends`` may be injected (tests: fakes).
+    After the ladder, the local brain answers when allowed (``local``; llm_local.py)."""
 
     def __init__(self, config: Any, secrets: Any, *, db: Any = None, timing: Any = None, bus: Any = None,
                  backends: dict[str, Backend] | None = None) -> None:
@@ -413,7 +419,8 @@ class LLMClient:
                    max_tokens: int | None = None, temperature: float | None = None, reasoning: str | None = None,
                    json_schema: dict[str, Any] | None = None, timeout_s: float | None = None,
                    turn: Any = None, rung_timeouts: dict[str, float] | None = None,
-                   deadline_s: float | None = None, retry_transient: bool = True) -> LLMResponse:
+                   deadline_s: float | None = None, retry_transient: bool = True,
+                   local: bool | None = None) -> LLMResponse:
         """One completion through the ladder. Raises LLMError('exhausted').
 
         ``rung_timeouts`` ({ref or provider: seconds}) caps single rungs below
@@ -424,9 +431,24 @@ class LLMClient:
         already used 3/4 of its own cap.
         ``retry_transient=False`` moves on after a 5xx/network error instead of
         asking the same rung again (a spoken turn has other rungs; Gemini
-        direct answered 503 twice in a row, 3.9 s, in the repair probe)."""
+        direct answered 503 twice in a row, 3.9 s, in the repair probe).
+        ``local``: after an exhausted ladder the local brain answers (its own
+        timeout, not the deadline); False skips it (llm_local.py)."""
         req = self._request(messages, tools=tools, tool_choice=tool_choice, max_tokens=max_tokens,
                             temperature=temperature, reasoning=reasoning, json_schema=json_schema, timeout_s=timeout_s)
+        try:
+            response = await self._ladder_chat(req, ladder, turn, rung_timeouts, deadline_s, retry_transient)
+        except LLMError as err:
+            if err.kind == "exhausted" and self._local_allowed(local, req):
+                return await self._local_chat(req, turn, err)
+            raise
+        self.note_cloud_answer(response)
+        return response
+
+    async def _ladder_chat(self, req: LLMRequest, ladder: str | list[str], turn: Any,
+                           rung_timeouts: dict[str, float] | None, deadline_s: float | None,
+                           retry_transient: bool) -> LLMResponse:
+        """The cloud ladder of ``chat`` (every rung except the local brain)."""
         attempts: list[str] = []
         ends = time.monotonic() + float(deadline_s) if deadline_s else None
         for ref, provider, model, backend in self._candidates(self.ladder(ladder), attempts):
@@ -508,10 +530,12 @@ class LLMClient:
     async def stream(self, messages: list[dict[str, Any]], *, ladder: str | list[str] = "chat",
                      tools: list[dict[str, Any]] | None = None, tool_choice: str | None = None,
                      max_tokens: int | None = None, temperature: float | None = None, reasoning: str | None = None,
-                     timeout_s: float | None = None, turn: Any = None) -> AsyncIterator[LLMChunk]:
+                     timeout_s: float | None = None, turn: Any = None,
+                     local: bool | None = None) -> AsyncIterator[LLMChunk]:
         """Stream text deltas (kind='text'), then tool calls, then 'done' with
         the full LLMResponse. Falls back to the next rung only if the failure
-        happens before the first chunk was yielded."""
+        happens before the first chunk was yielded; after the ladder, to the
+        local brain (``local`` as in ``chat``)."""
         req = self._request(messages, tools=tools, tool_choice=tool_choice, max_tokens=max_tokens,
                             temperature=temperature, reasoning=reasoning, json_schema=None, timeout_s=timeout_s)
         attempts: list[str] = []
@@ -541,6 +565,7 @@ class LLMClient:
                             self._count(provider, model, current, usage=response.usage)
                             self._record(turn, response)
                             self._succeeded(ref)
+                            self.note_cloud_answer(response)
                         yielded = True
                         yield chunk
                     return
@@ -566,7 +591,11 @@ class LLMClient:
                     continue
                 self._on_error(provider, ref, err, elapsed_s)
                 break
-        raise LLMError("exhausted", "; ".join(attempts) or "no model configured", attempts=attempts)
+        exhausted = LLMError("exhausted", "; ".join(attempts) or "no model configured", attempts=attempts)
+        if not self._local_allowed(local, req):
+            raise exhausted
+        async for chunk in self._local_stream(req, turn, exhausted):
+            yield chunk
 
     def _record(self, turn: Any, response: LLMResponse) -> None:
         extra = {"model": response.model_ref}

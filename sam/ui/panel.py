@@ -33,7 +33,7 @@ PAGES = ("chat", "strategies", "monitor", "activity", "settings")
 NAV_ICONS = {"chat": "chat", "strategies": "strategies", "monitor": "monitor", "activity": "activity",
              "settings": "settings"}
 # ComponentStatus.component -> sidebar row
-COMPONENT_ROWS = {"voice": "voice", "live": "voice", "cascade": "voice", "omniroute": "omniroute",
+COMPONENT_ROWS = {"voice": "voice", "live": "voice", "cascade": "voice", "brain": "brain", "omniroute": "omniroute",
                   "tradingview": "tradingview", "mt5": "mt5"}
 
 
@@ -130,6 +130,7 @@ class ComponentRow(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 2, 6, 2)
         lay.setSpacing(8)
+        self.key = key
         self.dot = StatusDot("unknown", 8)
         self.name = QLabel(tr(f"comp.{key}"))
         self.name.setObjectName("Faint")
@@ -142,7 +143,10 @@ class ComponentRow(QWidget):
 
     def set_state(self, state: str, detail: str = "") -> None:
         self.dot.set_state(state)
-        self.state_label.setText(tr_or(f"status.{state}", state))
+        # The brain row says WHICH brain answers: the cloud models or the local
+        # Ollama model (ComponentStatus("brain", ..., "local: ollama:qwen3:8b")).
+        local = self.key == "brain" and str(detail).startswith("local")
+        self.state_label.setText(tr("status.local_brain") if local else tr_or(f"status.{state}", state))
         self.setToolTip(detail)
 
 
@@ -188,7 +192,7 @@ class Panel(QWidget):
             side.addWidget(button)
         side.addStretch(1)
         self.components: dict[str, ComponentRow] = {}
-        for key in ("voice", "omniroute", "tradingview", "mt5"):
+        for key in ("voice", "brain", "omniroute", "tradingview", "mt5"):
             comp = ComponentRow(key)
             self.components[key] = comp
             side.addWidget(comp)

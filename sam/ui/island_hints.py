@@ -12,7 +12,10 @@ The voice package now publishes ``VoiceNotice`` events (sam/voice/notices.py):
   quota is the reason);
 - ``enroll``  -- voice enrollment progress / result;
 - ``voiceprint`` -- the voiceprint exists but its model cannot run, so every
-  nearby voice is accepted until the enrollment is repeated.
+  nearby voice is accepted until the enrollment is repeated;
+- ``local`` / ``cloud`` -- the brain switched to the local Ollama model (every
+  cloud rung resting/offline; sam/brain/llm_local.py) or back. While on the
+  local brain the idle/thinking status word is «مێشکی ناوخۆیی».
 
 Every notice is shown once as the caption line. A ``models`` notice also
 replaces the idle status word with «سنووری ئەمڕۆ پڕە» until its reset time
@@ -26,10 +29,12 @@ import time
 from typing import Any
 
 STICKY_STATES = frozenset({"idle", "sleeping", "error"})
+LOCAL_STATES = frozenset({"idle", "sleeping", "thinking"})
 MODELS_WORD = "سنووری ئەمڕۆ پڕە"
+LOCAL_WORD = "مێشکی ناوخۆیی"
 DEFAULT_STICKY_S = 600.0
 TONES = {"closed": "system", "ignored": "system", "enroll": "system", "quota": "alert", "models": "danger",
-         "voiceprint": "alert"}
+         "voiceprint": "alert", "local": "alert", "cloud": "system"}
 
 
 class IslandHints:
@@ -38,6 +43,7 @@ class IslandHints:
         self._sticky_text = ""
         self._sticky_until = 0.0
         self.last_kind = ""
+        self.local_brain = False
 
     def on_notice(self, event: Any) -> tuple[str, str] | None:
         """(caption text, tone) to show for a ``VoiceNotice``-like event."""
@@ -46,6 +52,10 @@ class IslandHints:
         if not text:
             return None
         self.last_kind = kind
+        if kind == "local":
+            self.local_brain = True
+        elif kind == "cloud":
+            self.local_brain = False
         if kind == "models":
             until = float(getattr(event, "until", 0.0) or 0.0)
             self._sticky_text = MODELS_WORD
@@ -65,6 +75,8 @@ class IslandHints:
             if self._clock() < self._sticky_until:
                 return self._sticky_text
             self.clear_sticky()
+        if self.local_brain and state in LOCAL_STATES:
+            return LOCAL_WORD
         return None
 
 
@@ -72,4 +84,4 @@ def is_notice(event: Any) -> bool:
     return type(event).__name__ == "VoiceNotice" and hasattr(event, "text_ckb")
 
 
-__all__ = ["IslandHints", "is_notice", "MODELS_WORD"]
+__all__ = ["IslandHints", "is_notice", "MODELS_WORD", "LOCAL_WORD"]

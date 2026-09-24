@@ -574,7 +574,8 @@ class GeminiBackend:
 
 
 def default_backends(config: Any, secrets: Any) -> dict[str, Any]:
-    """The four providers, reading URLs from settings and keys from Secrets."""
+    """The four cloud providers (URLs from settings, keys from Secrets) and
+    the local Ollama brain (no key; paths from settings ``llm.local.*``)."""
     return {
         "omniroute": OpenAICompatBackend(
             "omniroute", lambda: config.get("providers.omniroute.base_url"),
@@ -585,7 +586,15 @@ def default_backends(config: Any, secrets: Any) -> dict[str, Any]:
             "openrouter", lambda: config.get("providers.openrouter.base_url"),
             lambda: secrets.get("openrouter_api_key"), extra_headers={"X-Title": "SAM"}),
         "gemini": GeminiBackend(lambda: secrets.get("gemini_api_key")),
+        # The local brain: the implicit last rung of every ladder (llm_local.py).
+        "ollama": _local_backend(config),
     }
+
+
+def _local_backend(config: Any) -> Any:
+    from .llm_ollama import make_backend
+
+    return make_backend(config)
 
 
 __all__ = ["OpenAICompatBackend", "GeminiBackend", "default_backends", "classify_status"]

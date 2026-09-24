@@ -90,7 +90,7 @@ def tool_sentence(name: str, args: dict[str, Any] | None, result: dict[str, Any]
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     good = bool(result.get("ok"))
     for key in ("declined", "blocked", "timeout", "cancelled"):
-        if data.get(key):
+        if data.get(key) is True:   # the registry's flags; cancel_alert's data.cancelled is a COUNT
             return _SPECIAL[key]
     own = str(data.get("summary_ckb") or "").strip()
     if own and is_arabic_script(own):
@@ -110,4 +110,57 @@ def tool_sentence(name: str, args: dict[str, Any] | None, result: dict[str, Any]
     return template[0 if good else 1].format(name=_app_name(args))
 
 
-__all__ = ["tool_sentence", "DONE", "NOT_DONE", "NO_MODEL_YET", "NO_RESULTS"]
+_DIGITS_CKB = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+_COUNT_CKB = {1: "یەک", 2: "دوو", 3: "سێ", 4: "چوار", 5: "پێنج", 6: "شەش", 7: "حەوت", 8: "هەشت", 9: "نۆ",
+              10: "دە"}
+
+
+def alerts_sentence(alerts: list[dict[str, Any]]) -> str:
+    """The active alerts read out in Sorani (list_alerts' own ``what_ckb``
+    lines). qwen3:8b worded an empty list as «هیچ ئاگادارکردنەوەکەی نەدەرە. بۆ
+    چی نەدەرە؟» in the live run (2026-09-25), so no model words this."""
+    if not alerts:
+        return "هیچ ئاگادارکردنەوەیەکی چالاکت نییە."
+    count = len(alerts)
+    spoken = _COUNT_CKB.get(count) or str(count).translate(_DIGITS_CKB)
+    items = [str(a.get("what_ckb") or "").strip() for a in alerts[:3] if isinstance(a, dict)]
+    items = [i for i in items if i]
+    text = f"{spoken} ئاگادارکردنەوەی چالاکت هەیە"
+    if items:
+        text += ": " + "؛ ".join(items)
+    if count > 3:
+        text += f"؛ و {str(count - 3).translate(_DIGITS_CKB)}ی تر"
+    return text + "."
+
+
+# Results the user wants READ (a list, a page, what SAM remembers): a template
+# would only say «I have it but cannot read it now», so a model words these.
+_READ_TOOLS = frozenset({"list_alerts", "strategy_list", "strategy_get", "recall", "chart_state", "screen_look",
+                         "web_search", "fetch_page", "theory_info", "more_tools", "files", "run_powershell"})
+
+
+def own_sentence(name: str, args: dict[str, Any] | None, result: dict[str, Any] | None) -> str | None:
+    """The tool's own honest Sorani sentence when that is a complete answer
+    (the local brain then skips its wording round), else None."""
+    if not result:
+        return None
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    for key in ("declined", "blocked", "timeout", "cancelled"):
+        if data.get(key) is True:   # the registry's flags; cancel_alert's data.cancelled is a COUNT
+            return _SPECIAL[key]
+    if name == "list_alerts" and result.get("ok") and str((args or {}).get("status") or "active") == "active":
+        return alerts_sentence(data.get("alerts") or [])
+    if name in _READ_TOOLS or (name == "window_control" and str((args or {}).get("action")) == "list"):
+        return None
+    own = str(data.get("summary_ckb") or "").strip()
+    if own and is_arabic_script(own):
+        return own
+    summary = str(result.get("summary") or "").strip()
+    if summary and len(summary) <= 240 and is_arabic_script(summary):
+        return summary
+    if result.get("ok") and (name in _TEMPLATES or name == "window_control"):
+        return tool_sentence(name, args, result)
+    return None
+
+
+__all__ = ["tool_sentence", "own_sentence", "alerts_sentence", "DONE", "NOT_DONE", "NO_MODEL_YET", "NO_RESULTS"]

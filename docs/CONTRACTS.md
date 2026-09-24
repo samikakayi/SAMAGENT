@@ -1010,3 +1010,84 @@ Settings has a card «گوێگرتن و دەنگی من» (`sam/ui/voice_profile
 speech is ignored, «تەنها دەنگی من», sensitivity, «ناساندنی دەنگی من», «سڕینەوەی دەنگی من»); the enrollment
 dialog also opens when the user says «دەنگم بناسە». `CascadeVoice.submit_utterance(..., meta=)`,
 `CascadeVoice.reply_active`.
+
+---------------------------------------------------------------------------------------------------
+
+## 10. Local brain, no-AI fast path (brain, 2026-09-25)
+
+The user's decisions after the first real test: every free quota was used up in one evening, Gemini Live
+heard «سڵاو سام چۆنی» as Korean (answered in English, then Italian), and an A/B listening test preferred
+KurdishTTS's voice. Compatible additions; everything above still holds.
+
+**Local brain = the implicit LAST rung of every ladder.** Provider `ollama` (in `llm.PROVIDERS`, never in a
+ladder setting). `LLMClient.chat(..., local=None)` / `stream(..., local=None)`: the cloud ladder runs exactly as
+before; only when it is exhausted (every rung resting, failing, over its cap, unconfigured, offline, or cut by
+the round deadline) the local model answers, with its OWN timeout `llm.local.timeout_s` (150 s: the round's
+deadline is spent and a cold answer takes ~1.5 min). `local=False` where a local answer is worse than none:
+`Responder._reword`, the slow head rungs in `_chat_reserving`, conversation summaries, fact extraction.
+Requests with images never go local (qwen3:8b has no vision). A local failure of kind network/not_found rests
+`ollama:*` 120 s. Mixin `sam/brain/llm_local.py` (`LocalRung`): `brain_mode` ("cloud"|"local", who answered
+last), `local_backend()`, `local_ready()`, `cloud_usable(refs)`, `await local_model()` (`llm.local.model`, else
+the first installed `llm.local.fallback_models`), `prewarm_local(messages, tools)` (one task at a time),
+`local_status()`, `note_cloud_answer(resp)`. Usage is counted as provider `ollama`.
+
+**Backend** `sam/brain/llm_ollama.py` (`OllamaBackend`, native `/api/chat`: `think: false`, `keep_alive`,
+`options.num_ctx`/`num_predict` (capped by `llm.local.max_tokens`), tools in OpenAI shape, NDJSON streaming,
+`loaded()` = `/api/ps`, `warm(model, messages, tools)`; `aclose()` stops the server only if SAM started it).
+`split_context(system)`: the persona now puts its stable text first (fixed rules + tool list) and the per-turn
+part after `persona.CONTEXT_HEADING` ("Current context (changes every turn):" + time, user name, facts,
+strategies, conversation); the backend moves that part in front of the LAST user message so the stable prefix
+and the tool schemas stay in Ollama's prompt cache. **Server** `sam/brain/local_server.py` (`OllamaServer`):
+started on demand only when nothing listens on `llm.local.host` (SAM v1's `ollama serve` on 11434 is shared,
+never stopped), `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` (never DETACHED_PROCESS), env OLLAMA_HOST /
+OLLAMA_MODELS, never OLLAMA_IGPU_ENABLE, log `%LOCALAPPDATA%\SAM2\logs\ollama.log`; stopped (process tree) on
+quit if SAM started it. Settings (`sam/config.py` `LOCAL_BRAIN_DEFAULTS`): `llm.local.enabled` True,
+`.model` "qwen3:8b", `.fallback_models` ["qwen3.5:4b"], `.host` "127.0.0.1:11434", `.ollama_exe` "" (=
+SAM_HOME/tools/ollama*/ollama.exe, then %LOCALAPPDATA%\Programs\Ollama, PATH), `.models_dir` "" (=
+<data>/ollama-models when it exists), `.keep_alive` "5m", `.num_ctx` 8192, `.max_tokens` 1024, `.timeout_s` 150,
+`.temperature` 0.3, `.think` False, `.vision` False, `.stop_on_quit` True, `.prewarm` True.
+
+Measured on this PC (2026-09-24/25, CPU; ~2 GB RAM free while other work ran), SAM's real voice prompt and the
+compact core tools (4.1-4.6k prompt tokens), 14 Sorani commands (lead scratchpad `sam2/localbrain`):
+
+| model | load | generate | first prompt | next prompts | per command (warm) | right tool |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3:8b | 8.3 s | 8.4 tok/s | 86 s (48 tok/s) | 1-2.7 s (prefix cache) | 2.6-9.2 s | 12/14 |
+| qwen3.5:4b | 6.5 s | 14-16 tok/s | 52 s | 12-16 s (no prefix reuse) | 13-19 s | 13/14 |
+
+GPU: Ollama 0.33.1 drops the Radeon 890M (integrated) by default; with `OLLAMA_IGPU_ENABLE=1` llama-server
+crashed fitting either model to Vulkan memory (exit 0xe06d7363, "AMD driver is too old"), so CPU only.
+Default qwen3:8b (prefix cache 3-5x faster per turn, natural «سڵاو، فەرموو. چۆنی؟»; its two misses were
+«نۆتپاد/کرۆم بکەرەوە» answered as text, which the fast path answers first). Live end to end with SAM's own
+code (`acceptance/brain_local.py`, no cloud key): SAM started `ollama serve` on 11436 hidden, the warm-up took
+100 s, then warm turns 3.7-12.8 s (tool turns) with the right tool 5/6, small talk 5.8 s, a free question
+22.7 s (weak Sorani); quitting stopped the server (port closed). Known limit: qwen3:8b may claim an action it
+did not call a tool for («نۆتپاد ئامادەیە» with no tool); common commands never reach it (fast path).
+
+**Conversation on the local brain** (`responder.py`, `conversation.py`): after a LOCAL tool call the tool's own
+Sorani result is the answer (`outcome.own_sentence`; no second 3-10 s local round; list_alerts has a fixed
+sentence `outcome.alerts_sentence`; read-type tools are still worded by the model). Voice: when no cloud rung
+can answer and the model is not loaded, the turn first says `LOCAL_ACK_CKB` «یەک چرکە، بە مێشکی ناوخۆیی
+بیری لێ دەکەمەوە.». `Conversation.prewarm_local_brain(mode)` runs on `VoiceState("listening")` when no cloud
+rung is usable (loads the model and reads the stable prompt while the user speaks).
+**Who answers** is published once per switch: `ComponentStatus("brain", "degraded", "local: ollama:<model>")` /
+`("brain", "ok", "cloud: <ref>")` and `VoiceNotice(kind="local"|"cloud", text_ckb=...)`. UI (small additions):
+`island_hints` shows «مێشکی ناوخۆیی» as the idle/sleeping/thinking status word while local; the panel sidebar
+has a «مێشک» row (`COMPONENT_ROWS["brain"]`, label «مێشکی ناوخۆیی» when local); `status_seed` reports it.
+
+**No-AI fast path** (`sam/brain/intents.py` matcher, `sam/brain/fastpath.py` runner; setting
+`brain.fastpath.enabled` True). `Responder.respond_stream` (typed text and the cascade) first asks
+`fastpath.intent_for(app, text)`; a match runs ONE tool through `app.tools.dispatch` (risk, confirmations,
+timings, taint as usual) and answers with the tool's own Sorani result: no model, no quota, milliseconds.
+Intents: price (get_price), open_tradingview (tv_open), open_app (known aliases from `hands.aliases`, generic
+ones excluded), set_chart (tv_set_chart symbol/timeframe), analyze (analyze_market draw full, vision False),
+draw_levels (analyze_market draw levels on the chart's symbol), clear_drawings, list_alerts, cancel_alerts
+(all / a number), stop (stop_all). Precision rule: every word must be consumed by one intent's grammar;
+questions, negations, past tense, conditions, «و»/"and" joining actions, orders and unknown words go to the
+model. Tolerates KurdishTTS STT spellings («نەخنەشکی زێڕ چەندە»), Arabic letters, word-final ه, clitics
+(«ترەیدینگ ڤیوم بۆ بکەرەوە»). Corpus `tests/fastpath_corpus.py`: 290 labelled rows (146 commands, 144
+non-commands): precision 1.00, recall 0.99; the 67 held-out rows written before tuning scored precision 1.00,
+recall 0.87 on the first run (0.95 after three fixes). Usage counted as provider `fastpath`, model = intent.
+Test helper `brain_app(..., fastpath=False)`: model-loop tests keep the fast path off.
+`outcome.tool_sentence` fix: `data.cancelled` means "stopped" only when it is `True` (cancel_alert's count made
+«هەموو ئاگادارکردنەوەکان هەڵبوەشێنەوە» answer «ڕاگیرا.»).

@@ -173,13 +173,17 @@ FAKE_TOOLS = (fake_open_app, fake_tv_open, fake_screen_look, fake_slow_job, fake
 
 def brain_app(make_app: Callable[..., Any], steps: list[Step] | None = None, *, default: Step = "باشە.",
               tools: tuple[Any, ...] = FAKE_TOOLS, modules: tuple[str, ...] = ("memory", "persona", "worker",
-                                                                               "conversation")) -> tuple[Any, ScriptedBackend]:
+                                                                               "conversation"),
+              fastpath: bool = False) -> tuple[Any, ScriptedBackend]:
     """An App on a temp home with the brain modules registered and a scripted
-    'groq' backend that serves every ladder (other providers unconfigured)."""
+    'groq' backend that serves every ladder (other providers unconfigured).
+    The no-AI fast path is off unless asked for: these tests drive the model
+    loop with the user's common commands (tests/test_brain_fastpath.py covers it)."""
     import importlib
 
     backend = ScriptedBackend(steps, default=default)
     app = make_app(backends={"groq": backend})
+    app.config.set("brain.fastpath.enabled", fastpath)
     for name in modules:
         importlib.import_module(f"sam.brain.{name}").register(app)
     for fn in tools:
