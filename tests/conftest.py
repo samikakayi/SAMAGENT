@@ -1,148 +1,104 @@
+"""Shared fixtures. Tests never use the network, speakers, the real SAM_HOME
+or live apps; every App gets a temp home and an empty environment."""
+
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+from typing import Any, AsyncIterator
 
 import pytest
-from fastapi.testclient import TestClient
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from sam_backend.app import create_app  # noqa: E402
-from sam_backend.config import Settings  # noqa: E402
-from sam_backend.models import AssistantTurn, ToolCall  # noqa: E402
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from sam.brain.llm import LLMChunk, LLMError, LLMRequest, LLMResponse, ToolCall  # noqa: E402
 
-@pytest.fixture(autouse=True, scope="session")
-def supported_runtime():
-    """Tests describe SAM running the way it is supported: not elevated.
-
-    A Windows CI runner is an Administrator, and `Settings.prepare()` rightly
-    refuses to start there, so every test that builds an application would fail
-    for a reason that has nothing to do with what it is testing. This states the
-    runtime being described rather than weakening the guard: the tests that own
-    that guard set this back to True themselves and still prove the refusal.
-    """
-    import sam_backend.config as config
-
-    # Session scope: module-scoped fixtures build applications before any
-    # function-scoped patch would apply.
-    patch = pytest.MonkeyPatch()
-    patch.setattr(config, "is_elevated_windows_process", lambda: False)
-    yield
-    patch.undo()
+# Fake credentials with the real shapes (never real keys).
+FAKE_GROQ = "gsk_" + "T3st" * 10
+FAKE_GEMINI = "AIza" + "FakeKey0123456789abcdefXYZ"
+FAKE_GEMINI_AQ = "AQ." + "Ab8RN6Kfake_auth_key-0123456789xyz"
+FAKE_OPENROUTER = "sk-or-v1-" + "0f" * 20
 
 
-class _SilentStream:
-    """Takes audio the way a PortAudio output stream does, and plays none of it."""
+class FakeBackend:
+    """Scripted backend: ``script`` maps model -> list of results/exceptions
+    returned in order (last one repeats)."""
 
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
+    def __init__(self, provider: str, script: dict[str, list[Any]] | None = None, configured: bool = True) -> None:
+        self.provider = provider
+        self.script = script or {}
+        self._configured = configured
+        self.calls: list[tuple[str, LLMRequest]] = []
 
-    def start(self):
+    def configured(self) -> bool:
+        return self._configured
+
+    def _next(self, model: str) -> Any:
+        items = self.script.get(model) or [f"reply from {self.provider}:{model}"]
+        index = sum(1 for m, _ in self.calls if m == model) - 1
+        return items[min(index, len(items) - 1)]
+
+    async def complete(self, model: str, req: LLMRequest) -> LLMResponse:
+        self.calls.append((model, req))
+        item = self._next(model)
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, LLMResponse):
+            return item
+        return LLMResponse(text=str(item), provider=self.provider, model=model, usage={"tokens_in": 3, "tokens_out": 5},
+                           total_ms=1.0)
+
+    async def stream(self, model: str, req: LLMRequest) -> AsyncIterator[LLMChunk]:
+        self.calls.append((model, req))
+        item = self._next(model)
+        if isinstance(item, BaseException):
+            raise item
+        text = str(item)
+        for word in text.split(" "):
+            yield LLMChunk(kind="text", text=word + " ")
+        yield LLMChunk(kind="done", response=LLMResponse(text=text, provider=self.provider, model=model, total_ms=1.0))
+
+    async def list_models(self) -> list[str]:
+        return list(self.script)
+
+    async def aclose(self) -> None:
         pass
 
-    def write(self, data):
-        return False
 
-    def stop(self):
-        pass
-
-    def abort(self):
-        pass
-
-    def close(self):
-        pass
+def rate_limited(provider: str, model: str, retry_after: float | None = None) -> LLMError:
+    return LLMError("rate_limit", "RESOURCE_EXHAUSTED", provider=provider, model=model, status=429,
+                    retry_after=retry_after)
 
 
-class _SilentSapiVoice:
-    """A Windows voice that finishes at once without a sound."""
-
-    def __init__(self):
-        from types import SimpleNamespace
-
-        self.Rate = 0
-        self.Volume = 100
-        self.Status = SimpleNamespace(RunningState=1)
-
-    def Speak(self, text, flags=0):  # noqa: N802 - the COM method's name
-        return 1
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    path = tmp_path / "home"
+    (path / "data").mkdir(parents=True)
+    return path
 
 
-@pytest.fixture(autouse=True)
-def silent_speakers(monkeypatch):
-    """No test makes a sound.
+@pytest.fixture
+def make_app(home: Path):
+    """Factory: ``make_app(backends=..., env_text=...)`` -> App on a temp home."""
+    from sam.app import App
 
-    The suite runs on the machine SAM speaks from, with its owner in the
-    room, and `service.speak("Gold is trading at 408.")` used to reach the
-    real Windows voice. Every speaker path is swapped for one that accepts
-    audio and plays nothing; a test that inspects playback installs its own.
-    """
-    import sam_backend.voice as voice
+    created: list[Any] = []
 
-    monkeypatch.setattr(voice, "_output_stream", lambda **kwargs: _SilentStream(**kwargs))
-    monkeypatch.setattr(voice.TextToSpeech, "_sapi_speaker", lambda self: _SilentSapiVoice())
-    try:
-        import sounddevice
-    except Exception:  # noqa: BLE001 - no PortAudio, nothing to guard
-        return
+    def factory(backends: dict[str, Any] | None = None, env_text: str = "") -> Any:
+        if env_text:
+            (home / ".env").write_text(env_text, encoding="utf-8")
+        app = App(home, environ={}, llm_backends=backends if backends is not None else {})
+        created.append(app)
+        return app
 
-    def refuse(*args, **kwargs):
-        raise AssertionError("A test tried to play audio through the real speakers.")
-
-    monkeypatch.setattr(sounddevice, "play", refuse)
-    monkeypatch.setattr(sounddevice, "OutputStream", refuse)
+    yield factory
+    for app in created:
+        app.close()
 
 
-class FakeAdapter:
-    async def list_models(self):
-        return [{"id": "fake", "name": "fake", "provider": "ollama"}]
-
-    async def complete(self, messages, tools, model):
-        if messages and messages[-1].get("role") == "tool":
-            return AssistantTurn("The approved action finished." if "denied" not in messages[-1].get("content", "").lower() else "I respected the denial.")
-        last_user = next((message.get("content", "") for message in reversed(messages) if message.get("role") == "user"), "")
-        if last_user.startswith("overwrite "):
-            _, path, content = last_user.split(" ", 2)
-            return AssistantTurn("I need approval to overwrite that file.", [ToolCall("call_overwrite", "write_file", {"path": path, "content": content})])
-        if last_user == "run python":
-            return AssistantTurn("I need approval to run Python.", [ToolCall("call_python", "run_python", {"code": "print('ran')"})])
-        if last_user == "read secret":
-            return AssistantTurn("I need approval to access that sensitive file.", [ToolCall("call_secret", "read_file", {"path": ".env"})])
-        if last_user.startswith("create "):
-            _, path, content = last_user.split(" ", 2)
-            return AssistantTurn("Creating it.", [ToolCall("call_create", "write_file", {"path": path, "content": content})])
-        return AssistantTurn(f"SAM heard: {last_user}")
-
-
-class FakeRegistry:
-    def __init__(self):
-        self.adapter = FakeAdapter()
-
-    def get(self, provider):
-        return self.adapter
-
-
-@pytest.fixture()
-def settings(tmp_path: Path) -> Settings:
-    return Settings(
-        project_root=tmp_path,
-        workspace_root=tmp_path / "workspace",
-        data_dir=tmp_path / "data",
-        default_provider="ollama",
-        default_model="fake",
-        cors_origins=["http://127.0.0.1:8765"],
-    )
-
-
-@pytest.fixture()
-def app(settings: Settings):
-    return create_app(settings, FakeRegistry())
-
-
-@pytest.fixture()
-def client(app):
-    with TestClient(app) as test_client:
-        yield test_client
+__all__ = ["FakeBackend", "rate_limited", "FAKE_GROQ", "FAKE_GEMINI", "FAKE_GEMINI_AQ", "FAKE_OPENROUTER", "ToolCall"]
