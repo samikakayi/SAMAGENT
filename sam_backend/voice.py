@@ -11,15 +11,22 @@ Sorani utterance be silently mistranscribed as Arabic or Persian.
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures
+import itertools
+import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from . import sorani as sorani_speech
 from .contracts import CapabilityState
+
+logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16_000
 FRAME_MS = 30
@@ -298,6 +305,293 @@ class WhisperSTT:
         }
 
 
+# --- Speaker output -----------------------------------------------------------
+
+# Measured on this machine's default output (MME, a USB headset; 22.05 kHz
+# mono like KurdishTTS; digital silence only): playing a reply as 200 ms slices
+# with sounddevice.play()+wait() per slice cost 466 ms of wall time per slice --
+# 162 ms to open and start a stream, 309 ms to wait it out -- so 5.0 s of
+# speech took 11.8 s: a fifth of a second of voice, then about a quarter of a
+# second of nothing, over and over. Each slice also ended in CallbackAbort,
+# which discards queued buffers, and PortAudio's clock had 168 ms of the slice
+# still queued at that moment. One stream written in 100 ms blocks played the
+# same 5.0 s in 5.4 s -- one 160 ms open, one 200 ms drain, no underflows.
+PLAYBACK_BLOCK_SECONDS = 0.1
+# 'high' measured 183 ms of buffering here against 91 ms for 'low'. The margin
+# is for a busy machine, and it costs barge-in nothing: abort() drops whatever
+# is queued (11 ms, measured), so only the block being written delays a stop --
+# 86 ms from the cancel to noticing it with 100 ms blocks, against 178 ms with
+# 200 ms blocks and a slice every 466 ms before.
+PLAYBACK_LATENCY = "high"
+
+
+class SpeakerQueue:
+    """Whose turn it is on the speakers: one voice at a time, first come first served.
+
+    sounddevice.play() keeps one module-global stream and stops whatever it
+    was playing when it is called again, so two replies spoken at once -- a
+    hands-free turn and /api/voice/speak, say -- cut each other off every
+    slice and came out interleaved. A later utterance waits for the earlier
+    one rather than cutting it off: every caller gets its whole sentence, in
+    the order asked, and cutting speech short stays barge-in's job alone.
+    A waiting utterance still honours its own cancel, so a barge-in empties
+    the queue instead of letting the next reply start where the last stopped.
+    """
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._line: collections.deque[object] = collections.deque()
+
+    def enter(self, cancel: Callable[[], bool] | None = None) -> object | None:
+        """Wait for a turn. None when `cancel` fired while waiting."""
+        ticket = object()
+        with self._changed:
+            self._line.append(ticket)
+            try:
+                while self._line[0] is not ticket:
+                    if cancel is not None and cancel():
+                        self._line.remove(ticket)
+                        self._changed.notify_all()
+                        return None
+                    self._changed.wait(0.05)
+            except BaseException:
+                if ticket in self._line:
+                    self._line.remove(ticket)
+                self._changed.notify_all()
+                raise
+        return ticket
+
+    def leave(self, ticket: object) -> None:
+        with self._changed:
+            if ticket in self._line:
+                self._line.remove(ticket)
+            self._changed.notify_all()
+
+    @property
+    def busy(self) -> bool:
+        with self._changed:
+            return bool(self._line)
+
+
+# Process-wide, because the output device is: every VoiceService and every
+# engine (Sorani, Piper, SAPI) takes its turn here.
+SPEAKERS = SpeakerQueue()
+
+
+def _output_stream(**kwargs: Any) -> Any:
+    """Open a PortAudio output stream. Its own function so tests can play in silence."""
+    import sounddevice
+
+    return sounddevice.OutputStream(**kwargs)
+
+
+def _output_defaults(device: int | None) -> tuple[int, int]:
+    """The output device's own sample rate and channel count."""
+    import sounddevice
+
+    info = sounddevice.query_devices(device, "output")
+    return int(info["default_samplerate"]), int(info["max_output_channels"])
+
+
+def _open_output(rate: int, channels: int, device: int | None) -> tuple[Any, int, int]:
+    """A stream at the audio's own rate and channels, or at the device's if it refuses those.
+
+    MME resamples anything it is given; a stricter host API can reject 22.05 kHz
+    or a channel count, and then the audio is converted rather than not played.
+    """
+    try:
+        stream = _output_stream(samplerate=rate, channels=channels, dtype="float32",
+                                device=device, latency=PLAYBACK_LATENCY)
+        return stream, rate, channels
+    except Exception as refused:  # noqa: BLE001 - retried once at the device's format
+        try:
+            device_rate, device_channels = _output_defaults(device)
+        except Exception:  # noqa: BLE001
+            raise refused from None
+        fitted = max(1, min(channels, device_channels))
+        if (device_rate, fitted) == (rate, channels):
+            raise
+        try:
+            stream = _output_stream(samplerate=device_rate, channels=fitted, dtype="float32",
+                                    device=device, latency=PLAYBACK_LATENCY)
+        except Exception:  # noqa: BLE001 - the first refusal is the one that explains it
+            raise refused from None
+        return stream, device_rate, fitted
+
+
+def _as_frames(chunk: Any) -> Any:
+    import numpy
+
+    array = numpy.asarray(chunk, dtype=numpy.float32)
+    return array.reshape(-1, 1) if array.ndim == 1 else array
+
+
+def _fit_audio(frames: Any, from_rate: int, to_rate: int, to_channels: int) -> Any:
+    """Convert (samples, channels) audio to the stream's rate and channel count."""
+    import numpy
+
+    if frames.shape[1] != to_channels:
+        mono = frames.mean(axis=1, keepdims=True)
+        frames = mono if to_channels == 1 else numpy.repeat(mono, to_channels, axis=1)
+    if from_rate != to_rate:
+        frames = numpy.stack(
+            [resample_mono(frames[:, channel], from_rate, to_rate) for channel in range(frames.shape[1])],
+            axis=1,
+        )
+    return numpy.ascontiguousarray(frames, dtype=numpy.float32)
+
+
+def _next_audio(source: Iterator[Any]) -> Any | None:
+    """The next non-empty chunk as (samples, channels) frames, or None at the end."""
+    for chunk in source:
+        frames = _as_frames(chunk)
+        if frames.shape[0]:
+            return frames
+    return None
+
+
+def play_audio(
+    chunks: Iterable[Any],
+    rate: int,
+    *,
+    cancel: Callable[[], bool] | None = None,
+    device: int | None = None,
+    block_seconds: float = PLAYBACK_BLOCK_SECONDS,
+) -> dict[str, Any]:
+    """Play float32 audio through one output stream, stopping the moment `cancel` says so.
+
+    `chunks` are arrays shaped (samples,) or (samples, channels), all at
+    `rate`. An iterator is consumed as it plays, so a streaming synthesiser
+    speaks its first sentence while it works on the next. The stream is
+    opened once, written in `block_seconds` blocks with `cancel` checked
+    between them, drained at the end, aborted on barge-in, and closed on
+    every path. The result reports what happened: `played` is True only once
+    audio was handed to the device, and a failure carries its `error`.
+    """
+    started = time.perf_counter()
+    report: dict[str, Any] = {"played": False, "interrupted": False, "frames": 0, "underflows": 0}
+    out_rate = rate
+
+    def done(**extra: Any) -> dict[str, Any]:
+        seconds = report["frames"] / out_rate if out_rate else 0.0
+        return {**report, **extra, "seconds": round(seconds, 3),
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+
+    source = iter(chunks)
+    try:
+        first = _next_audio(source)
+    except Exception as exc:  # noqa: BLE001 - a synthesiser failing is a result
+        return done(error=str(exc)[:160] or type(exc).__name__)
+    if first is None:
+        return done(error="There was no audio to play.")
+    if rate <= 0:
+        return done(error=f"Invalid sample rate: {rate}")
+    if cancel is not None and cancel():
+        return done(interrupted=True)
+    ticket = SPEAKERS.enter(cancel)
+    if ticket is None:
+        return done(interrupted=True)
+    stream = None
+    try:
+        if cancel is not None and cancel():
+            # The user said stop while this reply waited behind another one:
+            # the turn came, but the device is not even opened for it.
+            report["interrupted"] = True
+            return done()
+        stream, out_rate, out_channels = _open_output(rate, int(first.shape[1]), device)
+        stream.start()
+        block = max(1, int(out_rate * block_seconds))
+        chunk = first
+        while chunk is not None:
+            frames = _fit_audio(chunk, rate, out_rate, out_channels)
+            for offset in range(0, frames.shape[0], block):
+                if cancel is not None and cancel():
+                    stream.abort()
+                    report["interrupted"] = True
+                    return done()
+                piece = frames[offset:offset + block]
+                if stream.write(piece):
+                    report["underflows"] += 1
+                report["frames"] += piece.shape[0]
+                report["played"] = True
+            chunk = _next_audio(source)
+        # stop() drains what is queued; abort() would cut the last words off.
+        stream.stop()
+        return done()
+    except Exception as exc:  # noqa: BLE001 - a lost device is a result, not a crash
+        return done(error=str(exc)[:160] or type(exc).__name__)
+    finally:
+        if stream is not None:
+            try:
+                # Closing a stream that is still running discards its buffers.
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+        SPEAKERS.leave(ticket)
+
+
+# --- What gets read aloud -----------------------------------------------------
+
+# KurdishTTS's free plan refuses a request over 500 characters, and the reply
+# that went silent on 2026-09-24 was 552: one request for the whole reply, a
+# fast rejection, nothing played. The browser already reads replies in
+# sentence chunks of at most 180 characters (frontend/app.js
+# takeSpeakableChunks); the server path now does the same, so no reply is too
+# long and the first sentence is heard while the next is being synthesised.
+SPEECH_CHUNK_CHARS = 180
+_CODE_BLOCK = re.compile(r"```[\s\S]*?```")
+_LIST_MARKER = re.compile(r"(?m)^\s*(?:[-*+•]|\d+[.)])\s+")
+_MARKUP = re.compile(r"[*_`#>\[\]()|]")
+_SENTENCE = re.compile(r"[^.!?؟…\n]+(?:[.!?؟…]+[\"»”’']*|\n|$)")
+
+
+def speakable_text(text: str) -> str:
+    """The reply as it should sound: Markdown gone, lines joined.
+
+    Models answer in Markdown even when the reply is spoken, and the voice
+    read "**", list dashes and backticks aloud. Code is dropped rather than
+    read -- nobody wants a function spoken character by character. List items
+    become their own sentences, so a bullet list is read as a list.
+    """
+    plain = _CODE_BLOCK.sub(" ", text or "")
+    plain = _LIST_MARKER.sub("\n", plain)
+    plain = _MARKUP.sub(" ", plain)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in plain.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def speakable_chunks(text: str, limit: int = SPEECH_CHUNK_CHARS) -> list[str]:
+    """Sentences packed into pieces of at most `limit` characters.
+
+    Short sentences share a piece, so a reply costs as few provider requests as
+    its length allows. A sentence longer than the limit is cut at the last
+    space before it, as the browser does.
+    """
+    chunks: list[str] = []
+    current = ""
+    for match in _SENTENCE.finditer(speakable_text(text)):
+        sentence = match.group(0).strip()
+        while len(sentence) > limit:
+            cut = sentence.rfind(" ", 0, limit)
+            cut = cut if cut >= limit // 4 else limit
+            head, sentence = sentence[:cut].strip(), sentence[cut:].strip()
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(head)
+        if not sentence:
+            continue
+        joined = f"{current} {sentence}" if current else sentence
+        if len(joined) <= limit:
+            current = joined
+        else:
+            chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 # --- Text to speech -----------------------------------------------------------
 
 
@@ -340,38 +634,72 @@ class TextToSpeech:
             yield chunk.audio_int16_bytes if hasattr(chunk, "audio_int16_bytes") else bytes(chunk)
 
     def speak(self, text: str, *, cancel: Callable[[], bool] | None = None) -> dict[str, Any]:
-        """Speak text, stopping early when `cancel` starts returning True."""
+        """Speak text, stopping early when `cancel` starts returning True.
+
+        `spoken` says whether any of it reached the speakers and `error` why
+        not; VoiceService.speak turns the two into `ok`.
+        """
         started = time.perf_counter()
         if self.piper_voice_available():
-            try:
-                import numpy
-                import sounddevice
-
-                voice = self._load_piper()
-                spoken = 0
-                for chunk in voice.synthesize(text):
-                    if cancel and cancel():
-                        sounddevice.stop()
-                        return {"engine": "piper", "interrupted": True, "chunks": spoken,
-                                "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
-                    raw = chunk.audio_int16_bytes if hasattr(chunk, "audio_int16_bytes") else bytes(chunk)
-                    samples = numpy.frombuffer(raw, dtype=numpy.int16)
-                    rate = getattr(chunk, "sample_rate", None) or voice.config.sample_rate
-                    sounddevice.play(samples, rate)
-                    sounddevice.wait()
-                    spoken += 1
-                return {"engine": "piper", "interrupted": False, "chunks": spoken,
-                        "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
-            except Exception as exc:
-                return {"engine": "piper", "error": str(exc), "interrupted": False,
-                        "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+            return self._speak_piper(text, cancel=cancel, started=started)
         return self._speak_sapi(text, cancel=cancel, started=started)
 
-    def _speak_sapi(self, text: str, *, cancel: Callable[[], bool] | None, started: float) -> dict[str, Any]:
-        try:
-            import win32com.client
+    def _speak_piper(self, text: str, *, cancel: Callable[[], bool] | None, started: float) -> dict[str, Any]:
+        """Piper's sentences through one continuous stream, not a stream per sentence.
 
-            speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        Each sentence used to be its own sounddevice.play()+wait(): a new
+        PortAudio stream per chunk (162 ms to open on this machine's output),
+        and a play() that stopped whatever anything else was playing.
+        """
+        def elapsed() -> float:
+            return round((time.perf_counter() - started) * 1000, 2)
+
+        try:
+            import numpy
+
+            voice = self._load_piper()
+            produced = iter(voice.synthesize(text))
+            first = next(produced, None)
+        except Exception as exc:  # noqa: BLE001 - reported as the result
+            return {"engine": "piper", "error": str(exc) or type(exc).__name__, "interrupted": False,
+                    "spoken": False, "chunks": 0, "duration_ms": elapsed()}
+        if first is None:
+            return {"engine": "piper", "error": "Piper produced no audio.", "interrupted": False,
+                    "spoken": False, "chunks": 0, "duration_ms": elapsed()}
+        rate = int(getattr(first, "sample_rate", None) or voice.config.sample_rate)
+        counted = {"chunks": 0}
+
+        def pcm() -> Iterator[Any]:
+            for chunk in itertools.chain([first], produced):
+                raw = chunk.audio_int16_bytes if hasattr(chunk, "audio_int16_bytes") else bytes(chunk)
+                counted["chunks"] += 1
+                yield numpy.frombuffer(raw, dtype=numpy.int16).astype(numpy.float32) / 32768.0
+
+        played = play_audio(pcm(), rate, cancel=cancel)
+        result = {"engine": "piper", "interrupted": played["interrupted"], "spoken": played["played"],
+                  "chunks": counted["chunks"], "seconds": played.get("seconds"),
+                  "underflows": played.get("underflows", 0), "duration_ms": elapsed()}
+        if played.get("error"):
+            result["error"] = played["error"]
+        return result
+
+    def _sapi_speaker(self) -> Any:
+        """The Windows voice. Its own method so tests can speak without a sound."""
+        import win32com.client
+
+        return win32com.client.Dispatch("SAPI.SpVoice")
+
+    def _speak_sapi(self, text: str, *, cancel: Callable[[], bool] | None, started: float) -> dict[str, Any]:
+        def elapsed() -> float:
+            return round((time.perf_counter() - started) * 1000, 2)
+
+        # SAPI plays through its own audio object, but it is the same pair of
+        # speakers, so it waits its turn like everything else.
+        ticket = SPEAKERS.enter(cancel)
+        if ticket is None:
+            return {"engine": "sapi", "interrupted": True, "spoken": False, "duration_ms": elapsed()}
+        try:
+            speaker = self._sapi_speaker()
             speaker.Rate = max(-10, min(10, int((self.rate - 1.0) * 10)))
             speaker.Volume = max(0, min(100, int(self.volume * 100)))
             # 1 = SVSFlagsAsync, so cancellation can interrupt mid-utterance.
@@ -379,14 +707,14 @@ class TextToSpeech:
             while speaker.Status.RunningState != 1:
                 if cancel and cancel():
                     speaker.Speak("", 2)  # 2 = SVSFPurgeBeforeSpeak
-                    return {"engine": "sapi", "interrupted": True,
-                            "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+                    return {"engine": "sapi", "interrupted": True, "spoken": True, "duration_ms": elapsed()}
                 time.sleep(0.05)
-            return {"engine": "sapi", "interrupted": False,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
-        except Exception as exc:
-            return {"engine": "sapi", "error": str(exc), "interrupted": False,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 2)}
+            return {"engine": "sapi", "interrupted": False, "spoken": True, "duration_ms": elapsed()}
+        except Exception as exc:  # noqa: BLE001 - reported as the result
+            return {"engine": "sapi", "error": str(exc) or type(exc).__name__, "interrupted": False,
+                    "spoken": False, "duration_ms": elapsed()}
+        finally:
+            SPEAKERS.leave(ticket)
 
     def capability(self) -> dict[str, Any]:
         voices = self.sapi_voices()
@@ -538,6 +866,11 @@ class VoiceService:
         # Called with True when SAM starts speaking and False when it stops.
         # The hands-free wake listener uses it to go deaf while SAM talks.
         self.on_speaking: Callable[[bool], None] | None = None
+        # How many speak() calls are under way. Two can overlap -- the second
+        # waits for the speakers -- and the listener must stay deaf until the
+        # last of them has finished, not wake when the first one does.
+        self._speech_calls = 0
+        self._speech_span = threading.Lock()
 
     @property
     def mode(self) -> str:
@@ -819,18 +1152,69 @@ class VoiceService:
         fallback to an English Windows voice: reading Kurdish text through an
         English voice produces sounds that are not the language, and passing it
         off as Sorani would be a lie about what SAM can do.
+
+        Speech never overlaps: a second call synthesises alongside the first
+        and then waits for the speakers (SpeakerQueue). The result always
+        carries `ok` -- False, with an `error`, when nothing was spoken
+        because synthesis or playback failed.
         """
+        if not (text or "").strip():
+            return {"ok": False, "spoken": False, "interrupted": False, "error": "There was nothing to say."}
         wanted = language or getattr(self.settings, "voice_language", None)
         use_sorani = sorani_speech.is_sorani(wanted) or sorani_speech.looks_sorani(text)
-        self.barge_in.begin_speaking()
-        self._notify_speaking(True)
+        self._speech_begins()
         try:
-            if use_sorani:
-                return self._speak_sorani(text)
-            return self.tts.speak(text, cancel=self.barge_in.should_stop_tts)
+            try:
+                if use_sorani:
+                    result = self._speak_sorani(text)
+                else:
+                    result = self.tts.speak(text, cancel=self.barge_in.should_stop_tts)
+            except Exception as exc:  # noqa: BLE001 - reported in the outcome, like every other failure
+                result = {"engine": "sorani" if use_sorani else "local",
+                          "error": f"{type(exc).__name__}: {exc}"[:200]}
         finally:
-            self.barge_in.end_speaking()
-            self._notify_speaking(False)
+            self._speech_ends()
+        return self._speech_outcome(result)
+
+    @staticmethod
+    def _speech_outcome(result: dict[str, Any]) -> dict[str, Any]:
+        """`ok` says whether the words reached the speakers, for every engine.
+
+        Callers used to be left to guess. The Sorani path answered `spoken`
+        and dropped playback's error, the local engines answered neither, and
+        the hands-free loop -- which looks for `ok` being False -- took a reply
+        that failed to synthesise or play as spoken. Being interrupted is not
+        a failure: somebody asked for it, and `interrupted` says so.
+        """
+        outcome = dict(result)
+        spoken = bool(outcome.get("spoken"))
+        interrupted = bool(outcome.get("interrupted"))
+        if not outcome.get("error") and not spoken and not interrupted:
+            outcome["error"] = "Nothing was spoken."
+        outcome.update(ok=not outcome.get("error"), spoken=spoken, interrupted=interrupted)
+        return outcome
+
+    def _speech_begins(self) -> None:
+        """The first overlapping speak() deafens the listener; the rest join it.
+
+        The lock is held through the hook on purpose: the wake listener's
+        suppression is a flag, not a count, and its resume sleeps out the echo
+        before clearing it. A second reply starting inside that sleep would
+        suppress first and then be un-suppressed by the first reply's resume,
+        leaving the listener awake while SAM talks.
+        """
+        with self._speech_span:
+            self._speech_calls += 1
+            if self._speech_calls == 1:
+                self.barge_in.begin_speaking()
+                self._notify_speaking(True)
+
+    def _speech_ends(self) -> None:
+        with self._speech_span:
+            self._speech_calls -= 1
+            if self._speech_calls == 0:
+                self.barge_in.end_speaking()
+                self._notify_speaking(False)
 
     def _notify_speaking(self, speaking: bool) -> None:
         """Tell whoever is listening that SAM's own voice is on the speakers.
@@ -890,31 +1274,100 @@ class VoiceService:
         }
 
     def _speak_sorani(self, text: str) -> dict[str, Any]:
-        result = dict(self._synthesize_sorani(text))
-        audio = result.pop("audio", None)
+        """Read a Sorani reply sentence by sentence through one continuous stream.
+
+        The whole reply used to go to KurdishTTS in one request, raw Markdown
+        and all: over the free plan's 500-character cap it was refused and
+        nothing was said, and under it nothing was heard until every sentence
+        had been synthesised. Now each piece (speakable_chunks) is synthesised
+        while the one before it plays, so the first words come out after one
+        short request and there is no gap between pieces.
+        """
+        chunks = speakable_chunks(text)
+        if not chunks:
+            return {"engine": "sorani", "language": "ckb", "spoken": False, "interrupted": False,
+                    "error": "There was nothing to say."}
+        cancel = self.barge_in.should_stop_tts
+        first = dict(self._synthesize_sorani(chunks[0]))
+        audio = first.pop("audio", None)
         if not audio:
-            return {**result, "spoken": False}
-        played = self._play_wav(audio, cancel=self.barge_in.should_stop_tts)
-        return {**result, "spoken": played["played"], "interrupted": played["interrupted"]}
+            error = first.get("error") or "KurdishTTS returned no audio."
+            logger.warning("Sorani speech failed before anything was said: %s", error)
+            return {**first, "spoken": False, "interrupted": False, "error": error,
+                    "chunks": 0, "chunks_total": len(chunks)}
+        try:
+            opening, rate = sorani_speech.wav_to_frames(audio)
+        except Exception as exc:  # noqa: BLE001
+            return {**first, "spoken": False, "interrupted": False,
+                    "error": f"Unreadable speech audio: {exc}"[:160]}
+
+        def fitted(frames: Any, frames_rate: int) -> Any:
+            if frames.shape[1] > 2:
+                # Speech has nothing to say to a surround layout; fold it to mono.
+                frames = frames.mean(axis=1, keepdims=True)
+            # play_audio takes one rate for the whole reply.
+            return frames if frames_rate == rate else _fit_audio(frames, frames_rate, rate, frames.shape[1])
+
+        said = {"chunks": 1}
+        failure: dict[str, Any] = {}
+
+        def pieces() -> Iterator[Any]:
+            yield fitted(opening, rate)
+            if len(chunks) == 1:
+                return
+            # One worker: the next piece is synthesised while this one plays.
+            # Never waited for on the way out -- after a barge-in the request in
+            # flight finishes in the background and its audio is dropped.
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sam-tts")
+            try:
+                pending = pool.submit(self._synthesize_sorani, chunks[1])
+                for index in range(1, len(chunks)):
+                    result = pending.result()
+                    if cancel():
+                        return
+                    if index + 1 < len(chunks):
+                        pending = pool.submit(self._synthesize_sorani, chunks[index + 1])
+                    payload = result.get("audio")
+                    if not payload:
+                        failure.update(index=index, error=result.get("error") or "KurdishTTS returned no audio.")
+                        return
+                    frames, frames_rate = sorani_speech.wav_to_frames(payload)
+                    said["chunks"] += 1
+                    yield fitted(frames, frames_rate)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+        played = play_audio(pieces(), rate, cancel=cancel)
+        outcome = {**first, "spoken": bool(played.get("played")),
+                   "interrupted": bool(played.get("interrupted")),
+                   "chunks": said["chunks"], "chunks_total": len(chunks)}
+        for key in ("seconds", "underflows"):
+            if key in played:
+                outcome[key] = played[key]
+        if played.get("error"):
+            # Playback's failure is the caller's business too; it used to stop here.
+            outcome["error"] = played["error"]
+        elif failure:
+            # What was said stays said; the reply as a whole did not get out.
+            outcome["error"] = (f"Stopped after {failure['index']} of {len(chunks)} sentences: "
+                                f"{failure['error']}")[:200]
+        if outcome.get("error"):
+            logger.warning("Sorani speech: %s", outcome["error"])
+        return outcome
 
     def _play_wav(self, payload: bytes, *, cancel: Callable[[], bool] | None = None) -> dict[str, Any]:
-        """Play WAV audio in slices so barge-in can cut it off mid-sentence."""
-        try:
-            import sounddevice
+        """Play a WAV clip through one continuous stream that barge-in can abort.
 
-            samples, rate = sorani_speech.wav_to_float32(payload)
-        except Exception as exc:
-            return {"played": False, "interrupted": False, "error": str(exc)[:160]}
-        # A fifth of a second is short enough to feel immediate when interrupted
-        # and long enough not to click between slices.
-        slice_samples = max(1, int(rate * 0.2))
+        It used to be 200 ms slices, each its own sounddevice.play()+wait():
+        a stream opened and torn down five times a second, which on this
+        machine left a quarter-second hole after every fifth of a second of
+        voice (see PLAYBACK_BLOCK_SECONDS).
+        """
         try:
-            for offset in range(0, len(samples), slice_samples):
-                if cancel and cancel():
-                    sounddevice.stop()
-                    return {"played": True, "interrupted": True}
-                sounddevice.play(samples[offset:offset + slice_samples], rate)
-                sounddevice.wait()
-        except Exception as exc:
-            return {"played": False, "interrupted": False, "error": str(exc)[:160]}
-        return {"played": True, "interrupted": False}
+            frames, rate = sorani_speech.wav_to_frames(payload)
+        except Exception as exc:  # noqa: BLE001
+            return {"played": False, "interrupted": False, "error": f"Unreadable speech audio: {exc}"[:160]}
+        if frames.shape[1] > 2:
+            # Speech has nothing to say to a surround layout; fold it to mono.
+            frames = frames.mean(axis=1, keepdims=True)
+        return play_audio([frames], rate, cancel=cancel)

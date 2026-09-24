@@ -97,20 +97,37 @@ def pcm_to_wav(samples: Any, sample_rate: int = 16_000) -> bytes:
     return buffer.getvalue()
 
 
-def wav_to_float32(payload: bytes) -> tuple[Any, int]:
-    """Decode a WAV blob into float32 mono samples and its sample rate."""
+def wav_to_frames(payload: bytes) -> tuple[Any, int]:
+    """Decode a WAV blob into float32 frames shaped (samples, channels), and its rate.
+
+    Playback keeps the channels the file has; recognition wants mono and goes
+    through `wav_to_float32`. 8-bit WAV is the one unsigned width (silence is
+    128), so it is centred before scaling: read as int8, as it used to be,
+    silence became full-scale -1.0 and quiet speech flipped between the rails.
+    """
     import numpy
 
     with wave.open(io.BytesIO(payload), "rb") as handle:
         channels, width, rate = handle.getnchannels(), handle.getsampwidth(), handle.getframerate()
         frames = handle.readframes(handle.getnframes())
-    dtype = {1: numpy.int8, 2: numpy.int16, 4: numpy.int32}.get(width)
-    if dtype is None:
-        raise ValueError(f"Unsupported WAV sample width: {width}")
-    audio = numpy.frombuffer(frames, dtype=dtype).astype(numpy.float32) / float(numpy.iinfo(dtype).max)
-    if channels > 1:
-        audio = audio.reshape(-1, channels).mean(axis=1)
-    return audio, rate
+    if width == 1:
+        audio = (numpy.frombuffer(frames, dtype=numpy.uint8).astype(numpy.float32) - 128.0) / 128.0
+    else:
+        dtype = {2: numpy.int16, 4: numpy.int32}.get(width)
+        if dtype is None:
+            raise ValueError(f"Unsupported WAV sample width: {width}")
+        audio = numpy.frombuffer(frames, dtype=dtype).astype(numpy.float32) / float(numpy.iinfo(dtype).max)
+    channels = max(1, channels)
+    whole = audio.size - audio.size % channels
+    return audio[:whole].reshape(-1, channels), rate
+
+
+def wav_to_float32(payload: bytes) -> tuple[Any, int]:
+    """Decode a WAV blob into float32 mono samples and its sample rate."""
+    frames, rate = wav_to_frames(payload)
+    if frames.shape[1] == 1:
+        return frames.reshape(-1), rate
+    return frames.mean(axis=1), rate
 
 
 class KurdishTTSClient:

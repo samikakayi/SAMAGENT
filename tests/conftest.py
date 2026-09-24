@@ -35,6 +35,67 @@ def supported_runtime():
     patch.undo()
 
 
+class _SilentStream:
+    """Takes audio the way a PortAudio output stream does, and plays none of it."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def write(self, data):
+        return False
+
+    def stop(self):
+        pass
+
+    def abort(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _SilentSapiVoice:
+    """A Windows voice that finishes at once without a sound."""
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        self.Rate = 0
+        self.Volume = 100
+        self.Status = SimpleNamespace(RunningState=1)
+
+    def Speak(self, text, flags=0):  # noqa: N802 - the COM method's name
+        return 1
+
+
+@pytest.fixture(autouse=True)
+def silent_speakers(monkeypatch):
+    """No test makes a sound.
+
+    The suite runs on the machine SAM speaks from, with its owner in the
+    room, and `service.speak("Gold is trading at 408.")` used to reach the
+    real Windows voice. Every speaker path is swapped for one that accepts
+    audio and plays nothing; a test that inspects playback installs its own.
+    """
+    import sam_backend.voice as voice
+
+    monkeypatch.setattr(voice, "_output_stream", lambda **kwargs: _SilentStream(**kwargs))
+    monkeypatch.setattr(voice.TextToSpeech, "_sapi_speaker", lambda self: _SilentSapiVoice())
+    try:
+        import sounddevice
+    except Exception:  # noqa: BLE001 - no PortAudio, nothing to guard
+        return
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("A test tried to play audio through the real speakers.")
+
+    monkeypatch.setattr(sounddevice, "play", refuse)
+    monkeypatch.setattr(sounddevice, "OutputStream", refuse)
+
+
 class FakeAdapter:
     async def list_models(self):
         return [{"id": "fake", "name": "fake", "provider": "ollama"}]
