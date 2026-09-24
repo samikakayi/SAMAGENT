@@ -119,6 +119,20 @@ To start without opening a browser:
 .\start.ps1 -NoBrowser
 ```
 
+### 4. Use SAM as a desktop program (optional)
+
+```powershell
+.\install-desktop.ps1
+```
+
+This adds a **SAM** icon to the desktop and the Start menu. It opens SAM in a
+window of its own (no browser tabs), starts it quietly with no console window,
+and puts a tray icon next to the clock to open, restart or quit it. Closing
+the window does not stop SAM, so "Hey SAM" keeps listening. SAM also starts in
+the background when you sign in to Windows; pass `-NoAutostart` to skip that.
+The desktop program uses port 8877. `.\uninstall-desktop.ps1` removes the
+shortcuts.
+
 ## First conversation
 
 Try:

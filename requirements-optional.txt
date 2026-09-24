@@ -13,3 +13,6 @@ piper-tts
 # Microphone/speaker enumeration. Without it the device list reports
 # unconfigured; nothing else in SAM uses it.
 sounddevice
+
+# Tray icon for the desktop program (install-desktop.ps1 installs it).
+pystray
