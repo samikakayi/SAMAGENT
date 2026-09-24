@@ -124,3 +124,29 @@ def test_the_install_scripts_parse(script):
     )
     result = subprocess.run(["powershell", "-NoProfile", "-Command", check], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="needs Windows PowerShell")
+def test_a_hidden_powershell_script_really_runs_with_the_launchers_flags(tmp_path):
+    """The first install opened a window onto a SAM that never started.
+
+    With DETACHED_PROCESS among the flags, powershell.exe running start.ps1
+    exited at once with code 0 and wrote nothing. This runs a real script with
+    the flags the launcher uses and waits for it to leave its mark.
+    """
+    loader = importlib.machinery.SourceFileLoader("sam_desktop_flags", str(LAUNCHER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    marker = tmp_path / "ran.txt"
+    script = tmp_path / "probe.ps1"
+    script.write_text(f"Set-Content -LiteralPath '{marker}' -Value 'ran'\n", encoding="utf-8")
+    process = subprocess.Popen(  # noqa: S603
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-WindowStyle", "Hidden", "-File", str(script)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=module.BACKGROUND_FLAGS,
+    )
+    process.wait(timeout=60)
+
+    assert marker.is_file(), "the hidden script never ran"

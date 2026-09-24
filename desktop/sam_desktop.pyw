@@ -41,11 +41,14 @@ OMNIROUTE_HOME = Path.home() / ".omniroute"
 OMNIROUTE_URL = "http://127.0.0.1:20128"
 
 CREATE_NO_WINDOW = 0x08000000
-DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
-# Started services must outlive this launcher (and its tray) and never flash a
-# console window.
-BACKGROUND_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+# Started services never flash a console window, and they outlive this
+# launcher anyway: Windows does not end a child when its parent exits.
+# DETACHED_PROCESS must not be added: with it, powershell.exe running start.ps1
+# exited at once with code 0 and no output, so the first install opened a
+# window onto a SAM that never started. CREATE_NO_WINDOW alone gives the
+# script a hidden console of its own, and SAM came up in about 3 s.
+BACKGROUND_FLAGS = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
 
 def log(message: str) -> None:
