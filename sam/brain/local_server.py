@@ -12,6 +12,15 @@ demand, stopped on quit (only when SAM started it).
   ``llm.local.ollama_exe`` / ``llm.local.models_dir``; empty = found under
   SAM_HOME (``tools/ollama*/ollama.exe``, ``data/ollama-models``), then the
   normal Ollama install / PATH and Ollama's own model folder.
+- A crash must not leave it behind: the server SAM starts is created
+  suspended and put into a Windows Job Object with KILL_ON_JOB_CLOSE before
+  it runs, so when SAM's process ends for ANY reason (crash, kill, logoff)
+  Windows ends ``ollama serve`` and its runners with it (review 2026-09-25:
+  a hidden server outlived a killed SAM, and the next start took it for
+  someone else's and never stopped it).
+- Port: 11434 is shared with SAM v1's server on purpose. A second server
+  would hold a second ~5 GB copy of qwen3:8b on a PC that had ~2 GB free
+  while other work ran; v1 is retired by scripts/install.ps1.
 - GPU: this PC's Radeon 890M is not used. Ollama 0.33.1 drops integrated GPUs
   unless ``OLLAMA_IGPU_ENABLE=1``; with it, llama-server crashed while fitting
   either model to Vulkan memory (exit 0xe06d7363, "AMD driver is too old";
@@ -74,6 +83,8 @@ class OllamaServer:
         self._proc: Any = None
         self._lock: asyncio.Lock | None = None
         self._log_file: Any = None
+        self._job: Any = None               # Job Object that ends the server with SAM
+        self._real_popen = popen is None
         self.started_by_sam = False
         self.last_error = ""
 
@@ -167,11 +178,27 @@ class OllamaServer:
 
     def _spawn(self, exe: Path) -> Any:
         flags = 0
+        job = None
         if os.name == "nt":
             flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            job = _kill_on_close_job() if self._real_popen else None
+            if job is not None:
+                flags |= CREATE_SUSPENDED       # in the job before it can start runners
         self._log_file = open(self._log_path(), "ab")  # noqa: SIM115 - kept open for the child's lifetime
-        return self._popen([str(exe), "serve"], env=self._env(), cwd=str(exe.parent), stdin=subprocess.DEVNULL,
+        proc = self._popen([str(exe), "serve"], env=self._env(), cwd=str(exe.parent), stdin=subprocess.DEVNULL,
                            stdout=self._log_file, stderr=subprocess.STDOUT, creationflags=flags)
+        if job is not None:
+            try:
+                import win32job
+
+                win32job.AssignProcessToJobObject(job, int(proc._handle))  # type: ignore[attr-defined]
+                self._job = job
+            except Exception:  # noqa: BLE001 - it still runs; stop() ends it on a normal quit
+                log.warning("ollama: the kill-on-close job could not be assigned", exc_info=True)
+                job.Close()
+            finally:
+                _resume(proc)
+        return proc
 
     async def ensure(self, *, wait_s: float = START_WAIT_S) -> bool:
         """True when a server answers on the host (starting one if needed)."""
@@ -214,6 +241,12 @@ class OllamaServer:
         stopped = False
         if proc is not None and proc.poll() is None:
             stopped = await asyncio.to_thread(self._kill_tree, proc)
+        job, self._job = self._job, None
+        if job is not None:
+            try:
+                job.Close()                     # KILL_ON_JOB_CLOSE: whatever is left ends here
+            except Exception:  # noqa: BLE001
+                pass
         if self._log_file is not None:
             try:
                 self._log_file.close()
@@ -242,6 +275,33 @@ class OllamaServer:
         return {"host": self.host, "listening": self.listening(), "exe": str(exe) if exe else None,
                 "models_dir": str(self.models_dir() or ""), "started_by_sam": self.started_by_sam and self.running_ours(),
                 "last_error": self.last_error}
+
+
+CREATE_SUSPENDED = 0x00000004
+
+
+def _kill_on_close_job() -> Any:
+    """A Job Object whose processes end when its last handle closes (SAM's own
+    process holds the only one, so SAM ending ends the server)."""
+    try:
+        import win32job
+
+        job = win32job.CreateJobObject(None, "")
+        info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+        info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+        return job
+    except Exception:  # noqa: BLE001 - no job: start the server without one
+        log.debug("ollama: no job object", exc_info=True)
+        return None
+
+
+def _resume(proc: Any) -> None:
+    import ctypes
+
+    status = ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(proc._handle)))  # type: ignore[attr-defined]
+    if status != 0:
+        log.warning("ollama: resuming the server failed (NTSTATUS %#x)", status & 0xFFFFFFFF)
 
 
 __all__ = ["OllamaServer", "is_listening", "split_host", "DEFAULT_HOST"]

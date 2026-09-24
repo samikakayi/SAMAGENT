@@ -33,6 +33,15 @@ if TYPE_CHECKING:  # llm.py imports this module: runtime imports of it stay insi
 log = logging.getLogger("sam.local_brain")
 
 LOCAL_PROVIDER = "ollama"
+# Added to the per-turn part of every local request. Live run 2026-09-25 (after ten
+# fast-path turns in the same conversation): qwen3:8b answered «پێم بڵێ زێڕ ئێستا بە
+# چەند مامەڵە دەکرێت» with a made-up price and «ئەو پەنجەرانەی ... بژمێرە» with made-up
+# counts -- no tool call. The history showed only plain question -> answer pairs
+# (tool turns are not replayed), and a small model imitates that pattern.
+LOCAL_RULES = ("SAM's local brain is answering now (the online models are resting). Tools are the ONLY source "
+               "of prices, the chart, windows, alerts and files: call the tool now, even when an earlier message "
+               "mentions a value (it is outdated). For an action call its tool; never say it is done without the "
+               "tool's result. Answer in one or two short sentences.")
 LOCAL_NOTICE_CKB = "مۆدێلە ئۆنلاینەکان ئێستا بەردەست نین؛ بە مێشکی ناوخۆیی وەڵام دەدەمەوە، کەمێک هێواشترە."
 CLOUD_BACK_CKB = "مۆدێلە ئۆنلاینەکان گەڕانەوە."
 MODEL_CHECK_S = 600.0
@@ -45,6 +54,7 @@ class LocalRung:
     brain_mode: str = "cloud"          # "cloud" | "local": who answered last
     _local_models: tuple[float, list[str]] | None = None
     _local_warming: Any = None
+    _local_inflight: int = 0            # local answers being generated now
 
     # -- availability ------------------------------------------------------------------------------
     def local_backend(self) -> Any:
@@ -115,10 +125,40 @@ class LocalRung:
                 return name
         return wanted
 
+    async def local_cold(self) -> bool:
+        """The local model is not in memory (a load of ~8 s and an uncached
+        prompt of up to ~86 s wait for the next local answer on this PC)."""
+        backend = self.local_backend()
+        loaded = getattr(backend, "loaded", None)
+        if loaded is None:
+            return False
+        try:
+            return not await loaded()
+        except Exception:  # noqa: BLE001 - unknown: say nothing rather than a wrong «one moment»
+            return False
+
+    async def announce_local(self, on_local: Any) -> None:
+        """Call ``on_local(cold)`` before a local answer (``chat(on_local=)``)."""
+        try:
+            result = on_local(await self.local_cold())
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 - an announcement must never cost the answer
+            log.debug("on_local callback failed", exc_info=True)
+
     # -- the rung --------------------------------------------------------------------------------------
     def _local_request(self, req: LLMRequest) -> LLMRequest:
+        """The request as the local model gets it: its own timeout, a short
+        history (``llm.local.history_messages``, default 0, before the current
+        request) and LOCAL_RULES. Measured live 2026-09-25: with the last
+        exchange kept, qwen3:8b copied it -- after «نرخی زێڕ و زیو» it answered
+        an alert question and a window count with the gold price and no tool
+        (3 runs); the A/B without that pattern was equal (2/3 either way).
+        Fewer uncached tokens also help: ~38 tok/s on this PC under load."""
         timeout = float(self._setting("llm.local.timeout_s", 150) or 150)  # type: ignore[attr-defined]
-        return replace(req, timeout_s=timeout)
+        keep = int(self._setting("llm.local.history_messages", 0) or 0)  # type: ignore[attr-defined]
+        messages = with_local_rules(trim_history(req.messages, keep))
+        return replace(req, timeout_s=timeout, messages=messages)
 
     async def _local_chat(self, req: LLMRequest, turn: Any, cloud_err: LLMError) -> LLMResponse:
         from .llm import LLMError
@@ -128,6 +168,7 @@ class LocalRung:
         local_req = self._local_request(req)
         self._note_brain("local", f"{LOCAL_PROVIDER}:{model}")
         started = time.perf_counter()
+        self._local_inflight += 1
         try:
             response = await asyncio.wait_for(backend.complete(model, local_req), local_req.timeout_s + 5)
         except asyncio.TimeoutError:
@@ -141,6 +182,8 @@ class LocalRung:
             self._record(turn, response)  # type: ignore[attr-defined]
             self._note_brain("local", response.model_ref)
             return response
+        finally:
+            self._local_inflight -= 1         # also when the turn is cancelled (stop_all)
         raise self._local_failed(model, local_req, cloud_err, err)
 
     async def _local_stream(self, req: LLMRequest, turn: Any, cloud_err: LLMError) -> AsyncIterator[LLMChunk]:
@@ -226,6 +269,11 @@ class LocalRung:
         the background; at most one warm-up at a time. Returns the task or None."""
         if not self._setting("llm.local.prewarm", True) or not self.local_ready():  # type: ignore[attr-defined]
             return None
+        if self._local_inflight:
+            # Ollama has one slot: a warm-up next to a real answer made that answer wait
+            # (live run 2026-09-25: a 98 s voice-prompt warm-up pushed a library answer
+            # past the 150 s local timeout).
+            return None
         running = self._local_warming
         if running is not None and not running.done():
             return running
@@ -258,6 +306,32 @@ class LocalRung:
         return out
 
 
+def trim_history(messages: list[dict[str, Any]], keep: int) -> list[dict[str, Any]]:
+    """System messages, the last ``keep`` messages before the LAST user message,
+    and everything from that user message on (the current tool loop). A worker
+    task (one user goal, then tool rounds) is never shortened."""
+    last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+    if last_user < 0:
+        return list(messages)
+    head = [m for m in messages[:last_user] if m.get("role") == "system"]
+    history = [m for m in messages[:last_user] if m.get("role") != "system"]
+    kept = history[-keep:] if keep > 0 else []
+    while kept and kept[0].get("role") == "tool":      # never start with an orphan tool result
+        kept = kept[1:]
+    return [*head, *kept, *messages[last_user:]]
+
+
+def with_local_rules(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """LOCAL_RULES at the end of the system message (its per-turn part, after the
+    persona's CONTEXT_HEADING, so Ollama's cached stable prefix is unchanged)."""
+    out = list(messages)
+    for index, message in enumerate(out):
+        if message.get("role") == "system" and isinstance(message.get("content"), str):
+            out[index] = {**message, "content": f"{message['content']}\n\n{LOCAL_RULES}"}
+            return out
+    return [{"role": "system", "content": LOCAL_RULES}, *out]
+
+
 def _voice_notice(kind: str, text: str, detail: str) -> Any:
     try:
         from ..voice.notices import VoiceNotice
@@ -266,4 +340,5 @@ def _voice_notice(kind: str, text: str, detail: str) -> Any:
     return VoiceNotice(kind=kind, text_ckb=text, detail=detail)
 
 
-__all__ = ["LocalRung", "LOCAL_PROVIDER", "LOCAL_NOTICE_CKB", "CLOUD_BACK_CKB"]
+__all__ = ["LocalRung", "LOCAL_PROVIDER", "LOCAL_NOTICE_CKB", "CLOUD_BACK_CKB", "LOCAL_RULES", "trim_history",
+           "with_local_rules"]

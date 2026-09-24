@@ -242,3 +242,55 @@ async def test_stop_all_kills_a_running_program(app: Any) -> None:
     assert app.tools.cancel_all() == 1
     result = await asyncio.wait_for(task, 15)
     assert not result["ok"] and result["data"]["cancelled"]
+
+
+# -- the OS sandbox for code that runs without asking (review 2026-09-25) --------------------------------------------
+@pytest.mark.skipif(not WINDOWS, reason="Windows integrity levels")
+def test_sandboxed_code_can_write_only_its_own_folder(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    code = ("open('inside.txt', 'w').write('ok')\n"
+            f"try:\n    open(r'{outside}', 'w').write('x')\n    print('WROTE')\n"
+            "except PermissionError:\n    print('blocked')\n")
+    result = execute(code, run_dir=tmp_path / "run", timeout_s=30, sandbox=True)
+    assert result["sandbox"] == "low_integrity", result
+    assert result["stdout"].strip() == "blocked" and not outside.exists()
+    assert (tmp_path / "run" / "inside.txt").read_text() == "ok"
+    assert [f["name"] for f in result["files"]] == ["inside.txt"]          # .sam_* helpers are not listed
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows job objects")
+def test_sandboxed_code_cannot_start_programs_or_use_the_clipboard(tmp_path: Path) -> None:
+    code = ("import subprocess\n"
+            "try:\n    subprocess.run(['cmd', '/c', 'echo hi'], capture_output=True, timeout=5)\n    print('STARTED')\n"
+            "except OSError as exc:\n    print('blocked', type(exc).__name__)\n")
+    result = execute(code, run_dir=tmp_path / "run", timeout_s=30, sandbox=True)
+    assert result["stdout"].startswith("blocked"), result
+    normal = execute(code, run_dir=tmp_path / "normal", timeout_s=30, sandbox=False)
+    assert normal["stdout"].strip() == "STARTED" and normal["sandbox"] == "none"
+
+
+@pytest.mark.skipif(not WINDOWS, reason="Windows integrity levels")
+async def test_the_tool_sandboxes_unasked_code_and_not_approved_code(app: Any) -> None:
+    safe = await app.tools.dispatch("run_python", {"code": "import statistics\nstatistics.mean([1, 2, 3])"})
+    assert safe["ok"] and safe["data"]["result"] == "2" and safe["data"]["sandbox"] == "low_integrity"
+    asked_with(app, True)
+    approved = await app.tools.dispatch("run_python", {"code": "import os\nos.getcwd() != ''"})
+    assert approved["ok"] and approved["data"]["sandbox"] == "none"
+
+
+# Adversarial cases from a pass by someone other than the scan's author (2026-09-25):
+# each reached the system, the network or eval through an allowlisted package.
+@pytest.mark.parametrize("code", [
+    "import numpy as np\nnp.ctypeslib.ctypes.windll.kernel32.Beep(750, 300)",
+    "from numpy import ctypeslib",
+    "import numpy.ctypeslib as c",
+    "import numpy as np\nnp.DataSource().open('x')",
+    "import pandas as pd\nu = 'ht' + 'tp://example.com/a.csv'\npd.read_csv(u)",
+    "import pandas as pd\npd.read_html(data['url'])",
+    "import sympy\nsympy.sympify(\"__import__('os')\")",
+    "import numpy as np\nnp.load('a.npy', allow_pickle=True)",
+    "import pandas as pd\npd.read_pickle('a.pkl')",
+    "import pandas as pd\npd.read_clipboard()",
+])
+def test_scan_closes_the_allowlist_holes(code: str) -> None:
+    assert scan(code).risk == "confirm", scan(code).reasons

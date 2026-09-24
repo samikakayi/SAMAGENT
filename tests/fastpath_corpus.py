@@ -335,7 +335,77 @@ HELD_OUT: list[Row] = [
 HELD_OUT_FIRST_RUN: dict[str, Any] = {"rows": 67, "positive": 38, "negative": 29, "tp": 33, "fp": 0, "fn": 5,
                                       "precision": 1.0, "recall": 0.8684}
 
-CORPUS: list[Row] = POSITIVE + NEGATIVE + HELD_OUT
+# A second held-out set: the independent reviewer's adversarial rows (2026-09-25),
+# written before running them. 64 non-commands (or commands whose fast-path action
+# would be wrong) and 13 commands. First run on the matcher as built: 21 of the 64
+# negatives fired (every singular alert cancelled ALL alerts, prices were read as
+# timeframes, «نەخۆشی/نەرمی زێڕ چەندە» passed as a mangled price word).
+REVIEW_HELD_OUT: list[Row] = [
+    # a single alert never cancels them all without a number / an explicit "all"
+    ("cancel the alert", None, {}), ("remove my alert", None, {}), ("delete the alert", None, {}),
+    ("clear the alert", None, {}), ("cancel my alarm", None, {}), ("stop the alarm", None, {}),
+    ("stop the alert", None, {}), ("delete my alarm", None, {}), ("stop alerting me", None, {}),
+    # a price is not a timeframe
+    ("draw support at 60", None, {}), ("draw resistance at 30", None, {}), ("draw lines at 240", None, {}),
+    ("put support at 60", None, {}), ("هێڵی پشتگیری لە ٦٠ بکێشە", None, {}), ("هێڵی بەرگری لە ٣٠ بکێشە", None, {}),
+    ("draw support for oil at 60", None, {}), ("هێڵی پشتگیری نەوت لە ٦٠ بکێشە", None, {}),
+    # words that are not a price word before an instrument
+    ("نەخۆشی زێڕ چەندە", None, {}), ("نەرمی زێڕ چەندە", None, {}), ("نزیکترین زێڕ چەندە", None, {}),
+    # fragments / questions
+    ("چەند زێڕ", None, {}), ("how much gold", None, {}), ("how much gold can i buy", None, {}),
+    ("what is gold price doing", None, {}), ("check gold", None, {}), ("gold now", None, {}),
+    ("gold today", None, {}), ("open", None, {}), ("launch", None, {}), ("زێڕ چەندی ماوە", None, {}),
+    ("زێڕ چەند پۆینت ڕۆیشت", None, {}), ("نرخی زێڕ بە دینار چەندە", None, {}),
+    # negation / condition / reported speech / sequencing
+    ("کرۆم نەکرایەوە", None, {}), ("نامەوێت کرۆم بکەیتەوە", None, {}), ("no need to open chrome", None, {}),
+    ("never open chrome", None, {}), ("please don't clear the lines", None, {}), ("do not delete my alerts", None, {}),
+    ("unless gold falls clear the lines", None, {}), ("once gold hits 4300 clear the lines", None, {}),
+    ("ئەگەرنا هێڵەکان بسڕەوە", None, {}), ("تا زێڕ دەگاتە ٤٣٠٠ بوەستە", None, {}),
+    ("هێڵەکانت بسڕەوە یان نا", None, {}), ("بیرم چووە کرۆم بکەمەوە", None, {}),
+    ("هەموو ئاگادارکردنەوەکان بسڕەوە جگە لە زێڕ", None, {}), ("ئاگادارکردنەوەکان بسڕەوە بەڵام زێڕ نا", None, {}),
+    ("ئەحمەد گوتی کرۆم بکەرەوە", None, {}), ("he said open chrome", None, {}), ("my friend said stop", None, {}),
+    ("someone told me to delete all alerts", None, {}), ("open chrome also", None, {}),
+    ("open chrome plus notepad", None, {}), ("کرۆم بکەرەوە هەروەها نۆتپاد", None, {}),
+    ("کرۆم بکەرەوە لەگەڵ نۆتپاد", None, {}), ("کرۆم نۆتپاد بکەرەوە", None, {}), ("cancel alert 3 and 4", None, {}),
+    ("delete everything on the chart", None, {}), ("delete all lines and alerts", None, {}),
+    ("clear everything", None, {}), ("stop listening", None, {}), ("بوەستە بۆ ماوەیەک", None, {}),
+    ("زێڕی ٢٤ چەندە", None, {}), ("هێڵەکانی زێڕ بسڕەوە", None, {}), ("how much is gold worth in dinars", None, {}),
+    # true commands (recall)
+    ("cancel all my alerts", "cancel_alerts", {"alert_id": "all"}), ("delete alert 7", "cancel_alerts", {"alert_id": "7"}),
+    ("stop", "stop", {}), ("cancel that", "stop", {}), ("کپ بە", "stop", {}),
+    ("open task manager", "open_app", {"name": "Task Manager"}),
+    ("زیو لەسەر ٣٠ خولەک پیشان بدە", "set_chart", {"timeframe": "M30"}),
+    ("show gold on 4 hours", "set_chart", {"timeframe": "H4"}), ("نرخی نەوت چەندە", "price", {}),
+    ("analyze silver", "analyze", {}), ("هێڵەکانت لابە", "clear_drawings", {}),
+    ("ئالێرتەکانم پیشان بدە", "list_alerts", {}), ("ترەیدینگ ڤیو بکەرەوە سام", "open_tradingview", {}),
+]
+REVIEW_FIRST_RUN: dict[str, Any] = {"rows": 77, "positive": 13, "negative": 64, "tp": 13, "fp": 21, "fn": 0,
+                                    "precision": 0.38, "recall": 1.0}
+
+# Written with the fixes for the reviewer's rows (so not held out): the price-as-
+# timeframe and bare-noun probes of the review's wider run, and the commands that
+# must keep working next to them.
+REVIEW_PROBES: list[Row] = [
+    ("gold 240", None, {}), ("بیتکۆین ٦٠", None, {}), ("show me 30", None, {}), ("switch to 240", None, {}),
+    ("زێڕ لەسەر ٦٠", None, {}), ("gold on 60", None, {}), ("چارتەکە ٦٠", None, {}), ("gold 15", None, {}),
+    ("draw support levels at 120", None, {}), ("analysis", None, {}), ("analyze", None, {}),
+    ("market analysis", None, {}), ("delete the chart", None, {}), ("remove the chart", None, {}),
+    ("stop alerts", None, {}), ("alerts stop", None, {}), ("stop all alerts", None, {}),
+    ("change the timeframe to 60", "set_chart", {"timeframe": "H1"}),
+    ("تایمفرەیمەکە بکە بە ٢٤٠", "set_chart", {"timeframe": "H4"}),
+    ("analyze the market", "analyze", {}), ("چارتەکە شی بکەرەوە", "analyze", {}),
+    ("clear the chart", "clear_drawings", {}), ("چارتەکە پاک بکەرەوە", "clear_drawings", {}),
+    ("delete my alerts", "cancel_alerts", {"alert_id": "all"}),
+    ("cancel the alert number 4", "cancel_alerts", {"alert_id": "4"}),
+    ("draw support and resistance on 4 hours", "draw_levels", {"timeframes": ["H4"]}),
+    # the phrasing qwen3:8b answered from memory in the live run (2026-09-25)
+    ("پێم بڵێ زێڕ ئێستا بە چەند مامەڵە دەکرێت", "price", {"symbol": "زێڕ"}),
+    ("بیتکۆین لە چ نرخێک مامەڵە دەکرێت؟", "price", {"symbol": "بیتکۆین"}),
+    ("زێڕ بە چەند مامەڵە بکەم", None, {}),
+    ("زێڕ بە چەند مامەڵە دەکرێت لە سلێمانی", None, {}),
+]
+
+CORPUS: list[Row] = POSITIVE + NEGATIVE + HELD_OUT + REVIEW_HELD_OUT + REVIEW_PROBES
 
 
 def evaluate(match: Any, rows: list[Row] | None = None) -> dict[str, Any]:
@@ -364,4 +434,5 @@ def evaluate(match: Any, rows: list[Row] | None = None) -> dict[str, Any]:
             "fn": fn, "precision": round(precision, 4), "recall": round(recall, 4), "wrong": wrong}
 
 
-__all__ = ["CORPUS", "POSITIVE", "NEGATIVE", "HELD_OUT", "HELD_OUT_FIRST_RUN", "evaluate"]
+__all__ = ["CORPUS", "POSITIVE", "NEGATIVE", "HELD_OUT", "HELD_OUT_FIRST_RUN", "REVIEW_HELD_OUT", "REVIEW_FIRST_RUN",
+           "REVIEW_PROBES", "evaluate"]

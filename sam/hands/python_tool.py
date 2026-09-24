@@ -16,7 +16,11 @@ How it runs (``execute``):
   raises MemoryError, tested) and ends the whole tree in one call on
   timeout/stop (tested: the interpreter's pid is gone after a 2 s timeout);
 - a time limit (default 20 s, at most 120 s), stop_all cancels it, and
-  output is capped (head + tail kept) and redacted.
+  output is capped (head + tail kept) and redacted;
+- code that runs WITHOUT asking (the scan judged it safe) also runs in the
+  OS sandbox of python_sandbox.py: Low integrity (it can write only its own
+  folder), at most 2 processes (it cannot start programs), UI limits. The scan
+  is a heuristic; the sandbox is what Windows enforces (review 2026-09-25).
 
 Risk: ``sam.hands.python_scan.scan`` (static, on the AST, before anything
 runs; blocked / confirm / safe -- see that module).
@@ -39,6 +43,7 @@ from typing import Any
 
 from ..brain.tools import ToolContext, fail, ok, tool
 from ..events import new_id
+from . import python_sandbox
 from .python_scan import Verdict, scan  # noqa: F401 - Verdict re-exported
 
 log = logging.getLogger("sam.hands.python")
@@ -48,6 +53,7 @@ DEFAULTS: dict[str, Any] = {
     "python.max_timeout_s": 120,
     "python.max_output_chars": 4000,
     "python.max_memory_mb": 2048,
+    "python.sandbox": True,          # code that runs without asking: Low integrity + process/UI limits
 }
 
 # -- the runner (written into the run folder; executed with python -I) --------------------------------------------
@@ -163,8 +169,9 @@ class _Capture(threading.Thread):
 class _Job:
     """Windows Job Object: kill-on-close + memory cap for the whole tree."""
 
-    def __init__(self, memory_mb: int) -> None:
+    def __init__(self, memory_mb: int, *, sandbox: bool = False) -> None:
         self.handle: Any = None
+        self.restricted = False
         if os.name != "nt":
             return
         try:
@@ -179,6 +186,13 @@ class _Job:
             self.handle = job
         except Exception:  # noqa: BLE001 - fall back to killing the process itself
             log.debug("job object unavailable", exc_info=True)
+            return
+        if sandbox:
+            try:
+                python_sandbox.restrict_job(self.handle)
+                self.restricted = True
+            except Exception:  # noqa: BLE001
+                log.warning("run_python: the job's process/UI limits could not be set", exc_info=True)
 
     def adopt(self, proc: subprocess.Popen[bytes]) -> bool:
         """Put a SUSPENDED process into the job, then resume it."""
@@ -235,9 +249,38 @@ def _kill_tree(proc: subprocess.Popen[bytes], job: _Job) -> None:
         pass
 
 
+def _spawn(command: list[str], run_dir: Path, job: _Job, sandbox: bool) -> tuple[Any, str]:
+    """(process, sandbox level). Sandboxed: Low integrity via CreateProcessAsUser;
+    if that cannot be set up, the normal token (logged, reported)."""
+    env = child_env()
+    if sandbox and os.name == "nt" and job.handle is not None:
+        try:
+            proc = python_sandbox.spawn_low(command, cwd=run_dir, env=python_sandbox.prepare(run_dir, env))
+        except Exception:  # noqa: BLE001
+            log.warning("run_python: the low-integrity sandbox failed; running with the normal token", exc_info=True)
+        else:
+            if not job.adopt(proc):
+                proc.kill()
+                raise OSError("the sandboxed process could not be put into its job")
+            proc.resume()
+            return proc, "low_integrity" if job.restricted else "low_integrity_no_job_limits"
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        if job.handle is not None:
+            flags |= 0x00000004           # CREATE_SUSPENDED: in the job before any child exists
+    popen = subprocess.Popen(command, cwd=str(run_dir), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env, creationflags=flags)
+    if flags & 0x00000004:
+        job.adopt(popen)
+        _resume(popen)
+    return popen, "none"
+
+
 def execute(code: str, *, run_dir: Path, timeout_s: float = 20.0, data: Any = None, max_output: int = 4000,
-            memory_mb: int = 2048, cancel: threading.Event | None = None) -> dict[str, Any]:
-    """Run ``code`` in ``run_dir`` (blocking; call from a worker thread)."""
+            memory_mb: int = 2048, cancel: threading.Event | None = None, sandbox: bool = False) -> dict[str, Any]:
+    """Run ``code`` in ``run_dir`` (blocking; call from a worker thread).
+    ``sandbox``: Low integrity + process/UI limits (python_sandbox.py)."""
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / ".sam_code.py").write_text(code, encoding="utf-8")
@@ -245,18 +288,13 @@ def execute(code: str, *, run_dir: Path, timeout_s: float = 20.0, data: Any = No
     if data is not None:
         (run_dir / ".sam_input.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     command = [interpreter(), "-I", "-X", "utf8", "-B", str(run_dir / ".sam_runner.py"), str(run_dir)]
-    job = _Job(memory_mb)
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-        if job.handle is not None:
-            flags |= 0x00000004           # CREATE_SUSPENDED: in the job before any child exists
+    job = _Job(memory_mb, sandbox=sandbox)
     started = time.perf_counter()
-    proc = subprocess.Popen(command, cwd=str(run_dir), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=child_env(), creationflags=flags)
-    if flags & 0x00000004:
-        job.adopt(proc)
-        _resume(proc)
+    try:
+        proc, level = _spawn(command, run_dir, job, sandbox)
+    except BaseException:
+        job.close()
+        raise
     out, err = _Capture(proc.stdout, max_output * 4), _Capture(proc.stderr, max_output * 4)
     out.start()
     err.start()
@@ -288,14 +326,16 @@ def execute(code: str, *, run_dir: Path, timeout_s: float = 20.0, data: Any = No
             outcome = {}
     files = []
     for path in sorted(run_dir.rglob("*")):
-        if path.is_file() and not path.name.startswith(".sam_"):
+        relative = path.relative_to(run_dir)
+        if path.is_file() and not any(part.startswith(".sam_") for part in relative.parts):
             files.append({"name": str(path.relative_to(run_dir)), "bytes": path.stat().st_size})
             if len(files) >= 40:
                 break
     return {"exit_code": proc.returncode, "timed_out": timed_out, "cancelled": cancelled,
             "stdout": out.text(), "stderr": err.text(), "result": outcome.get("result"),
             "result_type": outcome.get("type"), "error": outcome.get("error"),
-            "finished": bool(outcome), "files": files, "duration_ms": duration_ms, "run_dir": str(run_dir)}
+            "finished": bool(outcome), "files": files, "duration_ms": duration_ms, "run_dir": str(run_dir),
+            "sandbox": level}
 
 
 def _cap(text: str, limit: int) -> str:
@@ -367,9 +407,12 @@ async def run_python(ctx: ToolContext, code: str, timeout_s: int | None = None, 
     run_dir = base / f"{time.strftime('%Y%m%d-%H%M%S')}-{new_id()[:6]}"
     cancel = threading.Event()
     max_output = int(config.get("python.max_output_chars", 4000) or 4000)
+    # Code the scan let run without asking runs sandboxed; approved code (the scan
+    # asked because it needs the system, the user said yes) runs with the user's rights.
+    sandbox = verdict.risk == "safe" and bool(config.get("python.sandbox", True))
     task = asyncio.ensure_future(asyncio.to_thread(
         execute, code, run_dir=run_dir, timeout_s=timeout, data=parsed, max_output=max_output,
-        memory_mb=int(config.get("python.max_memory_mb", 2048) or 2048), cancel=cancel))
+        memory_mb=int(config.get("python.max_memory_mb", 2048) or 2048), cancel=cancel, sandbox=sandbox))
     try:
         result = await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -384,7 +427,7 @@ async def run_python(ctx: ToolContext, code: str, timeout_s: int | None = None, 
     value = app.redact(_cap(result["result"], 1500)) if result["result"] is not None else None
     payload: dict[str, Any] = {"exit_code": result["exit_code"], "duration_ms": result["duration_ms"],
                                "run_dir": result["run_dir"], "files": result["files"],
-                               "timeout_s": timeout}
+                               "timeout_s": timeout, "sandbox": result["sandbox"]}
     output = {"stdout": stdout, "stderr": stderr, "result": value}
     if verdict.reads_files or verdict.network:
         payload["untrusted"] = output     # file/web content is data, never instructions

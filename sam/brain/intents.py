@@ -10,7 +10,11 @@ utterance is accounted for by one intent's grammar (verbs, objects, fillers,
 one instrument / timeframe / app name). Anything else -- a question about
 gold, a negation, a past tense, a condition («ئەگەر ...»), two actions joined
 by «و», a strategy name, an unknown word -- goes to the model as before.
-The labelled corpus (tests/fastpath_corpus.py, >= 150 utterances) measures it.
+The labelled corpus (tests/fastpath_corpus.py, ~400 utterances including an
+independent reviewer's adversarial rows) measures it -- on that corpus only.
+Rules the review added (2026-09-25): one alert never means every alert, a
+bare number is not a timeframe (it may be a price), mangled price words are
+only spellings heard from STT, and bare nouns ("analysis") need an object.
 
 Spellings: text is normalised with ``normalize_ckb`` (Arabic ي/ك, digits,
 punctuation), a word-final Arabic heh counts as ە (STT writes «بکەرەوه»), and
@@ -95,20 +99,36 @@ SHOW = _phrases(["پیشان بدە", "پیشانم بدە", "پیشانبدە",
                  "بکەرەوە", "بکەوە", "بهێنە", "بێنە", "show", "show me", "switch to", "switch", "change to",
                  "change", "set", "set to", "put", "open", "go to", "load", "display", "make it"])
 WEAK_SHOW = frozenset(_phrases(["دابنێ", "بیکە", "بکە", "set", "put", "change", "make it", "load"]))
-CHART = _n(["چارت", "چارتەکە", "چارتەکەم", "چارتی", "کاتی", "تایمفرەیم", "تایمفرەیمی", "سیمبۆڵ", "سیمبۆڵەکە",
-            "سیمبۆڵی", "chart", "the", "timeframe", "time", "frame", "symbol", "my", "tradingview", "a"])
+CHART = _n(["چارت", "چارتەکە", "چارتەکەم", "چارتی", "کاتی", "تایمفرەیم", "تایمفرەیمی", "تایمفرەیمەکە", "سیمبۆڵ",
+            "سیمبۆڵەکە", "سیمبۆڵی", "chart", "the", "timeframe", "time", "frame", "symbol", "my", "tradingview", "a"])
 TF_PREP = _n(["لەسەر", "بۆ", "بە", "لە", "on", "to", "at", "in", "into"])
+# Words that make a bare number a timeframe (set_chart only).
+TF_WORDS = _n(["تایمفرەیم", "تایمفرەیمی", "تایمفرەیمەکە", "کاتی", "timeframe", "frame"])
 PRICE = _n(["نرخی", "نرخ", "نەرخی", "نەرخ", "نرخەکەی", "نرخەکە", "نرخێ", "price", "prices", "rate", "quote",
             "the", "of", "is", "current", "s"])
 HOW_MUCH = _phrases(["چەندە", "چەند", "بە چەندە", "لە چەندە", "لە چەندایە", "بەچەندە", "چ نرخێکە",
-                     "لە چ نرخێکە", "لە چ نرخێکدایە", "چ نرخێکدایە", "how much", "how much is"])
+                     "لە چ نرخێکە", "لە چ نرخێکدایە", "چ نرخێکدایە", "how much", "how much is",
+                     # «زێڕ بە چەند مامەڵە دەکرێت» ("what is gold traded at"; the local brain
+                     # answered this phrasing from memory with a made-up price, 2026-09-25)
+                     # («دەکرێت» itself is consumed as a politeness word, see POLITE)
+                     "بە چەند مامەڵە", "بە چەندە مامەڵە", "لە چ نرخێک مامەڵە", "لە چەند مامەڵە"])
+# "tell me ..." before a price question (with or without a price word).
+TELL_ME = _phrases(["پێم بڵێ", "پێ بڵێ", "بۆم بڵێ", "بڵێ", "tell me"])
 # "what is ..." / «... چییە» ask for a price only next to a price word («زێڕ چییە» = what is gold?).
 WHAT_IS = _phrases(["چییە", "چیە", "چی یە", "پێم بڵێ", "پێ بڵێ", "بڵێ", "بزانە", "what is", "whats", "what s",
                     "what", "tell me", "give me", "check", "get"])
+# The weak forms ask a quantity unless a price word is there («چەند زێڕ», "how much gold").
+WEAK_HOW_MUCH = frozenset(_phrases(["چەند", "how much"]))
+# KurdishTTS STT spellings of «نرخی» heard on this PC (2026-09-24). A new one is added
+# here when it is seen in a transcript, never guessed from its shape.
+MANGLED_PRICE = _n(["نەخنەشکی"])
 PRICE_CORE = _n(["نرخی", "نرخ", "نەرخی", "نەرخ", "نرخەکەی", "نرخەکە", "قیمەتی", "قیمەت", "price", "prices", "quote"])
 NOW = _n(["ئێستا", "ئێستای", "ئەمڕۆ", "ئەمڕۆی", "now", "right", "today", "currently", "live"])
 ANALYZE = _phrases(["شیکاری", "شیکار", "شیکردنەوە", "شیکردنەوەی", "شی", "analyze", "analyse", "analysis",
                     "analysis of", "analyze the", "analyse the", "do an analysis of", "do analysis on"])
+ANALYSIS_NOUNS = frozenset(_phrases(["analysis", "analysis of"]))
+# What "analyze ..." may take without an instrument ("analyze the market", «چارتەکە شی بکەرەوە»).
+ANALYZE_OBJECT = _n(["market", "chart", "بازاڕ", "بازاڕەکە", "بازار", "بازارەکە", "چارت", "چارتەکە", "چارتەکەم"])
 ANALYZE_VERB = _phrases(["بکە", "بکەرەوە", "بکەوە", "بکەیت", "بکەیتەوە", "بۆ بکە", "شیبکەرەوە"])
 ANALYZE_ONE = _phrases(["شیبکەرەوە", "شیکاربکە", "شیکاریبکە"])
 MARKET = _n(["بازاڕ", "بازاڕەکە", "بازار", "بازارەکە", "market", "the"])
@@ -126,6 +146,8 @@ DRAWINGS = _n(["هێڵەکانت", "هێڵەکان", "هێڵەکانم", "هێڵ
 DRAWINGS_CORE = _n(["هێڵەکانت", "هێڵەکان", "هێڵەکانم", "هێڵەکانی", "کێشراوەکانت", "کێشراوەکان", "کێشراوەکانی",
                     "نیشانەکانت", "نیشانەکان", "ئاستەکانت", "ئاستەکان", "کێشانەکانت", "کێشانەکان", "drawings",
                     "lines", "levels", "marks"])
+# Verbs that clear a chart without deleting it («چارتەکە پاک بکەرەوە», "clear the chart").
+CLEAN_VERBS = frozenset(_phrases(["پاک بکەرەوە", "پاکی بکەرەوە", "پاکبکەرەوە", "clear", "clean", "wipe"]))
 CLEAR_EXTRA = _n(["هەموو", "هەمووی", "لەسەر", "چارتەکە", "چارت", "سەر", "off", "from"])
 ALERTS = _n(["ئاگادارکردنەوەکانم", "ئاگادارکردنەوەکان", "ئاگادارکردنەوەکانی", "ئاگادارییەکانم", "ئاگادارییەکان",
              "ئاگاداریەکانم", "ئاگاداریەکان", "ئالێرتەکانم", "ئالێرتەکان", "ئەلێرتەکانم", "ئەلێرتەکان", "alerts",
@@ -137,9 +159,14 @@ LIST = _phrases(["پیشان بدە", "پیشانم بدە", "پیشانبدە",
 HAVE = _phrases(["چ ئاگادارکردنەوەیەکم هەیە", "چ ئاگادارییەکم هەیە", "ئاگادارکردنەوەم هەیە", "چەند ئاگادارکردنەوەم هەیە",
                  "what alerts do i have", "do i have alerts", "do i have any alerts", "how many alerts do i have",
                  "any alerts"])
+# No "stop": «stop the alarm» is what the user says while an alert is being
+# spoken (review 2026-09-25: it cancelled EVERY active alert, with no question).
 CANCEL = _phrases(["هەڵبوەشێنەوە", "هەڵوەشێنەوە", "هەڵیبوەشێنەوە", "هەڵیانبوەشێنەوە", "بسڕەوە", "بیانسڕەوە",
-                   "لابە", "لاببە", "ڕەتبکەرەوە", "بکوژێنەوە", "cancel", "delete", "remove", "clear", "stop"])
-ALL = _n(["هەموو", "هەمووی", "all", "every", "my", "the"])
+                   "لابە", "لاببە", "ڕەتبکەرەوە", "بکوژێنەوە", "cancel", "delete", "remove", "clear"])
+# Only an explicit "all" (or the plural alert word) means every alert: "the"
+# and "my" made «cancel the alert» / «remove my alert» cancel all of them.
+ALL = _n(["هەموو", "هەمووی", "all", "every"])
+ALERT_FILLER = _n(["my", "the", "active", "چالاکەکان", "چالاکەکانم"])
 NUMBER_WORD = _n(["ژمارە", "ژمارەی", "number", "no", "id"])
 STOP_CORE = _n(["بوەستە", "ڕاوەستە", "ڕابوەستە", "وەستە", "بەسە", "ڕایگرە", "ڕابگرە", "ستۆپ", "بێدەنگ", "بێدەنگبە",
                 "کپ", "stop", "enough", "quiet", "silence", "halt", "shush", "cancel"])
@@ -272,9 +299,14 @@ def instrument(window: list[str]) -> tuple[str, str] | None:
     return (found, text) if found else None
 
 
-def timeframe(window: list[str]) -> str | None:
+def timeframe(window: list[str], *, bare: bool = False) -> str | None:
     """Canonical timeframe for an exact timeframe expression (every word must
-    be a number or a unit): «١٥ خولەک», «چوار کاتژمێر», «کاتژمێرێک», "15m", "H4"."""
+    be a number or a unit): «١٥ خولەک», «چوار کاتژمێر», «کاتژمێرێک», "15m", "H4".
+
+    A bare number ("60", «٦٠») counts only with ``bare=True``: the review
+    (2026-09-25) saw "draw support at 60" draw engine levels on H1 instead of a
+    line at 60, and "gold 240" switch the chart to H4 -- prices of silver/oil
+    look exactly like minutes."""
     from ..trading.common import TIMEFRAMES, normalize_timeframe
 
     if len(window) == 1:
@@ -283,6 +315,8 @@ def timeframe(window: list[str]) -> str | None:
             return _UNIT_ONE[word]
         compact = _COMPACT_TF.match(word)
         if compact:
+            if not bare and compact.group(3) and not compact.group(4):
+                return None
             value = normalize_timeframe(word)
             return value if value in TIMEFRAMES else None
         return None
@@ -464,20 +498,30 @@ def _cancel_alerts(words: Words) -> Intent | None:
         return None
     everything = words.take_words(ALL)
     if plural:
+        # «ئاگادارکردنەوەکان بسڕەوە» / "delete my alerts": every alert (cancel_alert
+        # itself asks first when more than one is active).
+        words.take_words(ALERT_FILLER)
         return Intent("cancel_alerts", "cancel_alert", {"alert_id": "all"})
     words.take_words(NUMBER_WORD)
     number = words.take_window(lambda w: w[0] if w[0].isdigit() else None, sizes=(1,))
     if number is None:
-        return Intent("cancel_alerts", "cancel_alert", {"alert_id": "all"}) if everything else None
+        # one alert without a number («cancel the alert»): the model asks which
+        if not everything:
+            return None
+        words.take_words(ALERT_FILLER)
+        return Intent("cancel_alerts", "cancel_alert", {"alert_id": "all"})
+    words.take_words(ALERT_FILLER)
     return Intent("cancel_alerts", "cancel_alert", {"alert_id": str(int(number))})
 
 
 def _clear_drawings(words: Words) -> Intent | None:
-    if not words.take(CLEAR):
+    verb = words.take(CLEAR)
+    if not verb:
         return None
     if not words.take_words(DRAWINGS_CORE):
-        # «چارتەکە پاک بکەرەوە» / "clear the chart": only SAM's drawings go (never the user's).
-        if not words.take_words(_n(["چارتەکە", "چارت", "chart"])):
+        # «چارتەکە پاک بکەرەوە» / "clear the chart": only SAM's drawings go (never the
+        # user's). "delete/remove the chart" may mean the chart window: the model decides.
+        if verb[0] not in CLEAN_VERBS or not words.take_words(_n(["چارتەکە", "چارت", "chart"])):
             return None
     words.take_words(DRAWINGS)
     words.take_words(CLEAR_EXTRA)
@@ -486,14 +530,22 @@ def _clear_drawings(words: Words) -> Intent | None:
 
 def _analyze(words: Words) -> Intent | None:
     one = words.take(ANALYZE_ONE)
+    english = noun = False
     if not one:
-        if not words.take(ANALYZE):
+        found = words.take(ANALYZE)
+        if not found:
             return None
-        english = any(t.isascii() for t in words.tokens)
-        if not words.take(ANALYZE_VERB) and not english:
+        english = found[0][0].isascii()
+        noun = found[0] in ANALYSIS_NOUNS
+        if not english and not words.take(ANALYZE_VERB):
             return None
+    obj = words.take_words(ANALYZE_OBJECT)
     words.take_words(MARKET)
     symbol = words.take_window(instrument)
+    if english and symbol is None and (noun or not obj):
+        # bare "analysis" / "analyze" / "market analysis" ran a full analyse-and-draw on the
+        # chart (review 2026-09-25): without an instrument English needs a verb and an object.
+        return None
     tf = _take_timeframe(words)
     if words.take_words(AND):
         words.take_words(LEVELS)
@@ -532,9 +584,11 @@ def _draw_levels(words: Words) -> Intent | None:
                   chart_symbol=symbol is None)
 
 
-def _take_timeframe(words: Words) -> str | None:
+def _take_timeframe(words: Words, *, bare: bool = False) -> str | None:
+    """A timeframe with a unit («١٥ خولەک», "H4", "15m"); a bare number only
+    when ``bare`` (set_chart next to an explicit timeframe word)."""
     before = list(words.used)
-    tf = words.take_window(timeframe, sizes=(2, 1))
+    tf = words.take_window(lambda window: timeframe(window, bare=bare), sizes=(2, 1))
     if tf is None:
         return None
     # a preposition right before it belongs to it («لەسەر ١٥ خولەک»)
@@ -549,8 +603,12 @@ def _price(words: Words) -> Intent | None:
     price = words.take_words(PRICE_CORE)
     if not (how or price):
         return None
+    if not price and how[0] in WEAK_HOW_MUCH:
+        return None      # «چەند زێڕ» / "how much gold": a quantity, not a price question
     if price:
         words.take(WHAT_IS)
+    else:
+        words.take(TELL_ME)
     words.take_words(PRICE)
     words.take_words(NOW)
     symbol = words.take_window(instrument)
@@ -567,22 +625,39 @@ def _price(words: Words) -> Intent | None:
 
 
 def _mangled_price(token: str) -> bool:
-    return (3 <= len(token) <= 10 and not token.isascii() and token.startswith("ن")
-            and ("خ" in token or "ر" in token))
+    """A price word STT mangled: a spelling heard on this PC, or one letter
+    away from «نرخی». The old shape rule (any ن-word with خ/ر) took «نەخۆشی»,
+    «نەرمی» and «نزیکترین» for a price word (review 2026-09-25)."""
+    return not token.isascii() and (token in MANGLED_PRICE or _within_one(token, "نرخی"))
+
+
+def _within_one(a: str, b: str) -> bool:
+    """Edit distance <= 1 (one letter added, dropped or changed)."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
 
 
 def _set_chart(words: Words) -> Intent | None:
+    # "change the timeframe to 60" names a timeframe; "gold 240" / «بیتکۆین ٦٠» may be a price.
+    bare = any(token in TF_WORDS for token in words.tokens)
     verb = words.take(SHOW)
     words.take_words(CHART)
     symbol = words.take_window(instrument)
-    tf = _take_timeframe(words)
+    tf = _take_timeframe(words, bare=bare)
     if not (symbol or tf):
         return None
     if verb and verb[0] in WEAK_SHOW and not tf:
         return None       # «زێڕ بکە» / "set gold": only with a timeframe
     if not verb:
-        # «گۆڵد لەسەر ١٥ خولەک» without a verb: only instrument + timeframe
-        if not (symbol and tf):
+        # «گۆڵد لەسەر ١٥ خولەک» / "timeframe 15 minutes" without a verb: instrument or a
+        # timeframe word next to the timeframe
+        if not (tf and (symbol or bare)):
             return None
     words.take_words(TF_PREP)
     words.take_words(CHART)

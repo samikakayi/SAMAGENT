@@ -23,8 +23,10 @@ Rules added by the repair review (2026-09-24, measured):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncIterator
 
@@ -45,6 +47,9 @@ SORANI_DONE = "تەواو بوو."
 SORANI_NOT_DONE = "ببورە، نەکرا."
 SORANI_NOT_UNDERSTOOD = "ببورە، تێنەگەیشتم. دەتوانیت جارێکی تر بیڵێیتەوە؟"
 LOCAL_ACK_CKB = "یەک چرکە، بە مێشکی ناوخۆیی بیری لێ دەکەمەوە."
+# The local brain answered an action with words only (qwen3:8b said «نۆتپاد ئامادەیە» with no
+# tool call, 2026-09-25): SAM never claims an action it did not run.
+LOCAL_NOT_DONE_CKB = "ببورە، ئەمەم نەکرد؛ مێشکی ناوخۆیی تێی نەگەیشت. تکایە بە شێوەیەکی تر بیڵێوە."
 
 # Short acknowledgements spoken while tools run (cascade voice only).
 ACKS_DO = ("باشە.", "بەسەرچاو.", "ئێستا دەیکەم.", "با بیکەم.", "باشە، ئێستا.")
@@ -109,6 +114,54 @@ def clean_tool_args(registry: Any, name: str, args: Any) -> Any:
         return args
     declared = params.get("properties") or {}
     return {key: value for key, value in args.items() if key in declared}
+
+
+# Imperatives that ask SAM to DO something on the computer (not "tell me" / «پێم بڵێ»).
+_ACTION_EN = frozenset({"open", "close", "start", "launch", "run", "draw", "delete", "remove", "clear", "set", "put",
+                        "play", "pause", "mute", "unmute", "type", "send", "click", "save", "create", "make", "move",
+                        "copy", "write", "switch", "change", "turn", "cancel", "minimize", "maximize", "install"})
+_ACTION_CKB = ("بکەرەوە", "بکەوە", "دابخە", "داخە", "بکێشە", "بسڕەوە", "لابە", "بنووسە", "بنێرە", "بگۆڕە", "دابنێ",
+               "هەڵبکە", "بکوژێنەوە", "لێبدە", "بخە", "بگرە", "بهێنە", "دروستبکە", "هەڵبگرە", "کپبکە")
+_DONE_MARKERS = ("ئامادەیە", "کرایەوە", "کرا.", "کرا،", "کێشرا", "سڕایەوە", "سڕدرایەوە", "دانرا", "گۆڕا", "لابرا",
+                 "داخرا", "نێردرا", "نووسرا", "تەواو بوو", "کردمەوە", "done", "opened", "is open", "is ready",
+                 "closed", "i have", "i've")
+
+
+def _is_action_command(text: str) -> bool:
+    words = normalize_ckb(text, strip_punct=True).split()
+    if not words:
+        return False
+    if any(w in _ACTION_EN for w in words[:3]):
+        return True
+    return "بڵێ" not in words and any(w.endswith(v) for w in words[-3:] for v in _ACTION_CKB)
+
+
+_NUMBER = re.compile(r"[0-9\u0660-\u0669]{3,}")
+_EASTERN_TO_ASCII = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def _unverified_number(reply: str, user_text: str, grounding: str = "") -> bool:
+    """A price-like number (3+ digits) with no tool result behind it: not said
+    by the user and not in ``grounding`` (the system prompt: time, facts,
+    library passages). Live runs 2026-09-25: qwen3:8b said «زێڕ ئێستا لە ٤٢٦٩
+    دەبێت» from memory, and answered a window count with the gold price."""
+    said = {n.translate(_EASTERN_TO_ASCII) for n in _NUMBER.findall(f"{user_text} {grounding}")}
+    return bool({n.translate(_EASTERN_TO_ASCII) for n in _NUMBER.findall(reply)} - said)
+
+
+# Things only a tool can know (alerts, windows, the chart, SAM's drawings, files).
+_STATE_STEMS = tuple(normalize_ckb(s) for s in (
+    "ئاگادارکردنەوە", "ئاگاداری", "ئالێرت", "ئەلێرت", "پەنجەرە", "چارت", "کێشراو", "فایل", "alert", "alarm",
+    "window", "chart", "drawing", "file"))
+
+
+def _asks_state(text: str) -> bool:
+    return any(w.startswith(stem) for w in normalize_ckb(text, strip_punct=True).split() for stem in _STATE_STEMS)
+
+
+def _claims_done(reply: str) -> bool:
+    lowered = normalize_ckb(reply)
+    return any(normalize_ckb(marker) in lowered for marker in _DONE_MARKERS)
 
 
 def _echoes(reply: str, user_text: str) -> bool:
@@ -208,6 +261,7 @@ class Responder:
         last: tuple[str, dict[str, Any], dict[str, Any]] | None = None
         extra: set[str] = set()
         completed = False
+        block = ""                              # grounding text for the local-brain number check
 
         def emit(piece: str, **mark: Any) -> str:
             if not parts:
@@ -241,6 +295,7 @@ class Responder:
                 completed = True
                 return
             local_ack = await self._local_ack(mode) if acknowledge else ""
+            local_acked = bool(local_ack)
             if local_ack:
                 yield emit(local_ack, ack=True)
             for round_no in range(max_rounds + 1):
@@ -261,9 +316,24 @@ class Responder:
                                 said = True
                                 yield emit(piece)
                     else:
-                        response = await self._ask(messages, ladder, tools, tool_choice, turn, deadline_s=deadline)
+                        # After a tool with its own Sorani result, no cold local round (up to
+                        # 150 s): if no cloud model can word it, that result is said at once.
+                        local = False if after_tools and last is not None and own_sentence(*last) else None
+                        async for kind, value in self._ask_announcing(
+                                messages, ladder, tools, tool_choice, turn, deadline, local,
+                                announce=acknowledge and not local_acked):
+                            if kind == "ack":
+                                local_acked = True
+                                yield emit(value, ack=True)
+                            else:
+                                response = value
+                        if response is None:           # _ask_announcing always yields one or raises
+                            raise LLMError("exhausted", "no answer")
                         calls = list(response.tool_calls) if tool_choice != "none" else []
                         reply = response.text or ""
+                        if not calls and last is None and self._local_false_claim(
+                                response, text, str(messages[0].get("content") or "") if messages else block):
+                            reply = LOCAL_NOT_DONE_CKB
                         if not calls and not after_tools and self._should_reword(response, text):
                             better = await self._reword(messages, tools, turn)
                             if better is not None and better.tool_calls:
@@ -298,6 +368,7 @@ class Responder:
                     yield emit(self._ack(calls), ack=True)
                 messages.append(response.assistant_message())
                 taint.use(scope)
+                done_now: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
                 for call in calls:
                     args = clean_tool_args(self.app.tools, call.name, call.arguments)
                     result = await self._run_tool(call, source, seen)
@@ -306,9 +377,10 @@ class Responder:
                         extra |= set(((result.get("data") or {}).get("tools")) or [])
                     else:
                         last = (call.name, args if isinstance(args, dict) else {}, result)
+                        done_now.append(last)
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
                                      "content": json.dumps(result, ensure_ascii=False, default=str)})
-                own = self._local_outcome(response, last, extra)
+                own = self._local_outcome(response, done_now, extra)
                 if own:
                     # The local brain picked the tool: its own Sorani result is the answer
                     # (a second local round costs 3-10 s on this PC's CPU and says the same).
@@ -343,13 +415,73 @@ class Responder:
             return ""
         return "" if loaded else LOCAL_ACK_CKB
 
+    async def _ask_announcing(self, messages: list[dict[str, Any]], ladder: list[str], tools: list[dict[str, Any]],
+                              tool_choice: str | None, turn: Any, deadline: float, local: bool | None, *,
+                              announce: bool) -> AsyncIterator[tuple[str, Any]]:
+        """``_ask`` that yields ("ack", LOCAL_ACK_CKB) when the round falls to a
+        COLD local brain (every cloud rung failed mid-turn, or the deadline cut
+        a slow one: the user would otherwise hear ~1.5 min of silence), then
+        ("response", LLMResponse). LLMError propagates."""
+        if not announce or local is False:
+            yield "response", await self._ask(messages, ladder, tools, tool_choice, turn, deadline_s=deadline,
+                                              local=local)
+            return
+        cold = asyncio.Event()
+
+        def on_local(is_cold: bool) -> None:
+            if is_cold:
+                cold.set()
+
+        task = asyncio.ensure_future(self._ask(messages, ladder, tools, tool_choice, turn, deadline_s=deadline,
+                                               local=local, on_local=on_local))
+        waiter = asyncio.ensure_future(cold.wait())
+        try:
+            await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if cold.is_set() and not task.done():
+                yield "ack", LOCAL_ACK_CKB
+            yield "response", await task
+        finally:
+            waiter.cancel()
+            if not task.done():
+                task.cancel()
+
     @staticmethod
-    def _local_outcome(response: LLMResponse | None, last: Any, extra: set[str]) -> str:
-        """The tool's own Sorani sentence after a local-brain tool call ('' =
-        let the model word it: a list the user wants read, more tools needed)."""
-        if response is None or response.provider != LOCAL_PROVIDER or last is None or extra:
+    def _local_false_claim(response: LLMResponse, user_text: str, grounding: str = "") -> bool:
+        """The local brain answered with words only where a tool was needed: a
+        short 'done/ready' claim or an echo of an action command (qwen3:8b:
+        «نۆتپاد ئامادەیە», «کرۆم بکەرەوە.»), a price-like number that no tool,
+        the user or ``grounding`` (the system prompt with this turn's library
+        passages) gave it («زێڕ ئێستا لە ٤٢٦٩ دەبێت»), or a short statement about
+        alerts / windows / the chart / files that only a tool can know."""
+        if response.provider != LOCAL_PROVIDER or response.tool_calls:
+            return False
+        reply = (response.text or "").strip()
+        if not reply:
+            return False
+        if _unverified_number(reply, user_text, grounding):
+            return True
+        if _asks_state(user_text) and len(reply) <= 160:
+            return True       # «ئاگادارکردنەوەکان بۆ زێڕ نەداناوە» with no list_alerts call (live run)
+        if len(reply) > 90 or not _is_action_command(user_text):
+            return False
+        return _claims_done(reply) or _echoes(reply, user_text)
+
+    @staticmethod
+    def _local_outcome(response: LLMResponse | None, done: list[Any], extra: set[str]) -> str:
+        """The tools' own Sorani sentences after local-brain tool calls, one per
+        call ('' = let the model word it: a list the user wants read, more tools
+        needed). Live run 2026-09-25: «نرخی زێڕ و زیو» made two get_price calls
+        and only the last result was said."""
+        if response is None or response.provider != LOCAL_PROVIDER or not done or extra:
             return ""
-        return own_sentence(*last) or ""
+        sentences: list[str] = []
+        for item in done:
+            sentence = own_sentence(*item)
+            if not sentence:
+                return ""
+            if sentence not in sentences:
+                sentences.append(sentence)
+        return " ".join(sentences)
 
     async def _streamed_round(self, messages: list[dict[str, Any]], ladder: list[str], tools: list[dict[str, Any]],
                               tool_choice: str | None, turn: Any, chunker: SentenceChunker) -> AsyncIterator[Any]:
@@ -414,7 +546,8 @@ class Responder:
 
     async def _ask(self, messages: list[dict[str, Any]], ladder: Any, tools: list[dict[str, Any]],
                    tool_choice: str | None, turn: Any, *, after: str | None = None,
-                   deadline_s: float | None = None, local: bool | None = None) -> LLMResponse:
+                   deadline_s: float | None = None, local: bool | None = None,
+                   on_local: Any = None) -> LLMResponse:
         """One non-streamed round. An answer with neither text nor a tool call
         is treated as a silent failure and the remaining rungs are asked once.
 
@@ -434,6 +567,8 @@ class Responder:
                   "reasoning": str(self.app.config.get("conversation.reasoning", "minimal") or "minimal")}
         if local is not None:
             kwargs["local"] = local
+        if on_local is not None:
+            kwargs["on_local"] = on_local
         response = await self._chat_reserving(messages, refs, kwargs)
         if (response.text or "").strip() or response.tool_calls:
             return response
@@ -466,7 +601,8 @@ class Responder:
                 break
             try:
                 # never the local brain here: the fast rungs after the head have not been asked yet
-                return await self.app.llm.chat(messages, ladder=[ref], **{**kwargs, "deadline_s": left, "local": False})
+                return await self.app.llm.chat(messages, ladder=[ref], **{**kwargs, "deadline_s": left, "local": False,
+                                                                          "on_local": None})
             except LLMError as err:
                 log.info("%s gave no answer (%s); next rung", ref, self.app.redact(str(err))[:160])
         left = float(deadline_s) - (time.monotonic() - started)

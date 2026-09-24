@@ -14,6 +14,14 @@ The program is parsed (``ast``) and judged before anything runs:
 ``Verdict.reads_files`` / ``network`` mark output that must be returned as
 untrusted data. Literal read paths are checked with the hands path policy
 (credential files -> blocked).
+
+A static scan of Python is a heuristic, so "safe" code also runs in the OS
+sandbox of python_sandbox.py (Low integrity, no child processes). Holes an
+independent adversarial pass found in the allowlist (2026-09-25) are closed
+here: ``numpy.ctypeslib`` (full ctypes without importing ctypes), ``from numpy
+import ctypeslib``, numpy's URL fetcher ``DataSource``, pandas readers on a
+computed path (a URL built at run time), pickle loads, and sympy's
+``sympify``/``parse_expr`` (they call ``eval`` on strings the AST never sees).
 """
 
 from __future__ import annotations
@@ -29,7 +37,14 @@ SAFE_MODULES = frozenset({
     "string", "textwrap", "unicodedata", "json", "csv", "dataclasses", "typing", "typing_extensions", "enum",
     "abc", "copy", "pprint", "reprlib", "hashlib", "hmac", "base64", "binascii", "struct", "uuid", "secrets",
     "difflib", "contextlib", "warnings", "traceback", "io", "zlib", "locale", "graphlib",
-    "numpy", "pandas", "scipy", "sympy", "statsmodels", "sklearn", "matplotlib", "PIL", "pathlib", "tzdata"})
+    "numpy", "pandas", "scipy", "statsmodels", "sklearn", "matplotlib", "PIL", "pathlib", "tzdata"})
+# Attributes / imported names of allowlisted packages that reach the system, the
+# network or eval (kind for REASON_CKB).
+DANGEROUS_ATTRS = {"ctypeslib": "system", "ctypes": "system", "f2py": "system", "windll": "system",
+                   "cdll": "system", "oledll": "system", "CDLL": "system", "WinDLL": "system", "system": "system",
+                   "popen": "system", "startfile": "system", "read_clipboard": "system", "to_clipboard": "system",
+                   "DataSource": "network", "_datasource": "network", "sympify": "code", "parse_expr": "code",
+                   "lambdify": "code", "read_pickle": "code"}
 BLOCKED_MODULES = {"win32crypt": "decrypts saved passwords/keys (DPAPI)", "MetaTrader5": "trading terminal access"}
 # Patterns (matched on the lower-cased source) that make a program blocked outright.
 BLOCKED_MARKERS: dict[str, str] = {
@@ -51,9 +66,12 @@ DANGEROUS_NAMES = {"eval": "code", "exec": "code", "compile": "code", "__import_
 # looks the same, so with pathlib imported these always ask).
 PATHLIB_WRITES = frozenset({"rename", "replace", "symlink_to", "hardlink_to"})
 READ_FUNCS = frozenset({"read_csv", "read_excel", "read_json", "read_parquet", "read_table", "loadtxt",
-                        "genfromtxt", "load"})
+                        "genfromtxt", "load", "read_html", "read_xml", "read_fwf", "read_feather", "read_orc",
+                        "read_stata", "read_sas", "read_spss", "read_hdf", "fromfile", "memmap", "open_memmap",
+                        "imread", "loadmat"})
 WRITE_FUNCS = frozenset({"to_csv", "to_excel", "to_json", "to_parquet", "to_pickle", "savetxt", "save", "savez",
-                         "savefig", "to_html"})
+                         "savefig", "to_html", "to_hdf", "to_feather", "to_stata", "to_xml", "tofile", "imsave",
+                         "savemat"})
 _ABS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\]|/[A-Za-z]|~[\\/]?|%[A-Za-z_]+%)")
 _URL = re.compile(r"^(?:https?|ftp|wss?)://", re.I)
 
@@ -153,9 +171,16 @@ def scan(code: str, *, policy: Any = None) -> Verdict:
                 verdict.raise_to("confirm", "captures the screen (PIL.ImageGrab)", "system")
         else:
             continue
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:         # «from numpy import ctypeslib»
+                if alias.name in DANGEROUS_ATTRS:
+                    verdict.raise_to("confirm", f"imports {alias.name}", DANGEROUS_ATTRS[alias.name])
         for name in names:
             top = name.split(".")[0]
             imports.add(top)
+            for part in name.split(".")[1:]:     # «import numpy.ctypeslib»
+                if part in DANGEROUS_ATTRS:
+                    verdict.raise_to("confirm", f"imports {name}", DANGEROUS_ATTRS[part])
             if top in BLOCKED_MODULES:
                 verdict.raise_to("blocked", f"imports {top}: {BLOCKED_MODULES[top]}")
             elif top in NETWORK_MODULES:
@@ -174,6 +199,8 @@ def scan(code: str, *, policy: Any = None) -> Verdict:
                 verdict.raise_to("confirm", f"reaches Python internals ({attr})", "internals")
             if "pathlib" in imports and attr in PATHLIB_WRITES:
                 verdict.raise_to("confirm", f"changes files with pathlib ({attr})", "system")
+            if attr in DANGEROUS_ATTRS:
+                verdict.raise_to("confirm", f"uses {attr}", DANGEROUS_ATTRS[attr])
         if isinstance(node, ast.Call):
             _scan_call(node, verdict, read_literals, policy, imports)
     for node in ast.walk(tree):
@@ -220,6 +247,9 @@ def _path_base(node: ast.AST) -> ast.AST | None:
 def _scan_call(node: ast.Call, verdict: Verdict, read_literals: set[int], policy: Any, imports: set[str]) -> None:
     func = node.func
     name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+    for keyword in node.keywords:
+        if keyword.arg == "allow_pickle" and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is False):
+            verdict.raise_to("confirm", "loads pickled data (runs code)", "code")
     if name in ("getattr", "hasattr") and len(node.args) >= 2:
         attr = _literal(node.args[1])
         if attr is None or (attr.startswith("__") and attr not in ALLOWED_DUNDERS):
@@ -254,11 +284,13 @@ def _scan_call(node: ast.Call, verdict: Verdict, read_literals: set[int], policy
             (k.value for k in node.keywords if k.arg in ("path", "path_or_buf", "fname", "file", "filepath_or_buffer",
                                                          "io", "excel_writer")), None)
         if target is not None and _literal(target) is None:
-            # a variable/expression path cannot be judged statically
+            # a variable/expression path cannot be judged statically; for a reader
+            # it may be a URL built at run time (pandas fetches URLs itself)
             if name in WRITE_FUNCS:
                 verdict.raise_to("confirm", f"writes to a computed path ({name})", "outside")
             else:
                 verdict.reads_files = True
+                verdict.raise_to("confirm", f"reads a computed path or address ({name})", "outside")
             return
         _judge_path(target, writing=name in WRITE_FUNCS, verdict=verdict, read_literals=read_literals,
                     policy=policy, how=name)

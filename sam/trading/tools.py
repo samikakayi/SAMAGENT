@@ -182,14 +182,28 @@ async def list_alerts(ctx: ToolContext, status: str = "active") -> dict[str, Any
     return ok(f"{len(alerts)} ئاگادارکردنەوە ({status}).", alerts=items)
 
 
-@tool("cancel_alert", description="Cancel one alert by id, or all active alerts with alert_id='all'.",
+_ALL_WORDS = ("all", "هەموو", "هەمووی")
+_EASTERN = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+@tool("cancel_alert", description="Cancel one alert by id, or all active alerts with alert_id='all' (the user is "
+                                  "asked first when more than one is active).",
       description_ckb="هەڵوەشاندنەوەی ئاگادارکردنەوە",
       params={"type": "object", "properties": {"alert_id": {"type": "string"}}, "required": ["alert_id"]},
-      examples_ckb=("هەموو ئاگادارکردنەوەکان هەڵبوەشێنەوە",), risk="safe", blocking=True, timeout_s=10)
+      examples_ckb=("هەموو ئاگادارکردنەوەکان هەڵبوەشێنەوە",), risk="safe", blocking=True, timeout_s=30)
 async def cancel_alert(ctx: ToolContext, alert_id: str) -> dict[str, Any]:
     monitor = _trading(ctx).monitor
     if monitor is None:
         return fail("The market monitor is not running.")
+    if str(alert_id).strip().lower() in _ALL_WORDS:
+        # Cancelled alerts cannot be brought back: several at once need a yes (the
+        # review found «cancel the alert» / «stop the alarm» cancelling every one).
+        active = monitor.list("active")
+        if len(active) > 1:
+            question = f"هەر {str(len(active)).translate(_EASTERN)} ئاگادارکردنەوە چالاکەکەت هەڵبوەشێنمەوە؟"
+            detail = "\n".join(f"#{a['id']}: {_alert_sentence(a)}" for a in active[:12])
+            if not await ctx.confirm(question, detail):
+                return fail("The user did not approve cancelling all alerts; nothing was cancelled.", declined=True)
     try:
         count = monitor.cancel(alert_id)
     except (TypeError, ValueError):

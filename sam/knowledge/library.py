@@ -27,7 +27,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -387,7 +387,10 @@ class Library:
             if not served:
                 store.update(doc_id, status="failed", error="cancelled")
             return {**base, "status": "cancelled", "document_id": doc_id}
-        chunks = chunk_blocks(extracted.blocks, target=int(self.setting("knowledge.chunk_chars", 900)),
+        # A key pasted into the user's notes never reaches the database, the panel or a
+        # model: known key values and key shapes are masked before anything is stored.
+        blocks = self._redacted(extracted.blocks)
+        chunks = chunk_blocks(blocks, target=int(self.setting("knowledge.chunk_chars", 900)),
                               overlap=int(self.setting("knowledge.overlap_chars", 150)))
         if not chunks:
             error = ("only scanned pages and Windows OCR is not available" if extracted.skipped_pages
@@ -415,6 +418,13 @@ class Library:
         return {"path": str(path), "title": extracted.title, "status": "reindexed" if existing else "indexed",
                 "document_id": doc_id, "pages": extracted.pages, "chunks": len(chunks),
                 "ocr_pages": extracted.ocr_pages, "skipped_pages": extracted.skipped_pages}
+
+    def _redacted(self, blocks: list[Any]) -> list[Any]:
+        out = []
+        for block in blocks:
+            masked = self.app.redact(block.text)
+            out.append(block if masked == block.text else replace(block, text=masked))
+        return out
 
     # -- OCR ---------------------------------------------------------------------------------------------------------
     def _ocr_fn(self) -> Callable[[Any], str] | None:
@@ -497,7 +507,8 @@ class Library:
                 "document_id": hit["document_id"], "title": hit["title"], "page": hit["page_start"],
                 "page_end": hit["page_end"], "section": hit["section"], "source": hit["source"],
                 "citation": en, "citation_ckb": ckb, "score": hit["score"], "matched": hit["matched"],
-                "text": best_window(hit["text"], concepts, max_chars)})
+                # redacted again here: passages indexed before masking existed
+                "text": self.app.redact(best_window(hit["text"], concepts, max_chars))})
         return {"query": question, "concepts": [c.label for c in concepts], "passages": passages}
 
     async def asearch(self, question: str, k: int = 5, **kwargs: Any) -> dict[str, Any]:

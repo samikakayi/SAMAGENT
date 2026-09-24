@@ -177,6 +177,28 @@ async def test_alert_tools_set_list_and_cancel(make_app):
     assert (await app.tools.dispatch("cancel_alert", {"alert_id": "7"}, source="text"))["ok"] is False
 
 
+async def test_cancelling_several_alerts_asks_first(make_app):
+    """'all' with more than one active alert needs a yes: a no cancels nothing."""
+    feed = FakeFeed({"M1": m1(2690.0, end=T0)}, price=2690.0)
+    app, _ = setup_app(make_app, feed)
+    for level in ("2700", "2750"):
+        await app.tools.dispatch("set_alert", {"kind": "price_cross", "symbol": "XAUUSD", "level": level}, source="text")
+    asked: list[str] = []
+
+    async def answer(question, detail="", **_kw):
+        asked.append(question)
+        return approve
+
+    app.confirm.confirm = answer
+    approve = False
+    declined = await app.tools.dispatch("cancel_alert", {"alert_id": "all"}, source="text")
+    assert not declined["ok"] and declined["data"]["declined"] and len(app.trading.monitor.list("active")) == 2
+    assert asked == ["هەر ٢ ئاگادارکردنەوە چالاکەکەت هەڵبوەشێنمەوە؟"]
+    approve = True
+    done = await app.tools.dispatch("cancel_alert", {"alert_id": "all"}, source="text")
+    assert done["ok"] and done["data"]["cancelled"] == 2 and app.trading.monitor.list("active") == []
+
+
 async def test_a_tradingview_sourced_alert_uses_the_chart_price(make_app):
     from engine_helpers import FakeTV
     feed = FakeFeed({"M1": m1(2600.0, end=T0)}, price=2600.0)  # MT5 would never reach the level

@@ -89,6 +89,7 @@ LOCAL_BRAIN_DEFAULTS: dict[str, Any] = {
     "llm.local.keep_alive": "5m",      # the model stays loaded a few minutes after use
     "llm.local.num_ctx": 8192,         # SAM's prompt is ~4.1k tokens before history
     "llm.local.max_tokens": 1024,      # 8 tok/s on CPU: an unbounded reply could run for minutes
+    "llm.local.history_messages": 0,   # earlier messages the local model sees (llm_local.trim_history)
     "llm.local.timeout_s": 150,        # a cold first answer took 8 s load + 86 s prompt (busy PC)
     "llm.local.temperature": 0.3,
     "llm.local.think": False,          # Qwen3 would think before every tool call

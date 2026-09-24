@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 from brain_helpers import brain_app
-from fastpath_corpus import CORPUS, HELD_OUT, HELD_OUT_FIRST_RUN, evaluate
+from fastpath_corpus import (CORPUS, HELD_OUT, HELD_OUT_FIRST_RUN, REVIEW_FIRST_RUN, REVIEW_HELD_OUT,
+                             REVIEW_PROBES, evaluate)
 
 from sam.brain import fastpath
 from sam.brain.intents import match
@@ -110,6 +111,38 @@ def test_held_out_rows_were_scored_before_tuning():
     assert HELD_OUT_FIRST_RUN["precision"] == 1.0 and HELD_OUT_FIRST_RUN["rows"] == len(HELD_OUT)
     result = evaluate(match, HELD_OUT)
     assert result["precision"] >= 0.98 and result["recall"] >= HELD_OUT_FIRST_RUN["recall"]
+
+
+def test_the_reviewers_held_out_rows():
+    """The independent review's 77 adversarial rows: 21 of 64 negatives fired
+    on the first run (precision 0.38 on that set); none may fire now."""
+    assert REVIEW_FIRST_RUN["rows"] == len(REVIEW_HELD_OUT) and REVIEW_FIRST_RUN["fp"] == 21
+    result = evaluate(match, REVIEW_HELD_OUT)
+    assert result["fp"] == 0 and result["recall"] == 1.0, result["wrong"]
+    probes = evaluate(match, REVIEW_PROBES)
+    assert probes["fp"] == 0 and probes["recall"] == 1.0, probes["wrong"]
+
+
+@pytest.mark.parametrize("text", ["cancel the alert", "remove my alert", "stop the alarm", "stop alerts",
+                                  "ئاگادارکردنەوەکە بسڕەوە"])
+def test_one_alert_never_means_every_alert(text):
+    assert match(text) is None
+
+
+@pytest.mark.parametrize("text", ["draw support at 60", "هێڵی پشتگیری نەوت لە ٦٠ بکێشە", "gold 240", "بیتکۆین ٦٠",
+                                  "analyze", "market analysis", "delete the chart", "نەرمی زێڕ چەندە",
+                                  "how much gold"])
+async def test_prices_bare_nouns_and_look_alikes_go_to_the_model(fast, text):
+    app, backend = fast
+    await turn(app, text)
+    assert SEEN == [] and len(backend.requests) >= 1
+
+
+def test_a_timeframe_needs_a_unit_or_a_timeframe_word():
+    assert match("change the timeframe to 60").args == {"timeframe": "H1"}
+    assert match("draw support and resistance on 4 hours").args["timeframes"] == ["H4"]
+    assert match("draw support and resistance on H4").args["timeframes"] == ["H4"]
+    assert match("draw lines at 240") is None and match("switch to 240") is None
 
 
 def test_matching_is_instant():

@@ -369,3 +369,22 @@ async def test_add_tool_asks_for_a_big_folder_but_not_from_the_panel(app: Any, t
     asked.clear()
     ui = await app.tools.dispatch("knowledge_add", {"path": str(folder)}, source="ui")
     assert ui["ok"] and not asked
+
+
+async def test_a_key_pasted_into_a_document_is_never_stored_shown_or_sent(app: Any, tmp_path: Path) -> None:
+    """Review 2026-09-25: a key-shaped string in the user's notes was stored
+    verbatim in kb_chunks and shown by the panel's search box."""
+    bind(app)
+    fake_key = "AIza" + "SyReviewerFake0123456789abcdefghi"      # fake, in the real shape
+    doc = txt(tmp_path / "notes", "setup notes.txt",
+              f"My trading setup notes. Gemini key {fake_key} used for the bot. Support and resistance matter.")
+    report = await app.knowledge.add([str(doc)], wait_s=30)
+    assert report["ok"], report
+    stored = [row["text"] + row["text_norm"] for row in app.db.query("SELECT text, text_norm FROM kb_chunks")]
+    assert stored and not any(fake_key in text or fake_key.lower() in text for text in stored)
+    panel = app.knowledge.search("gemini key bot", k=3)
+    assert panel["passages"] and not any(fake_key in p["text"] for p in panel["passages"])
+    brain = await passages_for(app, "gemini key bot support", min_score=0.0)
+    assert brain and fake_key not in context_for_prompt(brain)
+    tool_result = await app.tools.dispatch("knowledge_search", {"query": "gemini key bot"}, source="text")
+    assert fake_key not in str(tool_result)

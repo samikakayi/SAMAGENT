@@ -36,7 +36,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncIterator, Iterator, Literal, Protocol
+from typing import Any, AsyncIterator, Callable, Iterator, Literal, Protocol
 
 log = logging.getLogger("sam.llm")
 
@@ -420,7 +420,7 @@ class LLMClient(LocalRung):
                    json_schema: dict[str, Any] | None = None, timeout_s: float | None = None,
                    turn: Any = None, rung_timeouts: dict[str, float] | None = None,
                    deadline_s: float | None = None, retry_transient: bool = True,
-                   local: bool | None = None) -> LLMResponse:
+                   local: bool | None = None, on_local: Callable[[bool], Any] | None = None) -> LLMResponse:
         """One completion through the ladder. Raises LLMError('exhausted').
 
         ``rung_timeouts`` ({ref or provider: seconds}) caps single rungs below
@@ -433,13 +433,18 @@ class LLMClient(LocalRung):
         asking the same rung again (a spoken turn has other rungs; Gemini
         direct answered 503 twice in a row, 3.9 s, in the repair probe).
         ``local``: after an exhausted ladder the local brain answers (its own
-        timeout, not the deadline); False skips it (llm_local.py)."""
+        timeout, not the deadline); False skips it (llm_local.py).
+        ``on_local(cold)`` is called right before the local brain runs (``cold``
+        = its model is not in memory: ~1.5 min on this PC), so a voice turn can
+        say «one moment» instead of staying silent."""
         req = self._request(messages, tools=tools, tool_choice=tool_choice, max_tokens=max_tokens,
                             temperature=temperature, reasoning=reasoning, json_schema=json_schema, timeout_s=timeout_s)
         try:
             response = await self._ladder_chat(req, ladder, turn, rung_timeouts, deadline_s, retry_transient)
         except LLMError as err:
             if err.kind == "exhausted" and self._local_allowed(local, req):
+                if on_local is not None:
+                    await self.announce_local(on_local)
                 return await self._local_chat(req, turn, err)
             raise
         self.note_cloud_answer(response)

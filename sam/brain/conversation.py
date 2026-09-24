@@ -300,6 +300,8 @@ class Conversation(Responder):
         they speak (load 8 s + a cold 4.1k-token prompt 86 s on this PC,
         llm_ollama.py), instead of after the transcript. Returns the task."""
         llm = self.app.llm
+        if int(getattr(self, "active_turns", 0) or 0):
+            return None           # a turn is using the local model now: a warm-up would only make it wait
         try:
             if llm.cloud_usable(self._ladder(mode)) or not llm.local_ready():
                 return None

@@ -21,7 +21,7 @@ from sam.brain.llm_local import CLOUD_BACK_CKB, LOCAL_NOTICE_CKB
 from sam.brain.llm_ollama import OllamaBackend, split_context, to_ollama_messages
 from sam.brain.local_server import OllamaServer, split_host
 from sam.brain.persona import CONTEXT_HEADING
-from sam.brain.responder import LOCAL_ACK_CKB
+from sam.brain.responder import LOCAL_ACK_CKB, LOCAL_NOT_DONE_CKB
 from sam.brain.tools import ok, tool
 from sam.events import ComponentStatus
 from sam.voice.notices import VoiceNotice
@@ -495,3 +495,154 @@ async def test_the_alert_list_is_read_out_without_a_second_local_round(make_app)
     app.llm.backends["ollama"] = local
     chunks = [c async for c in app.conversation.respond_stream("ئاگادارکردنەوەکانم چین؟ هەموویان", source="text")]
     assert "".join(chunks).strip() == "هیچ ئاگادارکردنەوەیەکی چالاکت نییە." and len(local.calls) == 1
+
+
+# --- review 2026-09-25: no silent cold local rounds, no false claims ----------------------------------------
+
+async def test_a_failed_wording_round_says_the_tools_own_sentence_not_a_cold_local_answer(make_app):
+    """The cloud picked get_price, then every rung rate-limited the wording round:
+    the tool's own Sorani result at once (the local brain's 150 s timeout would
+    have cost ~1.5 min of silence when cold)."""
+    steps = [Reply(calls=[("get_price", {"symbol": "XAUUSD"})])] + [rate_limited("groq", "m")] * 6
+    app, _ = brain_app(make_app, steps, tools=(fake_price,))
+    local = FakeLocal(["نرخی زێڕ ٤٣١٢ە."], loaded=[])
+    app.llm.backends["ollama"] = local
+    chunks = [c async for c in app.conversation.respond_stream("gold?", source="cascade")]
+    assert chunks[-1].strip() == "زێڕ ئێستا لەسەر ٤٣١٢ مامەڵە دەکرێت." and local.calls == []
+
+
+async def test_a_read_result_is_worded_locally_and_a_cold_start_is_announced(make_app):
+    """A result the user wants read (no own sentence) may go to the local brain,
+    and a cold one mid-turn is announced: the start-of-turn check saw a healthy cloud."""
+    steps = [Reply(calls=[("list_alerts", {"status": "all"})])] + [rate_limited("groq", "m")] * 6
+    app, _ = brain_app(make_app, steps, tools=(fake_alerts,))
+    local = FakeLocal(["هیچ ئاگادارکردنەوەیەکت نییە."], delay=0.05, loaded=[])
+    app.llm.backends["ollama"] = local
+    chunks = [c async for c in app.conversation.respond_stream("all my alerts", source="cascade")]
+    assert LOCAL_ACK_CKB in chunks and chunks[-1].strip() == "هیچ ئاگادارکردنەوەیەکت نییە."
+    assert len(local.calls) == 1
+
+
+async def test_a_slow_cloud_cut_by_the_deadline_announces_the_cold_local_brain(make_app):
+    app, groq = brain_app(make_app, ["late"] * 4)
+    original = groq.complete
+
+    async def slow(model, req):
+        await asyncio.sleep(2.0)
+        return await original(model, req)
+
+    groq.complete = slow
+    app.config.set("conversation.picker_deadline_s", 0.5)
+    local = FakeLocal(["سڵاو."], delay=0.05, loaded=[])
+    app.llm.backends["ollama"] = local
+    chunks = [c async for c in app.conversation.respond_stream("سڵاو", source="cascade")]
+    assert chunks[0] == LOCAL_ACK_CKB and chunks.count(LOCAL_ACK_CKB) == 1 and chunks[-1].strip() == "سڵاو."
+
+
+@pytest.mark.parametrize("claim", ["نۆتپاد ئامادەیە.", "نۆتپاد بکەرەوە.", "Notepad is open."])
+async def test_the_local_brain_never_claims_an_action_it_did_not_run(make_app, claim):
+    app, _ = brain_app(make_app, [rate_limited("groq", "openai/gpt-oss-20b")] * 4)
+    app.llm.backends["ollama"] = FakeLocal([claim], loaded=["qwen3:8b"])
+    chunks = [c async for c in app.conversation.respond_stream("نۆتپاد بکەرەوە", source="text")]
+    assert " ".join(c.strip() for c in chunks) == LOCAL_NOT_DONE_CKB
+
+
+async def test_small_talk_and_explanations_from_the_local_brain_stay(make_app):
+    app, _ = brain_app(make_app, [rate_limited("groq", "openai/gpt-oss-20b")] * 8)
+    app.llm.backends["ollama"] = FakeLocal(["سڵاو، فەرموو. چۆنی؟"], loaded=["qwen3:8b"])
+    chunks = [c async for c in app.conversation.respond_stream("سڵاو سام", source="text")]
+    assert " ".join(c.strip() for c in chunks) == "سڵاو، فەرموو. چۆنی؟"
+
+
+def test_the_local_request_has_a_short_history_and_the_local_rules():
+    """Live run 2026-09-25: after ten fast-path answers in the history qwen3:8b
+    answered two commands from memory, with no tool call."""
+    from sam.brain.llm_local import LOCAL_RULES, trim_history, with_local_rules
+
+    history = [{"role": "system", "content": f"rules\n\n{CONTEXT_HEADING}\nNow: 01:00."}]
+    for n in range(10):
+        history += [{"role": "user", "content": f"q{n}"}, {"role": "assistant", "content": f"a{n}"}]
+    current = [{"role": "user", "content": "now"}, {"role": "assistant", "content": "", "tool_calls": []},
+               {"role": "tool", "tool_call_id": "c1", "content": "{}"}]
+    trimmed = trim_history(history + current, 2)
+    assert [m["content"] for m in trimmed[1:3]] == ["q9", "a9"] and trimmed[3:] == current
+    ruled = with_local_rules(trimmed)
+    assert ruled[0]["content"].endswith(LOCAL_RULES) and split_context(ruled[0]["content"])[0] == "rules"
+    worker = [{"role": "system", "content": "w"}, {"role": "user", "content": "goal"},
+              {"role": "assistant", "content": "", "tool_calls": []}, {"role": "tool", "content": "{}"}]
+    assert trim_history(worker, 0) == worker                     # one goal + its tool rounds: untouched
+
+
+async def test_the_local_brain_gets_the_trimmed_request(make_app):
+    app, _ = brain_app(make_app, [rate_limited("groq", "openai/gpt-oss-20b")] * 30)
+    local = FakeLocal(["سڵاو."], loaded=["qwen3:8b"])
+    app.llm.backends["ollama"] = local
+    for text in ("یەک", "دوو", "سێ"):
+        [c async for c in app.conversation.respond_stream(text, source="text")]
+    request = local.calls[-1][1]
+    roles = [m["role"] for m in request.messages]
+    assert roles == ["system", "user"] and "SAM's local brain is answering" in request.messages[0]["content"]
+    app.config.set("llm.local.history_messages", 2)
+    [c async for c in app.conversation.respond_stream("چوار", source="text")]
+    assert [m["role"] for m in local.calls[-1][1].messages] == ["system", "user", "assistant", "user"]
+
+
+@pytest.mark.parametrize("user, reply, claim", [
+    ("پێم بڵێ زێڕ ئێستا بە چەند مامەڵە دەکرێت", "زێڕ ئێستا لە ٤٢٦٩ دەبێت.", True),
+    # live run 3: a window count answered with the gold price, an alert question from nothing
+    ("ئەو پەنجەرانەی ئێستا کراونەتەوە بژمێرە", "چەندە زێڕ لەسەر 4272 مامەڵە دەکرێت.", True),
+    ("چ ئاگادارکردنەوەیەکم بۆ زێڕ داناوە؟", "ئاگادارکردنەوەکان بۆ زێڕ نەداناوە.", True),
+    ("سڵاو، ئەمڕۆ چۆنی؟", "سڵاو، باشم. تۆ چۆنی؟", False),
+    ("what is gold doing", "Gold is around 4269 now.", True),
+    ("ئەگەر زێڕ گەیشتە ٤٣٠٠ چی بکەم؟", "کە گەیشتە ٤٣٠٠ چاوەڕێی شکاندن بکە.", False),   # the user's own number
+    ("ئۆردەر بلۆک چییە؟", "ئۆردەر بلۆک کۆتا مۆمی پێچەوانەیە پێش جووڵەیەکی بەهێز.", False),
+])
+def test_a_local_price_without_a_tool_is_not_said(user, reply, claim):
+    from sam.brain.responder import Responder
+
+    response = LLMResponse(text=reply, provider="ollama", model="qwen3:8b")
+    assert Responder._local_false_claim(response, user) is claim          # noqa: SLF001
+
+
+def test_a_number_from_the_library_passages_is_grounded():
+    from sam.brain.responder import Responder
+
+    response = LLMResponse(text="بەپێی کتێبەکەت، کاتێک زێڕ لە ژێر ٢٠٠ دایە کڕین مەکە.", provider="ollama")
+    assert Responder._local_false_claim(response, "ستراتیژییەکەم بۆ زێڕ چی دەڵێت؟") is True           # noqa: SLF001
+    assert Responder._local_false_claim(response, "ستراتیژییەکەم بۆ زێڕ چی دەڵێت؟",                    # noqa: SLF001
+                                        "[1] «Book», p. 1: ... moving average 200 ...") is False
+
+
+@tool("get_price", description="Current price.", params={"type": "object", "properties": {"symbol": {"type": "string"}}},
+      risk="safe", blocking=True)
+async def fake_two_prices(ctx, symbol: str = "") -> dict[str, Any]:
+    if "زیو" in symbol:
+        return ok("زیو ئێستا لەسەر ٥٢ مامەڵە دەکرێت.", symbol="XAGUSD")
+    return ok("زێڕ ئێستا لەسەر ٤٣١٢ مامەڵە دەکرێت.", symbol="XAUUSD")
+
+
+async def test_every_local_tool_result_is_said_not_only_the_last(make_app):
+    app, _ = brain_app(make_app, [rate_limited("groq", "openai/gpt-oss-20b")] * 4, tools=(fake_two_prices,))
+    app.llm.backends["ollama"] = FakeLocal([Reply(calls=[("get_price", {"symbol": "زێڕ"}),
+                                                         ("get_price", {"symbol": "زیو"})])], loaded=["qwen3:8b"])
+    chunks = [c async for c in app.conversation.respond_stream("نرخی زێڕ و زیو پێکەوە", source="text")]
+    said = " ".join(c.strip() for c in chunks)
+    assert said == "زێڕ ئێستا لەسەر ٤٣١٢ مامەڵە دەکرێت. زیو ئێستا لەسەر ٥٢ مامەڵە دەکرێت."
+
+
+async def test_no_warm_up_while_a_turn_or_a_local_answer_runs(make_app):
+    """Live run 2026-09-25: a voice-prompt warm-up (98 s) started while a typed
+    turn waited for the local model, and that answer hit the 150 s timeout."""
+    app, _ = brain_app(make_app, [rate_limited("groq", "openai/gpt-oss-20b")] * 4)
+    local = FakeLocal(["سڵاو."], loaded=[])
+    app.llm.backends["ollama"] = local
+    for ref in ("groq:openai/gpt-oss-20b", "groq:openai/gpt-oss-120b"):
+        app.llm._cool(ref, 600)                      # noqa: SLF001
+    app.conversation.active_turns = 1
+    assert app.conversation.prewarm_local_brain() is None
+    app.conversation.active_turns = 0
+    app.llm._local_inflight = 1                      # noqa: SLF001
+    assert app.llm.prewarm_local([], []) is None
+    app.llm._local_inflight = 0                      # noqa: SLF001
+    task = app.conversation.prewarm_local_brain()
+    assert task is not None and await task and local.warmed
