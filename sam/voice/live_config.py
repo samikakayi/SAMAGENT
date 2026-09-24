@@ -9,7 +9,11 @@ Everything here follows the saved official docs (lead scratchpad
   from ``output_audio_transcription``.
 - automatic VAD with ``silence_duration_ms`` (docs recommend 500-800 ms; the
   server default is ~800 ms) and ``prefix_padding_ms`` so the first syllable
-  is not clipped.
+  is not clipped. ``start_of_speech_sensitivity`` LOW (setting
+  ``voice.live_start_sensitivity``; the SDK documents HIGH as the Live
+  default): a noisy home must not open turns. The client sends audio only for
+  utterances its own near-field gate / voiceprint accepted (frames.py), each
+  closed with ``audio_stream_end``.
 - ``context_window_compression.sliding_window``: without it an audio session
   ends after 15 minutes.
 - ``session_resumption``: a connection lives ~10 minutes; the server sends
@@ -75,6 +79,12 @@ def build_live_config(app: Any, model: str, *, handle: str | None = None, instru
     from google.genai import types  # lazy: ~2 s import on this PC
 
     voice = str(app.config.get("voice.voice_name", "Kore") or "Kore")
+    detection: dict[str, Any] = dict(silence_duration_ms=int(app.config.get("voice.silence_ms", 600)),
+                                     prefix_padding_ms=int(app.config.get("voice.live_prefix_padding_ms", 200)))
+    sensitivity = str(app.config.get("voice.live_start_sensitivity", "low") or "").lower()
+    if sensitivity in ("low", "high"):
+        detection["start_of_speech_sensitivity"] = getattr(types.StartSensitivity,
+                                                           f"START_SENSITIVITY_{sensitivity.upper()}")
     kwargs: dict[str, Any] = dict(
         response_modalities=[types.Modality.AUDIO],
         system_instruction=instruction if instruction is not None else system_instruction(app),
@@ -83,9 +93,7 @@ def build_live_config(app: Any, model: str, *, handle: str | None = None, instru
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                silence_duration_ms=int(app.config.get("voice.silence_ms", 600)),
-                prefix_padding_ms=int(app.config.get("voice.live_prefix_padding_ms", 200)))),
+            automatic_activity_detection=types.AutomaticActivityDetection(**detection)),
         context_window_compression=types.ContextWindowCompressionConfig(sliding_window=types.SlidingWindow()),
         session_resumption=types.SessionResumptionConfig(handle=handle),
     )

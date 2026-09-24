@@ -154,8 +154,13 @@ async def test_engine_choice_rules(voice):
     assert eng2.choose_engine() == "cascade"
 
 
-async def test_automatic_selftest_runs_once_and_retries_only_inconclusive(voice):
+async def test_automatic_selftest_runs_at_most_once_a_day(voice):
+    """The automatic self-test spends 3 Gemini TTS requests of a tiny free
+    quota: never run it twice within a day, and never while Gemini TTS rests
+    after a quota error (real use 2026-09-24: self-test + prewarm used it up)."""
     import time
+
+    from sam.voice.quota import rests
     app, eng, *_ = await voice(gemini=True, selftest_ok=False)
     runs = []
 
@@ -166,15 +171,20 @@ async def test_automatic_selftest_runs_once_and_retries_only_inconclusive(voice)
     eng.run_selftest = fake_selftest
     await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 2)    # never ran -> runs  # noqa: SLF001
     assert len(runs) == 1
-    app.config.set("voice.selftest", {"ok": False, "error": "live_quota: 429", "at": time.time()})
-    with pytest.raises(asyncio.TimeoutError):                                        # too recent: waits
-        await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 0.2)  # noqa: SLF001
+    for age in (0, 7200):                                                           # inconclusive but recent
+        app.config.set("voice.selftest", {"ok": False, "error": "live_quota: 429", "at": time.time() - age})
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 0.2)  # noqa: SLF001
     assert len(runs) == 1
-    app.config.set("voice.selftest", {"ok": False, "error": "live_quota: 429", "at": time.time() - 7200})
+    app.config.set("voice.selftest", {"ok": False, "error": "live_quota: 429", "at": time.time() - 90000})
     await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 2)  # noqa: SLF001
     assert len(runs) == 2
-    app.config.set("voice.selftest", {"ok": False, "cer": 0.8, "at": time.time() - 7200})
+    app.config.set("voice.selftest", {"ok": False, "cer": 0.8, "at": time.time() - 90000})
     with pytest.raises(asyncio.TimeoutError):                                        # a measured fail stays
+        await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 0.2)  # noqa: SLF001
+    app.config.set("voice.selftest", None)
+    rests(app).rest("gemini_tts", seconds=600, reason="daily", notify=False)
+    with pytest.raises(asyncio.TimeoutError):                                        # Gemini TTS resting
         await asyncio.wait_for(eng._auto_selftest(first_delay_s=0, every_s=0.01), 0.2)  # noqa: SLF001
     assert len(runs) == 2
 
@@ -191,13 +201,21 @@ async def test_cascade_turn_end_to_end_through_the_engine(voice):
     assert mics[0].stopped and states(events)[-1] == "sleeping"
 
 
-async def test_conversation_window_sleeps_after_silence(voice):
+async def test_push_to_talk_closes_quietly_when_nobody_speaks(voice):
+    """Default: a click opens listening for one utterance; no speech within
+    voice.start_timeout_s -> the mic closes, the island is told, and the
+    conversation is NOT ended (no "sleeping", no fact extraction per click)."""
+    from sam.voice.notices import VoiceNotice
     app, eng, mics, *_, events = await voice()
-    app.config.set("voice.conversation_timeout_s", 1)
+    app.config.set("voice.start_timeout_s", 1)
     await eng.start_listening()
-    assert await settle(lambda: not eng.listening, timeout=4.0)
-    await settle()
-    assert states(events)[-1] == "sleeping" and mics[0].stopped, [(e.state, e.detail, e.at) for e in events if isinstance(e, VoiceState)]
+    assert await settle(lambda: any(isinstance(e, VoiceState) and e.detail == "no_speech" for e in events),
+                        timeout=4.0)
+    last = [e for e in events if isinstance(e, VoiceState)][-1]
+    assert (last.state, last.detail) == ("idle", "no_speech") and mics[0].stopped
+    assert "sleeping" not in states(events)
+    notices = [e for e in events if isinstance(e, VoiceNotice)]
+    assert notices and notices[-1].kind == "closed" and notices[-1].text_ckb == strings.LISTEN_NO_SPEECH
 
 
 async def test_always_listening_keeps_the_window_open(voice):
@@ -237,9 +255,12 @@ async def test_live_engine_streams_mic_audio_and_speaks_model_audio(voice):
     await eng.start_listening()
     assert eng.engine_name == "live"
     assert await settle(lambda: eng.live is not None and eng.live.ready)
-    mics[0].push(quiet_frame(), 3)
     session = client.sessions[0]
-    assert await settle(lambda: len(session.audio) >= 3)
+    mics[0].push(quiet_frame(), 3)                # silence is never sent (near-field gate, frames.py)
+    await asyncio.sleep(0.1)
+    assert not session.audio
+    mics[0].push(tone_frame(), 14)                # ~420 ms of near-field speech: accepted after 300 ms
+    assert await settle(lambda: len(session.audio) >= 12)
     session.push(audio_msg(b"\x09\x00" * 480))
     assert await settle(lambda: speaker.chunks)
     assert eng.status()["live"]["connected"] is True
@@ -300,11 +321,12 @@ async def test_echo_guard_silences_quiet_frames_while_speaking(voice):
     assert await settle(lambda: eng.live is not None and eng.live.ready)
     speaker.playing = True
     quiet_but_not_silent = (b"\x20\x00" * 480)
-    mics[0].push(quiet_but_not_silent)            # SAM's own voice leaking into the mic
-    mics[0].push(tone_frame(20000))               # the user talking over SAM
+    mics[0].push(tone_frame(20000), 12)           # the user talking over SAM: an accepted utterance
+    mics[0].push(quiet_but_not_silent)            # SAM's own voice leaking into the mic mid-utterance
+    mics[0].push(tone_frame(20000), 2)
     session = client.sessions[0]
-    assert await settle(lambda: len(session.audio) >= 2)
-    assert session.audio[0] == bytes(960) and session.audio[1] == tone_frame(20000)
+    assert await settle(lambda: len(session.audio) >= 14)
+    assert bytes(960) in session.audio and quiet_but_not_silent not in session.audio
 
 
 async def test_hotkey_toggles_listening_and_failure_is_reported(voice):
@@ -436,5 +458,10 @@ async def test_a_short_sound_over_sams_voice_only_ducks_it(voice):
     assert await settle(lambda: getattr(speaker, "gain", 1.0) == 1.0)
     await asyncio.sleep(0.1)
     assert not cut and not eng.stt.calls
-    speak_utterance(mics[0], speech_frames=30)    # ~900 ms: a real barge-in
+    speak_utterance(mics[0], speech_frames=30)    # ~900 ms, but nobody knows the user's voice yet:
+    assert await settle(lambda: getattr(speaker, "gain", 1.0) == 1.0)
+    await asyncio.sleep(0.1)                      # ... only ducked (a TV must not cut SAM off)
+    assert not cut and not eng.stt.calls
+    app.config.set("voice.gate_user_level_db", -12.0)   # the user's level (tone_frame is -12 dBFS)
+    speak_utterance(mics[0], speech_frames=30)    # ~900 ms at the user's level: a real barge-in
     assert await settle(lambda: cut)

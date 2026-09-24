@@ -88,7 +88,9 @@ class EngineSupport:
     async def _warm_connections(self) -> None:
         """Open the TLS connections the first cascade turn needs (KurdishTTS and
         the first text model) while the user is still speaking."""
-        jobs = [kurdish_http.shared(self.app).warm()] if self.stt.configured() or self.tts.configured() else []
+        providers = [*getattr(self.stt, "providers", {}).values(), *getattr(self.tts, "providers", {}).values()]
+        kurdish = any(getattr(p, "provider", "") == "kurdishtts" and p.configured() for p in providers)
+        jobs = [kurdish_http.shared(self.app).warm()] if kurdish else []  # (test fakes: no network)
         try:
             backend = self.app.llm.backends.get("groq")
             if backend is not None and hasattr(backend, "warm"):

@@ -40,6 +40,7 @@ from ..events import (Alert, Caption, ConfirmRequest, ConfirmResult, Error, Leve
 from ..textnorm import is_arabic_script
 from . import theme
 from .confirm_card import ConfirmCard
+from .island_hints import IslandHints, is_notice
 from .island_paint import device_scale, paint_glass, paint_meter, paint_progress
 from .orb import paint_orb
 from .strings import state_word, tool_label, tr
@@ -106,6 +107,7 @@ class Island(QWidget):
         self.engine = ""
         self.muted = False
         self.caption: CaptionLine | None = None
+        self._hints = IslandHints()      # quota / listening notices (island_hints.py)
         self._families = theme.ui_families(self._cfg("ui.font_family"))
         self._fonts()
         self._level = 0.0
@@ -173,6 +175,9 @@ class Island(QWidget):
 
     # -- public state API (also used by tests) -------------------------------------------------------
     def status_text(self) -> str:
+        override = self._hints.status_override(self.state)
+        if override:
+            return override
         return state_word("muted" if self.muted and self.state in ("idle", "sleeping") else self.state)
 
     def state_color(self) -> str:
@@ -258,7 +263,12 @@ class Island(QWidget):
         elif isinstance(ev, Caption):
             self.set_caption(ev.text, "user" if ev.role == "user" else
                              "system" if ev.role == "system" else "assistant", ev.final)
+        elif is_notice(ev):
+            shown = self._hints.on_notice(ev)
+            if shown:
+                self.set_caption(shown[0], shown[1], True)
         elif isinstance(ev, Transcript):
+            self._hints.on_answer(ev.role, ev.text)
             if ev.role in ("user", "assistant") and ev.text:
                 self.set_caption(ev.text, "user" if ev.role == "user" else "assistant", True)
         elif isinstance(ev, ToolStarted):

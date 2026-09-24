@@ -123,7 +123,10 @@ async def test_prewarm_stops_quietly_when_the_provider_refuses(make_app):
     assert await router.prewarm(["باشە.", "یەک چرکە."]) == 0
 
 
-async def test_engine_prewarms_the_brain_acknowledgements_once(make_app):
+async def test_prewarm_is_off_by_default_and_never_uses_gemini(make_app):
+    """Real use 2026-09-24: the startup prewarm (plus the self-test) spent the
+    free Gemini TTS quota before the user's first sentence. Now phrases are
+    cached lazily when really spoken; an opted-in prewarm uses KurdishTTS only."""
     from voice_helpers import FakeMic, FakeSpeaker, FakeStt
 
     from sam.brain.conversation import ACKS_DO, ACKS_LOOK
@@ -132,18 +135,21 @@ async def test_engine_prewarms_the_brain_acknowledgements_once(make_app):
 
     app = make_app()
     app.bus.bind_loop(asyncio.get_running_loop())
-    provider = CountingTts()
-    router = TtsRouter(app, {"kurdishtts": provider}, cache=PhraseCache(app.db))
+    gemini, kurdish = CountingTts(), CountingTts()
+    gemini.provider = "gemini"
+    router = TtsRouter(app, {"gemini": gemini, "kurdishtts": kurdish}, cache=PhraseCache(app.db))
     eng = VoiceEngine(app, mic_factory=FakeMic, speaker=FakeSpeaker(), stt=FakeStt([]), tts=router)
-    expected = [*ACKS_DO, *ACKS_LOOK, strings.STT_FAILED_SPOKEN]
     await eng.start_listening()
+    await asyncio.sleep(0.2)
+    assert gemini.calls == [] and kurdish.calls == []             # default: no prewarm at all
+    await eng.stop_listening()
+    app.config.set("voice.tts_prewarm", True)
+    eng._prewarm_started = False  # noqa: SLF001
+    await eng.start_listening()
+    expected = [*ACKS_DO, *ACKS_LOOK, strings.STT_FAILED_SPOKEN]
     for _ in range(200):
-        if len(provider.calls) == len(expected):
+        if len(kurdish.calls) == len(expected):
             break
         await asyncio.sleep(0.01)
-    assert provider.calls == expected
-    await eng.stop_listening()
-    await eng.start_listening()                                   # once per run
-    await asyncio.sleep(0.05)
-    assert len(provider.calls) == len(expected)
+    assert kurdish.calls == expected and gemini.calls == []      # never the Gemini quota
     await eng.stop()

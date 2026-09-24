@@ -105,6 +105,11 @@ class Endpointer:
     def current_speech_ms(self) -> float:
         return self._voiced * self.frame_ms if self.in_speech else 0.0
 
+    def frames_so_far(self) -> list[bytes]:
+        """The current utterance's frames (pre-roll included) while in speech:
+        what Live receives once the utterance is accepted (engine frames.py)."""
+        return list(self._frames) if self.in_speech else []
+
     def process(self, frame: bytes, speech: bool, now: float | None = None) -> VadEvent | None:
         now = time.perf_counter() if now is None else now
         if not self.in_speech:

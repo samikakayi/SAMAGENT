@@ -14,6 +14,17 @@ strict verbatim-Sorani prompt. Google's dedicated STT models list no Kurdish
 (reports/realtime-voice.json), so this general model is the only Google path;
 its Sorani accuracy is undocumented.
 
+Gemini STT never retries inside the SDK (genai_client.py), must answer within
+``voice.stt_gemini_timeout_s`` (8 s), and a 429 rests it (quota.py) instead of
+being asked again for the next utterance.
+
+KurdishTTS STT must answer within ``voice.kurdishtts_stt_timeout_s`` (6 s)
+plus the utterance's length (adversarial review 2026-09-24, stall_probe.py: a
+request that was accepted but never answered cost the client's 30 s read
+timeout before the Gemini fallback). A timeout, network error or 5xx rests it
+60 s: the router then asks the other provider FIRST (a resting provider is
+still tried last, so SAM never stops listening because of a rest).
+
 One persistent ``httpx.AsyncClient`` per provider: a new TLS connection costs
 0.25-0.35 s on this network (measured 2026-09-24, reports/realtime-voice.json).
 Keys are read at call time and sent only to their own provider; errors never
@@ -30,8 +41,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..textnorm import normalize_ckb
-from . import kurdish_http
+from . import kurdish_http, strings
 from .audio import MIC_RATE, pcm16_to_wav, pcm_seconds, silence
+from .genai_client import make_client
+from .notices import VoiceNotice
+from .quota import rests
 
 if TYPE_CHECKING:  # httpx costs ~41 ms to import (measured 2026-09-24): loaded on first request
     import httpx
@@ -125,10 +139,22 @@ class KurdishTtsStt:
     def _setting(self, key: str, default: Any) -> Any:
         return self.app.config.get(key, default)
 
+    REST = "kurdishtts_stt"
+
     def configured(self) -> bool:
         if not self.app.secrets.has("kurdishtts_stt_api_key"):
             return False
         return self._exhausted_month != month_prefix()
+
+    def resting(self) -> bool:
+        return rests(self.app).resting(self.REST)
+
+    def _timeout_s(self, spoken_s: float) -> float:
+        try:
+            base = float(self._setting("voice.kurdishtts_stt_timeout_s", 6.0))
+        except (TypeError, ValueError):
+            base = 6.0
+        return max(1.0, base) + max(0.0, spoken_s)
 
     def budget_left_s(self) -> float:
         budget = float(self._setting("voice.kurdishtts_monthly_stt_s", 7200))
@@ -159,21 +185,32 @@ class KurdishTtsStt:
         wav = pcm16_to_wav(pcm, rate)
         url = str(self._setting("voice.kurdishtts_base_url", KURDISHTTS_BASE)).rstrip("/") + "/stt-proxy"
         started = time.perf_counter()
+        wait_s = self._timeout_s(seconds)
         try:
             response = await self._http().post(url, headers={"x-api-key": key},
                                                files={"file": ("audio.wav", wav, "audio/wav")},
-                                               data={"dialect": "sorani"})
+                                               data={"dialect": "sorani"},
+                                               timeout=httpx.Timeout(wait_s, connect=min(5.0, wait_s)))
         except httpx.TimeoutException as exc:
             self._count(seconds, error=True)
-            raise SttError("network", type(exc).__name__, provider=self.provider) from None
+            rests(self.app).on_transient(self.REST, "timeout")
+            raise SttError("network", f"{type(exc).__name__} after {wait_s:.1f} s", provider=self.provider) from None
         except httpx.HTTPError as exc:
             self._count(seconds, error=True)
+            rests(self.app).on_transient(self.REST, "network")
             raise SttError("network", type(exc).__name__, provider=self.provider) from None
         ms = (time.perf_counter() - started) * 1000.0
         if response.status_code != 200:
             kind = _status_kind(response.status_code)
+            if kind == "server":
+                rests(self.app).on_transient(self.REST, "server")
             if kind == "quota":
                 self._exhausted_month = month_prefix()
+                try:
+                    self.app.bus.publish_threadsafe(VoiceNotice(kind="quota", text_ckb=strings.KURDISH_STT_MONTH,
+                                                                detail="kurdishtts_stt"))
+                except Exception:  # noqa: BLE001
+                    pass
             self._count(seconds, error=True, rate_limited=kind == "rate_limit")
             detail = self.app.redact(response.text[:160])
             raise SttError(kind, f"HTTP {response.status_code} {detail}", provider=self.provider,
@@ -220,8 +257,11 @@ class GeminiStt:
     def model(self) -> str:
         return str(self.app.config.get("voice.stt_fallback_model", "gemini-3.5-flash-lite"))
 
+    REST = "gemini_stt"
+
     def configured(self) -> bool:
-        return self.app.secrets.has("gemini_api_key") and time.monotonic() >= self._cool_until
+        return (self.app.secrets.has("gemini_api_key") and time.monotonic() >= self._cool_until
+                and not rests(self.app).resting(self.REST))
 
     def _over_cap(self) -> bool:
         caps = self.app.config.get("llm.daily_caps", {}) or {}
@@ -235,11 +275,7 @@ class GeminiStt:
         import hashlib
         fingerprint = hashlib.sha256(key.encode()).hexdigest()[:12]
         if self._client is None or fingerprint != self._client_fp:
-            if self._client_factory is not None:
-                self._client = self._client_factory(key)
-            else:
-                from google import genai
-                self._client = genai.Client(api_key=key)
+            self._client = make_client(key, factory=self._client_factory)  # SDK retries OFF
             self._client_fp = fingerprint
         return self._client
 
@@ -262,10 +298,12 @@ class GeminiStt:
                                          "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL)}
         started = time.perf_counter()
         response = None
+        timeout_s = float(self.app.config.get("voice.stt_gemini_timeout_s", 8.0) or 8.0)
         for attempt in range(2):
             try:
-                response = await client.aio.models.generate_content(
-                    model=self.model, contents=contents, config=types.GenerateContentConfig(**config_kwargs))
+                response = await asyncio.wait_for(client.aio.models.generate_content(
+                    model=self.model, contents=contents, config=types.GenerateContentConfig(**config_kwargs)),
+                    max(0.5, timeout_s - (time.perf_counter() - started)))
                 break
             except Exception as exc:  # noqa: BLE001 - mapped below
                 code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
@@ -275,7 +313,7 @@ class GeminiStt:
                     continue
                 self._bump(seconds, error=True, rate_limited=code == 429)
                 if code == 429:
-                    self._cool_until = time.monotonic() + 60.0
+                    rests(self.app).on_rate_limit(self.REST, exc)
                     raise SttError("rate_limit", "429", provider=self.provider, status=429) from None
                 if code in (401, 403) or (code == 400 and "api key" in text.lower()):
                     self._cool_until = time.monotonic() + 600.0
@@ -283,7 +321,11 @@ class GeminiStt:
                 import httpx
 
                 if isinstance(exc, (httpx.HTTPError, OSError, asyncio.TimeoutError)):
+                    rests(self.app).on_transient(self.REST, "timeout" if isinstance(exc, asyncio.TimeoutError)
+                                                 else "network")
                     raise SttError("network", type(exc).__name__, provider=self.provider) from None
+                if isinstance(code, int) and code >= 500:
+                    rests(self.app).on_transient(self.REST, "server")
                 raise SttError("server", self.app.redact(f"{type(exc).__name__}: {text}")[:200],
                                provider=self.provider, status=code if isinstance(code, int) else None) from None
         ms = (time.perf_counter() - started) * 1000.0
@@ -326,9 +368,13 @@ class SttRouter:
         return cls(app, {"kurdishtts": KurdishTtsStt(app), "gemini": GeminiStt(app)})
 
     def order(self) -> list[Any]:
+        """The setting's provider first -- but a resting one (after a timeout /
+        5xx) goes to the end: still tried when nothing else answers."""
         first = str(self.app.config.get("voice.stt_provider", "kurdishtts"))
         names = [first] + [n for n in self.providers if n != first]
-        return [self.providers[n] for n in names if n in self.providers]
+        providers = [self.providers[n] for n in names if n in self.providers]
+        awake = [p for p in providers if not bool(getattr(p, "resting", lambda: False)())]
+        return awake + [p for p in providers if p not in awake]
 
     def configured(self) -> bool:
         return any(p.configured() for p in self.order())

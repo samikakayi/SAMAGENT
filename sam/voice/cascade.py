@@ -26,6 +26,19 @@ after, what the mic hears is not offered to the ConfirmBroker (the review
 showed SAM's own question «ئەم نامەیە بنێرم؟ «باشە ...»» classify as a yes
 when the room echo reaches the mic).
 
+Last check before a model hears the words (``hooks.admit_transcript``,
+engine.py): «دەنگم بناسە» opens the voice enrollment; in always-listening mode
+an utterance must start with «سام»; nothing else is dropped here (the
+near-field gate, "only my voice" and the listening policy already ran before
+STT, frames.py / listening.py).
+
+While a confirmation waits, an utterance that is not a clear yes/no never
+starts a new turn: that would silence the reply waiting for the answer and
+the question would time out to NO unheard (adversarial review 2026-09-24:
+«باشە» started a model turn and «نەمنارد» was never spoken). SAM asks
+«بەڵێ یان نەخێر؟» once instead. Only the user's own voice (voiceprint match)
+with a longer new request replaces the question: it is answered NO at once.
+
 KurdishTTS budget: under ``voice.tts_low_budget_share`` of the month's
 characters left (and no Gemini TTS), only the first sentence of an answer is
 spoken; the full text is in the panel (20,000 characters a month is about 90
@@ -40,6 +53,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
+from ..brain.confirm import ASK_AGAIN_CKB
 from ..events import Caption, Error, Transcript
 from ..textnorm import normalize_ckb
 from . import strings
@@ -75,6 +89,7 @@ class Utterance:
     text: str | None = None        # already transcribed (Live's input transcription)
     published: bool = False        # the user Transcript was already published
     cut_reply: bool = False        # this utterance barged in on SAM's reply
+    meta: dict[str, Any] = field(default_factory=dict)   # gate levels, first-after-click, verified
 
 
 @dataclass
@@ -117,6 +132,8 @@ class CascadeVoice:
         self.last_answer_ms: float | None = None
         self.confirm_quiet_until = 0.0     # perf_counter: SAM's confirmation question may still echo
         self._stt_warned = False
+        self._asked_again: set[str] = set()
+        self._tts_resting_noted: float = 0.0
 
     # -- lifecycle ------------------------------------------------------------------------------
     def start(self) -> None:
@@ -136,16 +153,21 @@ class CascadeVoice:
         return self.speaker.playing
 
     @property
+    def reply_active(self) -> bool:
+        """SAM is thinking about or saying an answer right now."""
+        return self.speaker.playing or (self._current is not None and not self._current.done)
+
+    @property
     def busy(self) -> bool:
         return (self._processing or not self._queue.empty() or self.speaker.playing
                 or (self._current is not None and not self._current.done))
 
     # -- input side --------------------------------------------------------------------------------
     def submit_utterance(self, pcm: bytes, eos_at: float, *, text: str | None = None,
-                         published: bool = False, cut_reply: bool = False) -> None:
+                         published: bool = False, cut_reply: bool = False, meta: dict[str, Any] | None = None) -> None:
         self.start()
         self._queue.put_nowait(Utterance(pcm=pcm, eos_at=eos_at, text=text, published=published,
-                                         cut_reply=cut_reply))
+                                         cut_reply=cut_reply, meta=dict(meta or {})))
 
     def barge_in(self) -> bool:
         """The user started speaking. True when SAM was talking or thinking."""
@@ -187,6 +209,13 @@ class CascadeVoice:
                 self._carry = (reply.text, time.monotonic())
             reply.task.cancel()
 
+    def _void(self, *, reopen: bool = False) -> None:
+        """The utterance produced no request: tell the listening policy (a
+        following "listening" state is not the end of an answer)."""
+        hook = getattr(self.hooks, "utterance_void", None)
+        if hook is not None:
+            hook(reopen=reopen)
+
     def _take_carry(self) -> str | None:
         carry, self._carry = self._carry, None
         if carry and time.monotonic() - carry[1] <= CARRY_TTL_S:
@@ -219,6 +248,7 @@ class CascadeVoice:
                 if not self._stt_warned:
                     self._stt_warned = True
                     self.app.bus.publish(Error(where="voice", message_ckb=strings.STT_UNCONFIGURED))
+                self._void()
                 self.hooks.set_state("listening")
                 return
             self.hooks.set_state("thinking")
@@ -229,22 +259,35 @@ class CascadeVoice:
                 turn.finish(outcome=f"stt_{exc.kind}")
                 self.app.bus.publish(Error(where="voice.stt", message_ckb=strings.STT_FAILED,
                                            detail=self.app.redact(str(exc))[:200]))
+                self._void(reopen=True)   # «دووبارەی بکەرەوە»: the user may say it again without a click
                 await self.speak(strings.STT_FAILED_SPOKEN, source="system")
                 return
             text = result.text
         if not text.strip():
             turn.finish(outcome="empty")
+            self._void(reopen=True)
             self.hooks.set_state("listening")
             self.resume_carry()
             return
         if self._confirm_echo(item):
             turn.finish(outcome="confirm_echo")
+            self._void()
             self.hooks.set_state("listening")
             return
         if item.cut_reply and is_backchannel(text):
             turn.finish(outcome="backchannel")
+            self._void()
             self.hooks.set_state("listening")
             return
+        admit = getattr(self.hooks, "admit_transcript", None)
+        if admit is not None and not item.published:
+            admitted = admit(text, item.meta)
+            if admitted is None:
+                turn.finish(outcome="not_admitted")
+                self._void()
+                self.hooks.set_state("listening")
+                return
+            text = admitted
         consumed = False
         if not item.published:
             self.app.bus.publish(Caption(text=text, role="user", final=True))
@@ -254,8 +297,36 @@ class CascadeVoice:
             turn.finish(outcome="confirm_answer")
             self.hooks.set_state("working")
             return
+        if not item.published and getattr(self.app.confirm, "has_pending", False):
+            if not self._replaces_question(text, item):
+                turn.finish(outcome="ask_again")
+                await self._ask_again()
+                return
         carry = self._take_carry()
         self._start_reply(f"{carry} {text}" if carry else text, turn)
+
+    def _replaces_question(self, text: str, item: Utterance) -> bool:
+        """A new request instead of the yes/no SAM waits for: only the user's
+        own voice (voiceprint match) with more than a word or two. The waiting
+        question is then answered NO at once (never left to time out)."""
+        needs_answer = getattr(self.app.confirm, "needs_clear_answer", lambda _t: True)
+        if not item.meta.get("verified") or needs_answer(text):
+            return False
+        self.app.confirm.resolve(None, False, via="superseded")
+        return True
+
+    async def _ask_again(self) -> None:
+        """«بەڵێ یان نەخێر؟» -- once per pending question; later unclear speech
+        is ignored until the answer, a click or the 20 s expiry."""
+        pending = self.app.confirm.pending() if hasattr(self.app.confirm, "pending") else []
+        confirm_id = str(pending[-1].get("confirm_id", "")) if pending else ""
+        if confirm_id in self._asked_again:
+            self._void()
+            self.hooks.set_state("listening")
+            return
+        self._asked_again.add(confirm_id)
+        self._void()
+        await self.speak(ASK_AGAIN_CKB, source="confirm")
 
     def _confirm_echo(self, item: Utterance) -> bool:
         """Heard while SAM's confirmation question played (or within 1 s):
@@ -420,7 +491,7 @@ class CascadeVoice:
             if reply is not None and reply.muted:
                 return False
             if not self.tts.configured():
-                self.app.bus.publish(Error(where="voice.tts", message_ckb=strings.TTS_UNCONFIGURED))
+                self._tts_unavailable()
                 return False
             epoch = self.speaker.epoch
             began = time.perf_counter()
@@ -441,6 +512,19 @@ class CascadeVoice:
                     self.app.bus.publish(Error(where="voice.tts", message_ckb=strings.TTS_FAILED,
                                                detail=self.app.redact(str(exc))[:200]))
             return played
+
+    def _tts_unavailable(self) -> None:
+        """No voice right now. A key exists but every provider rests after a
+        quota / timeout error: say so once a minute (the text is on screen);
+        otherwise no key is set at all."""
+        resting = getattr(self.tts, "resting_only", None)
+        if resting is not None and resting():
+            now = time.monotonic()
+            if now - self._tts_resting_noted >= 60.0:
+                self._tts_resting_noted = now
+                self.app.bus.publish(Error(where="voice.tts", message_ckb=strings.TTS_RESTING))
+            return
+        self.app.bus.publish(Error(where="voice.tts", message_ckb=strings.TTS_UNCONFIGURED))
 
     def _first_audio(self, reply: _Reply | None, tts_ms: float, text: str = "") -> None:
         if reply is not None and not reply.audio_started:

@@ -17,6 +17,23 @@ model_version, stream_format: "pcm"}`` -> raw 16-bit mono PCM at 24 kHz
 Sorani speakers v4 ``sorani_1``/``sorani_986`` (v3 ``sorani_85``/``sorani_214``).
 v1's reply of 552 characters was refused and went silent, so every request here
 is <= ``voice.tts_max_chars`` (480) and the month's characters are counted.
+
+Never stall (real use 2026-09-24 20:51: a 429 plus the SDK's own ~27 s retry
+kept the island on «بیردەکەمەوە» for ~40 s): the Gemini client never retries
+(genai_client.py); the first audio must arrive within ``voice.tts_first_audio_s``
+(2.5 s) or the request is dropped; a 429 / timeout / 5xx rests Gemini TTS
+(quota.py: until the Pacific-midnight reset for a daily quota, 60-180 s for a
+per-minute one) and the router moves to KurdishTTS for this sentence and the
+following ones at once. After the first audio, a gap of more than
+``voice.tts_chunk_gap_s`` (3 s) ends the piece and rests Gemini too.
+
+KurdishTTS gets the same treatment (adversarial review 2026-09-24,
+stall_probe.py: a KurdishTTS request that was accepted but never answered held
+every piece for the client's 30 s read timeout, and a network error did not
+rest it, so the next piece waited again): no audio within
+``voice.kurdishtts_tts_first_audio_s`` (5 s) or a gap that long between
+chunks -> the piece ends and KurdishTTS rests 60 s; while every provider
+rests, SAM's answer is shown as text (cascade.py says so once a minute).
 """
 
 from __future__ import annotations
@@ -28,7 +45,9 @@ import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
 from . import kurdish_http
+from .genai_client import make_client
 from .numbers_ckb import verbalize_numbers
+from .quota import rests
 from .speech_text import split_for_tts
 from .stt import KURDISHTTS_BASE, month_prefix, month_units
 from .tts_cache import PhraseCache
@@ -71,8 +90,15 @@ class GeminiTts:
     def model(self) -> str:
         return str(self.app.config.get("voice.tts_model", "gemini-3.8-flash-lite-tts"))
 
+    REST = "gemini_tts"
+
     def configured(self) -> bool:
-        return self.app.secrets.has("gemini_api_key") and time.monotonic() >= self._cool_until
+        return (self.app.secrets.has("gemini_api_key") and time.monotonic() >= self._cool_until
+                and not rests(self.app).resting(self.REST))
+
+    def resting(self) -> bool:
+        """Has a key but rests after a quota / timeout / server error."""
+        return self.app.secrets.has("gemini_api_key") and rests(self.app).resting(self.REST)
 
     def voice_id(self) -> str:
         """What the audio sounds like (phrase-cache key): model, voice, style."""
@@ -83,11 +109,7 @@ class GeminiTts:
         import hashlib
         fingerprint = hashlib.sha256(key.encode()).hexdigest()[:12]
         if self._client is None or fingerprint != self._client_fp:
-            if self._client_factory is not None:
-                self._client = self._client_factory(key)
-            else:
-                from google import genai
-                self._client = genai.Client(api_key=key)
+            self._client = make_client(key, factory=self._client_factory)  # SDK retries OFF
             self._client_fp = fingerprint
         return self._client
 
@@ -111,7 +133,7 @@ class GeminiTts:
         code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
         text = str(exc)
         if code == 429:
-            self._cool_until = time.monotonic() + 60.0
+            rests(self.app).on_rate_limit(self.REST, exc)
             return TtsError("rate_limit", "429", provider=self.provider, status=429)
         if code in (401, 403) or (code == 400 and "api key" in text.lower()):
             self._cool_until = time.monotonic() + 600.0
@@ -119,21 +141,46 @@ class GeminiTts:
         import httpx
 
         if isinstance(exc, (httpx.HTTPError, OSError, asyncio.TimeoutError)):
+            rests(self.app).on_transient(self.REST, "network")
             return TtsError("network", type(exc).__name__, provider=self.provider)
         kind = "bad_request" if isinstance(code, int) and 400 <= code < 500 else "server"
+        if kind == "server":
+            rests(self.app).on_transient(self.REST, "server")
         return TtsError(kind, self.app.redact(f"{type(exc).__name__}: {text}")[:200], provider=self.provider,
                         status=code if isinstance(code, int) else None)
+
+    def _first_audio_s(self) -> float:
+        try:
+            return max(0.5, float(self.app.config.get("voice.tts_first_audio_s", 2.5)))
+        except (TypeError, ValueError):
+            return 2.5
+
+    def _chunk_gap_s(self) -> float:
+        try:
+            return max(0.5, float(self.app.config.get("voice.tts_chunk_gap_s", 3.0)))
+        except (TypeError, ValueError):
+            return 3.0
+
+    def _too_slow(self, text: str) -> TtsError:
+        rests(self.app).on_transient(self.REST, "timeout")
+        self._bump(text, error=True)
+        return TtsError("timeout", f"no audio within {self._first_audio_s():g} s", provider=self.provider)
 
     async def stream(self, text: str) -> AsyncIterator[bytes]:
         key = self.app.secrets.get("gemini_api_key")
         if not key:
             raise TtsError("unconfigured", provider=self.provider)
         client = self._genai(key)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._first_audio_s()   # hard deadline for the FIRST audio
         events = None
         for attempt in range(2):
             try:
-                events = await client.aio.interactions.create(**self.request(text))
+                events = await asyncio.wait_for(client.aio.interactions.create(**self.request(text)),
+                                                max(0.05, deadline - loop.time()))
                 break
+            except asyncio.TimeoutError:
+                raise self._too_slow(text) from None
             except Exception as exc:  # noqa: BLE001
                 code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
                 if attempt == 0 and code == 400 and "store" in str(exc).lower():
@@ -143,8 +190,20 @@ class GeminiTts:
                 raise self._map_error(exc) from None
         carry = b""
         produced = 0
+        iterator = events.__aiter__()  # type: ignore[union-attr]
         try:
-            async for event in events:  # type: ignore[union-attr]
+            while True:
+                try:
+                    if produced:
+                        # A stream that stalls mid-sentence must not hold the voice line
+                        # (every later piece, alert and confirmation question waits on it).
+                        event = await asyncio.wait_for(iterator.__anext__(), self._chunk_gap_s())
+                    else:
+                        event = await asyncio.wait_for(iterator.__anext__(), max(0.05, deadline - loop.time()))
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    raise self._too_slow(text) from None
                 kind = getattr(event, "event_type", None)
                 if kind == "error":
                     raise TtsError("server", str(getattr(event, "error", "") or "stream error")[:200],
@@ -158,8 +217,9 @@ class GeminiTts:
                 if pcm:
                     produced += len(pcm)
                     yield pcm
-        except TtsError:
-            self._bump(text, error=True)
+        except TtsError as exc:
+            if exc.kind != "timeout":   # _too_slow already counted it
+                self._bump(text, error=True)
             raise
         except Exception as exc:  # noqa: BLE001
             self._bump(text, error=True)
@@ -214,12 +274,23 @@ class KurdishTts:
     def budget(self) -> float:
         return float(self._setting("voice.kurdishtts_monthly_tts_chars", 20000))
 
+    REST = "kurdishtts_tts"
+
     def configured(self) -> bool:
         if not self.app.secrets.has("kurdishtts_tts_api_key"):
             return False
-        if self._exhausted_month == month_prefix():
+        if self._exhausted_month == month_prefix() or rests(self.app).resting(self.REST):
             return False
         return self.month_used() < self.budget()
+
+    def resting(self) -> bool:
+        return self.app.secrets.has("kurdishtts_tts_api_key") and rests(self.app).resting(self.REST)
+
+    def _first_audio_s(self) -> float:
+        try:
+            return max(0.5, float(self._setting("voice.kurdishtts_tts_first_audio_s", 5.0)))
+        except (TypeError, ValueError):
+            return 5.0
 
     def voice_id(self) -> str:
         return f"{self._setting('voice.kurdishtts_speaker', 'sorani_1')}|" \
@@ -248,8 +319,12 @@ class KurdishTts:
                 "stream_format": "pcm"}
         carry = b""
         produced = 0
+        wait_s = self._first_audio_s()
+        # read = the longest wait for the first bytes AND between chunks (httpx per-request timeout).
+        timeout = httpx.Timeout(wait_s, connect=min(5.0, wait_s))
         try:
-            async with self._http().stream("POST", url, headers={"x-api-key": key}, json=body) as response:
+            async with self._http().stream("POST", url, headers={"x-api-key": key}, json=body,
+                                           timeout=timeout) as response:
                 if response.status_code != 200:
                     raw = await response.aread()
                     status = response.status_code
@@ -257,6 +332,8 @@ class KurdishTts:
                                                                               "server" if status >= 500 else "bad_request")
                     if kind == "quota":
                         self._exhausted_month = month_prefix()
+                    if kind in ("server", "rate_limit"):
+                        rests(self.app).on_transient(self.REST, kind)
                     self._bump(body["text"], error=True)
                     raise TtsError(kind, f"HTTP {status} {self.app.redact(raw[:160].decode('utf-8', 'replace'))}",
                                    provider=self.provider, status=status)
@@ -272,8 +349,14 @@ class KurdishTts:
                         yield pcm
         except TtsError:
             raise
+        except httpx.TimeoutException as exc:
+            self._bump(body["text"], error=True)
+            rests(self.app).on_transient(self.REST, "timeout")
+            kind = "timeout" if not produced else "stalled"
+            raise TtsError(kind, f"{type(exc).__name__} after {wait_s:g} s", provider=self.provider) from None
         except httpx.HTTPError as exc:
             self._bump(body["text"], error=True)
+            rests(self.app).on_transient(self.REST, "network")
             raise TtsError("network", type(exc).__name__, provider=self.provider) from None
         if not produced:
             raise TtsError("empty", "no audio", provider=self.provider)
@@ -341,10 +424,17 @@ class TtsRouter:
     def configured(self) -> bool:
         return any(p.configured() for p in self.order())
 
+    def resting_only(self) -> bool:
+        """No provider can speak now, but one has a key and only rests (a
+        quota / timeout rest), so the answer is shown as text for a while."""
+        return not self.configured() and any(bool(getattr(p, "resting", lambda: False)())
+                                             for p in self.providers.values())
+
     def status(self) -> dict[str, Any]:
         out: dict[str, Any] = {name: {"configured": p.configured()} for name, p in self.providers.items()}
         if self.cache is not None:
             out["cache"] = self.cache.status()
+        out["rests"] = rests(self.app).status()
         return out
 
     def max_chars(self) -> int:
@@ -377,10 +467,10 @@ class TtsRouter:
         getter = getattr(provider, "voice_id", None)
         return str(getter()) if callable(getter) else ""
 
-    async def _stream_piece(self, text: str) -> AsyncIterator[bytes]:
+    async def _stream_piece(self, text: str, *, only: Any = None) -> AsyncIterator[bytes]:
         last: TtsError | None = None
         cache = self.cache if self.cache is not None and self.cache.cacheable(text) else None
-        for provider in self.order():
+        for provider in ([only] if only is not None else self.order()):
             if not provider.configured():
                 continue
             voice = self._voice_id(provider)
@@ -414,7 +504,12 @@ class TtsRouter:
     async def prewarm(self, phrases: Any, *, idle: Any = None, pause_s: float = 0.5) -> int:
         """Synthesize missing short phrases into the cache (background, one at
         a time). ``idle()`` -> False makes it wait, so it never competes with a
-        real reply for the provider. Returns how many were added."""
+        real reply for the provider. Returns how many were added.
+
+        Never with Gemini TTS: its free quota is a handful of requests a day,
+        and on 2026-09-24 the self-test plus this prewarm used it up before
+        the user's first sentence. Off by default (``voice.tts_prewarm``):
+        phrases are cached the first time they are really spoken."""
         if self.cache is None:
             return 0
         phrases = list(phrases)
@@ -423,7 +518,7 @@ class TtsRouter:
         for text in phrases:
             if not self.cache.cacheable(text):
                 continue
-            provider = next((p for p in self.order() if p.configured()), None)
+            provider = next((p for p in self.order() if p.configured() and p.provider != "gemini"), None)
             if provider is None:
                 return added
             if self.cache.has(provider.provider, self._voice_id(provider), text):
@@ -431,7 +526,7 @@ class TtsRouter:
             while idle is not None and not idle():
                 await asyncio.sleep(pause_s)
             try:
-                async for _chunk in self._stream_piece(text):
+                async for _chunk in self._stream_piece(text, only=provider):
                     pass
                 added += 1
             except TtsError as exc:

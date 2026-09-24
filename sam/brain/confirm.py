@@ -58,8 +58,9 @@ YES_WORDS, YES_PHRASES = _norm_all((
     "approved", "affirmative", "go ahead", "do it", "of course",
 ))
 # Words that may stand next to a yes without changing it («ئا بەڵێ», «بەڵێ تکایە»).
+# The name too: in always-listening mode the user may say «سام، بەڵێ».
 FILLER_WORDS, _ = _norm_all(("ئا", "ئاا", "آ", "ئەها", "دەی", "تکایە", "باشە", "تەواو", "زۆر", "باش", "please", "sure",
-                             "oh", "uh", "um", "well"))
+                             "oh", "uh", "um", "well", "سام", "sam", "هێی", "hey"))
 NO_WORDS, NO_PHRASES = _norm_all((
     "نا", "نەخێر", "نەخیر", "نەء", "نە", "مەیکە", "مەکە", "نەیکەی", "نەکەی", "وازبێنە", "بوەستە", "ڕاوەستە",
     "هەڵیوەشێنەوە", "ناوێت", "نامەوێت", "ڕەتیدەکەمەوە", "پاشگەزبوومەوە", "بەسە", "لێگەڕێ", "چاوەڕێ",
@@ -67,12 +68,45 @@ NO_WORDS, NO_PHRASES = _norm_all((
     "واز بێنە", "هیچ مەکە", "پاشگەز بوومەوە", "پێویست ناکات", "وازی لێ بێنە", "لێی گەڕێ",
     "no", "nope", "nah", "cancel", "stop", "abort", "negative", "dont", "don't", "do not", "never mind",
     "not", "wait", "later", "enough", "hold", "hold on",
+    # negative imperatives of the actions SAM asks about (never a yes)
+    "مەینێرە", "مەنێرە", "مەیسڕەوە", "مەسڕەوە", "دامەخە", "دایمەخە", "مەیکەرەوە", "مەکەرەوە", "دامەگرە",
+    "دایمەگرە", "مەیگوازەوە", "مەینووسە",
 ))
 MAX_ANSWER_WORDS = 8
 MAX_YES_WORDS = 3
+# The action's own verb as an answer («ئەم نامەیە بنێرم؟» -> «بەڵێ بینێرە» /
+# «بینێرە»). Verify review 2026-09-24: these natural answers were "unclear",
+# so the cascade started a new turn that muted the waiting reply and the
+# question timed out to NO. They count as YES only while the pending question
+# itself contains the same verb stem (first item), so «بیسڕەوە» can never
+# approve sending a message.
+ACTION_VERBS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("نێر", ("بنێرە", "بینێرە", "send", "send it")),
+    ("سڕ", ("بسڕەوە", "بیسڕەوە", "delete", "delete it")),
+    ("دابخ", ("دابخە", "دایبخە", "close", "close it")),
+    ("جێبەجێ", ("جێبەجێی بکە", "جێبەجێ بکە", "run", "run it")),
+    ("بکەمەوە", ("بیکەرەوە", "بکەرەوە", "open", "open it")),
+    ("دابگر", ("دابگرە", "دایگرە", "press", "press it")),
+    ("کلیک", ("کلیکی بکە", "کلیک بکە", "click", "click it")),
+    ("گواز", ("بگوازەوە", "بیگوازەوە", "move", "move it")),
+    ("بنووس", ("بنووسە", "بینووسە", "write", "type it")),
+    ("پاشەکەوت", ("پاشەکەوتی بکە", "save", "save it")),
+)
+ASK_AGAIN_CKB = "بەڵێ یان نەخێر؟"
 
 
-def classify_answer(text: str) -> bool | None:
+def _action_yes(question: str) -> tuple[frozenset[str], tuple[str, ...]]:
+    """(words, phrases) that answer YES to this particular question."""
+    asked = normalize_ckb(question or "", strip_punct=True)
+    items: list[str] = []
+    if asked:
+        for stem, answers in ACTION_VERBS:
+            if normalize_ckb(stem) in asked:
+                items.extend(answers)
+    return _norm_all(tuple(items)) if items else (frozenset(), ())
+
+
+def classify_answer(text: str, question: str = "") -> bool | None:
     """True (yes), False (no) or None (not a clear short answer).
 
     'No' wins over 'yes' when both appear (safer default); utterances longer
@@ -80,6 +114,8 @@ def classify_answer(text: str) -> bool | None:
     the whole utterance (``MAX_YES_WORDS`` words at most, fillers allowed);
     anything else is unclear and is NOT consumed, so it reaches the brain as a
     normal request and the pending question simply times out (default NO).
+    With ``question`` (the pending confirmation), that action's own verb is a
+    yes too (``ACTION_VERBS``).
     """
     norm = normalize_ckb(text, strip_punct=True)
     if not norm:
@@ -92,13 +128,15 @@ def classify_answer(text: str) -> bool | None:
         return False
     if len(tokens) > MAX_YES_WORDS:
         return None
+    verb_words, verb_phrases = _action_yes(question)
     rest = padded
-    for phrase in sorted(YES_PHRASES, key=len, reverse=True):
+    for phrase in sorted(YES_PHRASES + verb_phrases, key=len, reverse=True):
         if f" {phrase} " in rest:
             rest = rest.replace(f" {phrase} ", " YES ")
     words = rest.split()
-    has_yes = any(w == "YES" or w in YES_WORDS for w in words)
-    only_yes = all(w == "YES" or w in YES_WORDS or w in FILLER_WORDS for w in words)
+    yes_words = YES_WORDS | verb_words
+    has_yes = any(w == "YES" or w in yes_words for w in words)
+    only_yes = all(w == "YES" or w in yes_words or w in FILLER_WORDS for w in words)
     return True if has_yes and only_yes else None
 
 
@@ -188,12 +226,30 @@ class ConfirmBroker:
     def offer_transcript(self, text: str) -> bool:
         """Feed a final user transcript. Consumed (True) only when a
         confirmation is pending and the text is a clear yes/no."""
-        if not self._pending:
+        latest = self._latest()
+        if latest is None:
             return False
-        answer = classify_answer(text)
+        answer = classify_answer(text, latest.question_ckb)
         if answer is None:
             return False
-        return self.resolve(None, answer, via="voice")
+        return self.resolve(latest.confirm_id, answer, via="voice")
+
+    def classify_pending(self, text: str) -> bool | None:
+        """``classify_answer`` against the most recent pending question
+        (None when nothing is pending or ``text`` is not a clear yes/no)."""
+        latest = self._latest()
+        return None if latest is None else classify_answer(text, latest.question_ckb)
+
+    def needs_clear_answer(self, text: str) -> bool:
+        """A confirmation is pending and ``text`` is a SHORT utterance that is
+        neither yes nor no («باشە», «ئا»): the caller should ask
+        ``ASK_AGAIN_CKB`` instead of starting a new turn with it (a new
+        cascade turn mutes the reply that waits for this answer)."""
+        latest = self._latest()
+        if latest is None:
+            return False
+        norm = normalize_ckb(text, strip_punct=True)
+        return bool(norm) and len(norm.split()) <= MAX_YES_WORDS and classify_answer(text, latest.question_ckb) is None
 
     def pending(self) -> list[dict[str, Any]]:
         return [p.public() for p in sorted(self._pending.values(), key=lambda p: p.created_at)]
@@ -211,4 +267,4 @@ class ConfirmBroker:
         return count
 
 
-__all__ = ["ConfirmBroker", "classify_answer", "YES_WORDS", "NO_WORDS", "PendingConfirm"]
+__all__ = ["ConfirmBroker", "classify_answer", "YES_WORDS", "NO_WORDS", "PendingConfirm", "ACTION_VERBS", "ASK_AGAIN_CKB"]
