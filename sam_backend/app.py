@@ -28,6 +28,7 @@ from .api import (
 from .autonomy import AutonomousOrchestrator
 from .cancellation import CancellationManager
 from .capabilities import CapabilityRegistry
+from .capability_brief import CapabilityBrief
 from .config import Settings
 from .dpi import ensure_dpi_awareness
 from .integrations import IntegrationHealth
@@ -121,6 +122,13 @@ def create_app(settings: Settings | None = None, adapters: AdapterRegistry | Non
     # hands the text to the same `agent.chat` the typed box uses, so a
     # spoken request gets no authority a typed one would not have.
     voice_session = VoiceConversationController(settings, voice, agent)
+    # The chat model is told what SAM can do from live state -- the voice keys,
+    # the wake listener, the desktop switches -- so it cannot deny having a
+    # voice it has. Attached here because those services exist only now; the
+    # orchestrator behind Autopilot is always built above.
+    agent.capability_brief = CapabilityBrief(
+        settings, voice=voice, voice_session=voice_session, trading=trading, autonomy=True,
+    )
     replay = BarReplayResearch(trading.market_data, trading.tradingview)
     # Workflow Intelligence: SAM reasons and gates, n8n executes.
     workflow_intelligence = WorkflowIntelligence(settings, router=router)

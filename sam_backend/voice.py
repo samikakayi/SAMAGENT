@@ -583,6 +583,16 @@ class VoiceService:
         stt_key, _, google = self._sorani_credentials()
         return bool(stt_key or google)
 
+    def sorani_output_configured(self) -> bool:
+        """Whether a Sorani speech key is present. Does not call the provider.
+
+        The TTS health check lists speakers over the network, far too slow to
+        ask before every chat turn; the chat model's capability brief only
+        needs to know whether the key is there.
+        """
+        _, tts_key, _ = self._sorani_credentials()
+        return bool(tts_key)
+
     def sorani_stack(self) -> tuple[Any, Any]:
         """The (STT, TTS) routers, rebuilt when the configured keys change."""
         stt_key, tts_key, google = self._sorani_credentials()
