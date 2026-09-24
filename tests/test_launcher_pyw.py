@@ -20,7 +20,7 @@ from tests.launcher_helpers import LAUNCHER, ROOT, load_launcher
 @pytest.fixture(autouse=True)
 def restore_launcher_env(monkeypatch):
     """SAM.pyw writes these into os.environ; make monkeypatch restore them."""
-    for name in ("SAM_BACKGROUND", "OPENBLAS_NUM_THREADS"):
+    for name in ("SAM_BACKGROUND", "SAM_SHOW_PANEL", "OPENBLAS_NUM_THREADS"):
         monkeypatch.setenv(name, "placeholder")
         monkeypatch.delenv(name)
 
@@ -56,8 +56,10 @@ def test_a_normal_launch_runs_sam_opens_the_panel_and_starts_omniroute(launcher)
     assert launcher.launch(["--home", r"C:\SAMHOME"]) == 0
 
     assert launcher.calls["run_app"] == [["--home", r"C:\SAMHOME"]]
-    assert launcher.calls["omniroute"] == [1] and launcher.calls["panel"] == [1]
-    assert os.environ["SAM_BACKGROUND"] == "0"
+    # The UI opens the panel itself after the island's first frame (acceptance 2026-09-24:
+    # waiting for the launcher's show request left ~8 s without a window).
+    assert launcher.calls["omniroute"] == [1] and launcher.calls["panel"] == []
+    assert os.environ["SAM_BACKGROUND"] == "0" and os.environ["SAM_SHOW_PANEL"] == "1"
     assert launcher.calls["error"] == []
 
 
@@ -66,7 +68,7 @@ def test_background_launch_starts_hidden(launcher):
 
     assert launcher.calls["run_app"] == [["--home", "H"]]
     assert launcher.calls["panel"] == [], "sign-in start shows the island only"
-    assert os.environ["SAM_BACKGROUND"] == "1"
+    assert os.environ["SAM_BACKGROUND"] == "1" and os.environ["SAM_SHOW_PANEL"] == "0"
 
 
 def test_second_launch_asks_the_running_sam_to_show_its_panel(launcher, monkeypatch):

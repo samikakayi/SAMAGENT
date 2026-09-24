@@ -27,7 +27,7 @@ from .pages.settings import SettingsPage
 from .pages.strategies import StrategiesPage
 from .strings import en, state_word, tr, tr_or
 from .widgets import A_RIGHT, StatusDot
-from .win32 import dark_title_bar
+from .win32 import bring_to_front, dark_title_bar
 
 PAGES = ("chat", "strategies", "monitor", "activity", "settings")
 NAV_ICONS = {"chat": "chat", "strategies": "strategies", "monitor": "monitor", "activity": "activity",
@@ -181,7 +181,8 @@ class Panel(QWidget):
         for key in PAGES:
             button = NavButton(key, tr(f"tab.{key}"))
             button.setFixedHeight(42)
-            button.clicked.connect(lambda _=False, k=key: self.show_page(k))
+            # toggled (not clicked): UI Automation's Toggle on a nav item checks it without a click.
+            button.toggled.connect(lambda on, k=key: on and k != self.current and self.show_page(k))
             self.nav_group.addButton(button)
             self.nav[key] = button
             side.addWidget(button)
@@ -211,6 +212,7 @@ class Panel(QWidget):
         root.addWidget(sidebar)      # RTL: first widget sits on the right
         root.addWidget(body, 1)
         self.current = ""
+        self.in_front = False            # the last show_and_raise made the panel the foreground window
         self.show_page("chat", refresh=False)
         bridge.subscribe(None, self.handle_event)
 
@@ -243,6 +245,9 @@ class Panel(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+        # activateWindow alone can leave the panel behind the app in front
+        # (Windows foreground lock): the user asked for it, so bring it forward.
+        self.in_front = bring_to_front(self)
         self._page_shown(self.current)
 
     # -- events ----------------------------------------------------------------------------------------

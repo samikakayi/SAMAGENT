@@ -206,11 +206,14 @@ async def test_older_turns_are_summarised_in_the_background(make_app):
     for i in range(8):
         app.bus.publish(Transcript(role="user", text=f"پرسیاری {i}", source="live", conversation_id=cid))
         app.bus.publish(Transcript(role="assistant", text=f"وەڵامی {i}", source="live", conversation_id=cid))
-    for _ in range(100):
-        if app.memory.get_conversation(cid)["summary"]:
-            break
-        await asyncio.sleep(0.01)
+    # Acceptance 2026-09-24: never a model call in the middle of the exchange ...
+    await app.conversation.background_tick()
+    assert app.memory.get_conversation(cid)["summary"] == "" and backend.requests == []
+    # ... but in the next pause (brain/budget.py quiet_s), with one request.
+    app.conversation._last_activity -= 60                                     # noqa: SLF001
+    await app.conversation.background_tick()
     assert app.memory.get_conversation(cid)["summary"].startswith("User asked about gold")
+    assert len(backend.requests) == 1
     context = app.conversation.context_for_prompt("text")
     assert "Earlier in this conversation" in context
     upto = app.db.scalar("SELECT summary_upto FROM brain_conversation_state WHERE conversation_id=?", (cid,))

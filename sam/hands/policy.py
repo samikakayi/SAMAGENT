@@ -68,16 +68,33 @@ _BLOCK_RULES: tuple[tuple[str, str], ...] = (
      r".*\|\s*(?:stop-process|spps)\b", "stopping a critical Windows process is blocked"),
 )
 _DELETE_VERB = r"\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\b"
+# PowerShell accepts any unambiguous prefix of a parameter name: -r, -Rec,
+# -Recu ... all mean -Recurse, and -Depth (-Dep, -Dept) recurses too
+# (acceptance review 2026-09-24).
+_RECURSE_FLAG = r"(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\b|-dep(?:t(?:h)?)?\b|/s\b)"
 _ROOTISH = (r"(?:\s|^|['\"])(?:[a-z]:\\?\*?|[a-z]:\\users\\[^\\\s'\"]+\\?|~[\\/]?|\$home[\\/]?|"
             r"\$env:(?:userprofile|homedrive|systemroot|windir|programfiles|onedrive)[\\/]?|"
             r"[^\s'\"]*[\\/](?:desktop|documents|downloads|pictures|onedrive)[\\/]?\*?)(?:['\"]|\s|$)")
+# Every file directly inside a drive, the home folder or a main user folder
+# ("Remove-Item ~\Documents\*"): no -Recurse needed to empty the folder.
+_ROOT_WILDCARD = (r"(?:[a-z]:\\|~[\\/]|\$home[\\/]|\$env:\w+[\\/]|[a-z]:\\users\\[^\\\s'\"]+\\|"
+                  r"[^\s'\"]*[\\/](?:desktop|documents|downloads|pictures|onedrive)[\\/])\*(?:\.\*)?(?:['\"]|\s|$)")
 _MASS_DELETE = (
-    re.compile(_DELETE_VERB + r".*(?:-r(?:ecurse)?\b|/s\b)" + r".*" + _ROOTISH, re.I),
-    re.compile(_DELETE_VERB + r".*" + _ROOTISH + r".*(?:-r(?:ecurse)?\b|/s\b)", re.I),
-    re.compile(_DELETE_VERB + r".*(?:-r(?:ecurse)?\b|/s\b).*[\\/]\*(?:\s|$|['\"])", re.I),
-    re.compile(r"\b(?:get-childitem|gci|dir|ls)\b.*-r(?:ecurse)?\b.*\|\s*" + _DELETE_VERB, re.I),
+    re.compile(_DELETE_VERB + r".*" + _RECURSE_FLAG + r".*" + _ROOTISH, re.I),
+    re.compile(_DELETE_VERB + r".*" + _ROOTISH + r".*" + _RECURSE_FLAG, re.I),
+    re.compile(_DELETE_VERB + r".*" + _RECURSE_FLAG + r".*[\\/]\*(?:\s|$|['\"])", re.I),
+    re.compile(r"\b(?:get-childitem|gci|dir|ls)\b.*" + _RECURSE_FLAG + r".*\|\s*" + _DELETE_VERB, re.I),
     re.compile(r"\brm\s+-rf\s+[/~]", re.I),
+    re.compile(_DELETE_VERB + r".*" + _ROOT_WILDCARD, re.I),
+    # .NET recursive deletes: [IO.Directory]::Delete(path, $true), DirectoryInfo.Delete($true),
+    # VisualBasic FileSystem.DeleteDirectory (no PowerShell parameter to look at).
+    re.compile(r"\[(?:system\.)?io\.directory\]::delete\s*\([^)]*,\s*\$true|\.delete\s*\(\s*\$true\s*\)|"
+               r"filesystem\]::deletedirectory\b", re.I),
 )
+# A recursive listing with a delete command anywhere later in the same
+# statement ("gci -r | % { Remove-Item $_ }"); checked on literal-free code.
+_LISTING_THEN_DELETE = re.compile(r"\b(?:get-childitem|gci|dir|ls)\b[^;\n]*" + _RECURSE_FLAG + r"[^;\n]*\|[^;\n]*"
+                                  + _DELETE_VERB, re.I)
 # v1 high_patterns: need a confirmation.
 _CONFIRM_RULES: tuple[tuple[str, str], ...] = (
     (r"\b(?:remove-item|ri|del|erase|rm|rmdir|rd|move-item|mi|mv|rename-item|ren|copy-item|cp|copy)\b",
@@ -132,7 +149,10 @@ _SAFE_METHODS = frozenset({"tostring", "tolower", "toupper", "trim", "trimstart"
                            "startswith", "endswith", "substring", "gettype", "replace", "padleft", "padright",
                            "indexof", "round", "floor", "ceiling", "abs", "max", "min", "sqrt", "pow", "now",
                            "toshortdatestring", "tolongdatestring", "totalseconds", "totalminutes", "totalhours",
-                           "totaldays", "getenvironmentvariables"})
+                           "totaldays", "getenvironmentvariables", "adddays", "addhours", "addminutes", "addseconds",
+                           "addmonths", "addyears", "addmilliseconds", "tolowerinvariant", "toupperinvariant",
+                           "compareto", "equals", "lastindexof", "tochararray", "toshorttimestring",
+                           "tolongtimestring", "touniversaltime", "tolocaltime"})
 _SAFE_TYPES = frozenset({"math", "datetime", "system.math", "system.datetime", "environment", "system.environment",
                          "timespan", "convert", "int", "double", "string", "decimal"})
 
@@ -181,10 +201,131 @@ def command_words(command: str) -> tuple[list[str], list[str]]:
 
 # ForEach-Object's member shorthand calls a .NET method by NAME, without
 # parentheses: "gci -Recurse | % Delete" deleted every file permanently while
-# classified "Read-only command." (repair review ps_delete_proof.py).
-_MEMBER_CALL = re.compile(r"(?:^|[|;(]\s*)(?:foreach-object|foreach|%)\s+(?:-membername\s+|-m\s+)?([a-z_]\w*)\b")
-_DESTRUCTIVE_METHOD = re.compile(r"\.\s*(?:delete|moveto|copyto|remove|kill|terminate|stop|encrypt|replace)\s*\(")
-_RECURSE = re.compile(r"(?:^|\s)-r(?:ecurse)?\b|(?:^|\s)/s\b")
+# classified "Read-only command." (repair review ps_delete_proof.py). The name
+# can also come quoted ('Delete'), through -Mem/-MemberName:Delete, from a
+# variable or an expression (acceptance review ps_quoted_proof.py deleted
+# files with all three), so every ForEach-Object argument that is not a
+# script block counts as a member call (``foreach_members``).
+_DESTRUCTIVE_METHOD = re.compile(r"(?:\.|::)\s*(?:delete|moveto|copyto|remove|kill|terminate|stop|encrypt|replace|"
+                                 r"move|copy)\s*\(")
+_RECURSE = re.compile(r"(?:^|\s)" + _RECURSE_FLAG)
+# Properties that are commonly read with the shorthand ("Get-Process | % Name").
+_SAFE_MEMBERS = frozenset({"name", "fullname", "basename", "extension", "length", "directoryname", "lastwritetime",
+                           "creationtime", "lastaccesstime", "mode", "id", "processname", "path", "count",
+                           "displayname", "status", "starttype", "cpu", "workingset", "ws", "mainwindowtitle",
+                           "version", "source", "description", "value", "key", "psiscontainer", "attributes"})
+_FE_COMMAND = re.compile(r"(^|\|\|?|;|&&|\(|\{|\n)\s*(foreach-object|foreach|%)(?=[\s('\"${@]|$)")
+# Member names that change or remove what they are called on; with a listing
+# of a drive / home / main user folder they are a mass change even without -Recurse.
+_DESTRUCTIVE_MEMBERS = frozenset({"delete", "moveto", "copyto", "remove", "kill", "terminate", "stop", "encrypt",
+                                  "replace", "move", "copy", "clear", "setaccesscontrol", "decrypt", "invoke"})
+_FE_BLOCK_PARAMS = ("begin", "process", "end", "parallel", "remainingscripts")
+_FE_VALUE_PARAMS = ("inputobject", "throttlelimit", "timeoutseconds", "erroraction", "warningaction",
+                    "informationaction", "errorvariable", "warningvariable", "informationvariable", "outvariable",
+                    "outbuffer", "pipelinevariable")
+_FE_VALUE_ALIASES = frozenset({"ea", "wa", "infa", "ev", "wv", "iv", "ov", "ob", "pv"})
+_FE_SWITCHES = ("asjob", "usenewrunspace", "confirm", "whatif", "verbose", "debug")
+
+
+def _mask_literals(code: str) -> str:
+    """Same-length copy with the insides of quoted strings blanked, so
+    positions still match ``code``."""
+    return re.sub(r"'[^']*'|\"[^\"]*\"", lambda m: m.group(0)[0] + "x" * (len(m.group(0)) - 2) + m.group(0)[-1],
+                  code)
+
+
+def _scan_args(code: str, start: int) -> list[tuple[str, str]]:
+    """Top-level argument tokens of the command starting at ``start``:
+    (kind, text) with kind block/string/param/other; stops at the end of the
+    pipeline segment."""
+    tokens: list[tuple[str, str]] = []
+    i, n = start, len(code)
+    while i < n:
+        ch = code[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "|;)}\n" or code.startswith("&&", i):
+            break
+        if ch in "{(":
+            close = "}" if ch == "{" else ")"
+            depth, j, quote = 0, i, ""
+            while j < n:
+                c = code[j]
+                if quote:
+                    quote = "" if c == quote else quote
+                elif c in "'\"":
+                    quote = c
+                elif c == ch:
+                    depth += 1
+                elif c == close:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            tokens.append(("block" if ch == "{" else "other", code[i:j + 1]))
+            i = j + 1
+            continue
+        if ch in "'\"":
+            j = code.find(ch, i + 1)
+            j = n if j < 0 else j
+            tokens.append(("string", code[i + 1:j]))
+            i = j + 1
+            continue
+        j = i
+        while j < n and not code[j].isspace() and code[j] not in "|;)}{(\n":
+            j += 1
+        word = code[i:j]
+        tokens.append(("param" if word.startswith("-") and len(word) > 1 else "other", word))
+        i = j
+    return tokens
+
+
+def _prefix_of(name: str, options: tuple[str, ...]) -> bool:
+    return bool(name) and any(option.startswith(name) for option in options)
+
+
+def foreach_members(lowered: str) -> list[str]:
+    """Every member name (or unknown value) that ForEach-Object / % /
+    foreach would call in ``lowered``: all its arguments that are not
+    script blocks or harmless parameters. The ``foreach (...)`` loop
+    statement is not ForEach-Object and is skipped."""
+    masked = _mask_literals(lowered)
+    members: list[str] = []
+    for match in _FE_COMMAND.finditer(masked):
+        word, after = match.group(2), match.end()
+        rest = lowered[after:].lstrip()
+        if word == "foreach" and not match.group(1).startswith("|") and rest.startswith("("):
+            continue  # foreach ($x in $list) { ... }: the loop statement
+        tokens = _scan_args(lowered, after)
+        k = 0
+        while k < len(tokens):
+            kind, text = tokens[k]
+            if kind == "block":
+                k += 1
+                continue
+            if kind != "param":
+                members.append(text.strip().strip("'\"") or "(empty)")
+                k += 1
+                continue
+            name, colon, attached = text[1:].partition(":")
+            value = [("other", attached)] if colon else tokens[k + 1:k + 2]
+            step = 1 if colon else 2
+            if _prefix_of(name, _FE_SWITCHES) and not colon:
+                k += 1
+                continue
+            if _prefix_of(name, _FE_BLOCK_PARAMS) and value and value[0][0] == "block":
+                k += step
+                continue
+            if (len(name) >= 2 and _prefix_of(name, _FE_VALUE_PARAMS)) or name in _FE_VALUE_ALIASES:
+                k += step
+                continue
+            # -MemberName / -Mem / -M / -ArgumentList, or anything unknown.
+            members.append((value[0][1].strip().strip("'\"") if value else name) or name)
+            k += step
+    for match in re.finditer(r"\.foreach\s*\(\s*(?!\{)([^)]*)\)", lowered):
+        members.append(match.group(1).strip().strip("'\"") or "(empty)")
+    return members
 _READ_FILE = re.compile(r"\b(?:get-content|gc|cat|type|get-item|gi|select-string|sls|import-csv|import-clixml|"
                         r"get-filehash|copy-item|cp|copy|format-hex|fhx)\b")
 _BUILT_PATH = re.compile(r"\$|\+|\bjoin-path\b|-join\b|\[char\]|\bchild-path\b")
@@ -208,21 +349,65 @@ def _wildcard_hits_secret(code: str) -> bool:
 def _member_call_verdict(lowered: str) -> Verdict | None:
     code = _strip_literals(lowered)
     recursive = bool(_RECURSE.search(code))
-    for method in _MEMBER_CALL.findall(code):
-        if method in _SAFE_METHODS or method in ("{",):
+    rootish = bool(re.search(_ROOTISH, lowered, re.I))
+    for method in foreach_members(lowered):
+        if method in _SAFE_METHODS or method in _SAFE_MEMBERS:
             continue
-        if recursive:
-            return "blocked", ("Blocked by SAM's safety rules: a recursive listing piped into a method call "
-                               f"('{method}') is a mass change.")
-        return "confirm", f"Needs the user's approval: the command calls the .{method} method on each item."
-    if recursive and _DESTRUCTIVE_METHOD.search(code):
+        if recursive or (rootish and method in _DESTRUCTIVE_MEMBERS):
+            return "blocked", ("Blocked by SAM's safety rules: a folder listing piped into a method call "
+                               f"('{method[:40]}') is a mass change.")
+        return "confirm", f"Needs the user's approval: the command calls '{method[:40]}' on each item."
+    if recursive and (_DESTRUCTIVE_METHOD.search(code) or _LISTING_THEN_DELETE.search(code)):
         return "blocked", "Blocked by SAM's safety rules: a recursive listing piped into delete/move calls."
+    if recursive and _LISTING.search(code):
+        # Any other method a recursive listing calls on its items ($_.psobject.Methods['Delete'].Invoke(),
+        # $_.GetFiles()...) cannot be told apart from a deletion by its name alone.
+        unsafe = [m for m in re.findall(r"\.\s*([a-z_]\w*)\s*\(", code) if m not in _SAFE_METHODS]
+        if unsafe:
+            return "blocked", ("Blocked by SAM's safety rules: a recursive listing calls "
+                               f"'.{unsafe[0][:40]}()' on its items.")
     return None
 
 
-def classify_powershell(command: str) -> Verdict:
+_LISTING = re.compile(r"\b(?:get-childitem|gci|dir|ls|get-item|gi)\b")
+# powershell -Command "..." / pwsh -c '...': the quoted inner command is classified too.
+_NESTED_SHELL = re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b[^|;]*?\s-(?:c|co|com|comm|comma|comman|command)\s+"
+                           r"(?:'([^']*)'|\"([^\"]*)\"|(.+))", re.I)
+_RANK = {"safe": 0, "confirm": 1, "blocked": 2}
+
+
+def _nested_verdict(lowered: str, depth: int) -> Verdict | None:
+    """The verdict of a PowerShell command inside ``powershell -c "..."``
+    when it is stricter than 'confirm' (the outer call already asks)."""
+    if depth >= 2:
+        return None
+    for match in _NESTED_SHELL.finditer(lowered):
+        inner = next((g for g in match.groups() if g), "")
+        if inner.strip():
+            risk, reason = classify_powershell(inner, _depth=depth + 1)
+            if risk == "blocked":
+                return risk, reason
+    return None
+
+
+# PowerShell reads the en dash, em dash and horizontal bar as a parameter
+# dash, and curly quotes as quotes: "Remove-Item ~\Documents –Recurse" really
+# recurses (adversarial review 2026-09-24, ps_probe.py: classified 'confirm'
+# instead of 'blocked'). Every rule below is written with ASCII, so the
+# command is normalised first.
+_PS_CHARS = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-",
+                           "\u2015": "-", "\u2212": "-", "\ufe58": "-", "\ufe63": "-", "\uff0d": "-",
+                           "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+                           "\u201c": '"', "\u201d": '"', "\u201e": '"'})
+# "$_.Attributes = 'Hidden'" inside ForEach-Object changes every listed item
+# without a method call (review: hid / set read-only on a scratch tree while
+# classified "Read-only command."): an assignment to a member of a variable.
+_MEMBER_ASSIGN = re.compile(r"\$[\w:?]+(?:\s*\[[^\]]*\])*\s*\.\s*\w+(?:\s*\.\s*\w+|\s*\[[^\]]*\])*\s*(?:[-+*/%]|\?\?)?=(?!=)")
+
+
+def classify_powershell(command: str, *, _depth: int = 0) -> Verdict:
     """(risk, reason) for one PowerShell command line."""
-    text = " ".join(str(command or "").split())
+    text = " ".join(str(command or "").translate(_PS_CHARS).split())
     if not text:
         return "blocked", "The command is empty."
     lowered = text.lower()
@@ -232,12 +417,21 @@ def classify_powershell(command: str) -> Verdict:
         if re.search(pattern, lowered, re.I):
             return "blocked", f"Blocked by SAM's safety rules: {reason}."
     if any(p.search(lowered) for p in _MASS_DELETE):
-        return "blocked", "Blocked by SAM's safety rules: mass deletion (recursive delete of a whole folder tree)."
+        return "blocked", "Blocked by SAM's safety rules: mass deletion (a whole folder or folder tree)."
+    nested = _nested_verdict(lowered, _depth)
+    if nested is not None:
+        return nested
     if _READ_FILE.search(lowered) and _wildcard_hits_secret(lowered):
         return "blocked", "Blocked by SAM's safety rules: the wildcard path could match a key or password file."
     member = _member_call_verdict(lowered)
     if member is not None:
         return member
+    if _MEMBER_ASSIGN.search(_strip_literals(lowered)):
+        if _RECURSE.search(_strip_literals(lowered)) and _LISTING.search(lowered) \
+                or re.search(_ROOTISH, lowered, re.I) and _LISTING.search(lowered):
+            return "blocked", ("Blocked by SAM's safety rules: a folder listing that changes a property of "
+                               "every item is a mass change.")
+        return "confirm", "Needs the user's approval: the command changes a property of an object (file, process...)."
     if _READ_FILE.search(_strip_literals(lowered)) and _BUILT_PATH.search(_strip_literals(lowered).split("|")[0]):
         # A path built from variables or pieces cannot be checked against the
         # key-file rules ('.' + 'env'), so a person decides.

@@ -20,7 +20,11 @@ What it does, in order:
    CREATE_NEW_PROCESS_GROUP, never DETACHED_PROCESS).
 4. Runs ``sam.__main__.main`` (core thread + Qt UI). ``--background`` sets
    ``SAM_BACKGROUND=1`` for the UI (island only, panel hidden); a normal
-   launch opens the panel once the UI is listening for show requests.
+   launch sets ``SAM_SHOW_PANEL=1`` and the UI opens the panel itself right
+   after the island's first frame (it used to wait for this launcher's show
+   request: ~8 s without a window on the user's evening test, 2026-09-24).
+   A second launch lets the running SAM take the foreground
+   (AllowSetForegroundWindow) before it asks it to show the panel.
 5. If start-up fails, a Sorani/English message box names the log file (a
    pythonw program has no other way to tell the user).
 
@@ -181,8 +185,20 @@ def instance_running(name: str | None = None) -> bool:
     return ctypes.get_last_error() == ERROR_ACCESS_DENIED  # exists, other integrity level
 
 
+def allow_foreground() -> bool:
+    """This launch was started by the user, so Windows lets it hand its
+    foreground right to the running SAM (whose panel should come to front)."""
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.user32.AllowSetForegroundWindow(-1))   # ASFW_ANY
+    except (AttributeError, OSError):
+        return False
+
+
 def signal_show() -> bool:
     from sam.winapp import signal_show as _signal_show
+    allow_foreground()
     return _signal_show()
 
 
@@ -273,10 +289,9 @@ def launch(argv: list[str] | None = None) -> int:
             log.info("SAM is already running: nothing to do for a background start")
         return 0
     os.environ["SAM_BACKGROUND"] = "1" if args.background else "0"
+    os.environ["SAM_SHOW_PANEL"] = "0" if args.background or headless else "1"
     if not args.no_omniroute and "--check" not in rest:
         log.info("OmniRoute: %s", start_omniroute())
-    if not args.background and not headless:
-        request_panel_when_ready()
     interactive = "--check" not in rest   # --check is scripted: never block on a message box
     started = time.monotonic()
     try:

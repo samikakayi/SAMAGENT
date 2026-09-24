@@ -883,3 +883,130 @@ MT5 re-verifies the broker offset from live ticks (every 5 min, every 1 min whil
 
 **Launcher.** `scripts/install.ps1` step 0 stops when SAM v1 (sam_desktop.pyw, sam_backend, LiteLLM)
 still runs from the repository folder (`-StopV1` stops them); `.venv.old-*/` is gitignored.
+
+---------------------------------------------------------------------------------------------------
+
+## 7. Acceptance additions (acceptance stage, 2026-09-24 evening; the user's first real test)
+
+Compatible additions; everything above still holds.
+
+**Ladders.** `GEMINI_CAP_S` 5 s. The slow head of a round (Gemini direct, OmniRoute ahead of the first
+healthy Groq rung) shares at most `ladders.head_budget(deadline)` = min(`HEAD_MAX_S` 6, deadline -
+`FAST_RESERVE_S` 3); a slow rung is not started with less than `MIN_SLOW_RUNG_S` 2.5 s left; the rest
+goes to Groq (`Responder._chat_reserving`, `ladders.split_head`). `LLMClient.chat`: a rung the round's
+deadline cut after it used 3/4 of its own cap IS blamed (rests). `LLMClient.reset_provider(provider, *,
+auth_only=False)` forgets a provider's rests and strikes (memory and `llm_health`); Settings calls it after
+a key is saved, `test_provider` clears the provider-wide auth rest when listing works.
+
+**Background budget (`sam/brain/budget.py`, `BackgroundBudget` at `app.conversation.budget`).**
+Conversation summaries, fact extraction and rewording are optional model calls. Summaries and extraction
+never run during a live exchange (a turn running: `Conversation.active_turns`; the voice engine
+thinking/speaking/working; or speech/text within `brain.background.quiet_s` 40 s); they run in
+`Conversation.background_tick()` (every 15 s from `idle_watch`), one request to one rung, with
+`retry_transient=False`. Any of them is skipped while ANY rung of the live picker/wording ladders (or of
+its own ladder) rests, or when the day's budget is low (`brain.background.daily_max` 30 summary+extraction
+requests; `reword_daily_max` 60; a capped model past `cap_share` 0.6 of `llm.daily_caps`). Under pressure a
+summary is folded without a model (extractive) and an extraction waits (retried in a later pause, dropped
+after 24 h). Every decision is counted in `usage_counters` (provider `background`, model = purpose, kind =
+ran | skipped | deferred | failed); `budget.counts_today()`. `Memory.extract_facts(conversation_id, *,
+ladder=None)` takes the one-rung ladder.
+
+**Confirmations.** `classify_answer(text, question="")`: the pending action's own verb is a yes when the
+pending question contains its stem (`ACTION_VERBS`: «بەڵێ بینێرە», «بینێرە» for «... بنێرم؟»,
+«بیسڕەوە», «دایبخە» ...); negative imperatives are a no. `ConfirmBroker.needs_clear_answer(text)`: a
+confirmation waits and a short utterance is neither yes nor no -- the caller should answer `ASK_AGAIN_CKB`
+(«بەڵێ یان نەخێر؟») instead of starting a turn (typed text does; the cascade should, voice package).
+
+**Taint.** `taint.note(scope, name, result)` (called by `ToolRegistry.dispatch`) marks the scope and keeps
+the scope's own web_search result links; `fetch_page` of exactly such a link needs no question (a changed
+query string or another host still asks).
+
+**Hands.** PowerShell: every ForEach-Object argument that is not a script block is a member call
+(`policy.foreach_members`: quoted, -Mem/-MemberName:, variables, expressions, splatting, `.ForEach('x')`),
+blocked after any recursion flag (-r/-Rec/-Depth) or on a listing of a drive/home/main folder; `powershell
+-c "..."` is classified inside; `Remove-Item <main folder>\*`, `[IO.Directory]::Delete(x, $true)` and
+`.Delete($true)` are mass deletion. `guards.click_windows(args)`: the click guard judges the window the
+click goes to (`Windows.find_sync(window)`, and for a numbered target the window of the last screen_look);
+'Algo Trading', AutoTrading, Expert Advisors and Ctrl+E are blocked in trading apps. Grounded web search
+skips Gemini while its model rests (and for 5 min after it failed).
+
+**Trading.** `symbols`: the edit-distance fallback never applies to inputs with digits, currency-pair shapes
+or `NOT_NEAR_MISSES` (US500, UK100, UKOIL, GER40, USDT stay themselves). `tv_owner.match_shapes` re-adopts
+only labelled rows of the same kind (`SHAPE_NAMES`). `tv_feeds.FeedMemory` (bridge `.feeds`): symbols SAM set
+are kept in `trading.tv_sam_set_symbols` (30 days) and never learned as the user's feed unless the user
+changes the chart to them. `analyze.feed_offset`: no chart-minus-MT5 offset when the MT5 quote is older
+than the chart's newest bar by > 300 s or differs by > 2 %; `draw_report` does not draw a stale MT5 feed
+on an open market (reason `stale_feed`, Sorani sentence in `NOT_DRAWN_CKB`).
+
+**UI / launcher.** A normal `SAM.pyw` launch sets `SAM_SHOW_PANEL=1` (background launch: 0); the UI opens
+the panel itself 30 ms after the island's first frame (no show-request polling). `Panel.show_and_raise`
+brings the panel to the foreground (`win32.bring_to_front`: SetForegroundWindow, then AttachThreadInput when
+Windows refuses; `Panel.in_front`); a second launch calls AllowSetForegroundWindow(ASFW_ANY) before
+signalling. Settings controls carry unique Sorani accessible names and English descriptions (`a11y.*`
+strings, `widgets.accessible`), key rows have objectNames `KeyRow_<secret>`; engine chips and nav items
+act on `toggled`, so UI Automation's Toggle works without a click. SAM's own hands still never act on SAM's
+own windows (its chat box accepts «بەڵێ» as a confirmation answer).
+
+---------------------------------------------------------------------------------------------------
+
+## 8. Listening additions (voice, 2026-09-24 night: deliberate, noise-robust, quota-safe listening)
+
+Why: in the user's first real test SAM transcribed the TV and a family conversation as commands (149
+KurdishTTS STT calls, every free model quota used up) and a Gemini TTS 429 plus the SDK's own ~27 s retry
+left the island on «بیردەکەمەوە» for ~40 s. Compatible additions (everything above still holds):
+
+**Listening windows (`sam/voice/listening.py`).** Default (`voice.always_listening` False) = push-to-talk
+turns: `start_listening()` (click / hotkey / a confirmation question) opens ONE utterance window of
+`voice.start_timeout_s` (8 s); after SAM's answer a follow-up window of `voice.followup_s` (6 s). An
+automatic close publishes `VoiceState("idle", detail="no_speech"|"turn_end")` + `VoiceNotice(kind="closed")`
+and does NOT end the conversation; `VoiceState("sleeping", detail="conversation_end")` follows after
+`voice.conversation_timeout_s` with the mic closed (so `Conversation.on_sleep` / fact extraction run once
+per conversation). `stop_listening()` by the user still publishes "sleeping" (contract 3.1). Always
+listening: the cascade only, and the transcript must start with «سام»/SAM (`starts_with_name`) before any
+model call -- except a yes/no to a pending confirmation or an utterance that began while SAM answered or in
+the follow-up window.
+
+**Near-field gate (`sam/voice/gate.py`)** before STT or Live: per 30 ms frame, webrtcvad AND level >=
+clamp(max(p30 floor + `voice.gate_margin_db`, rejected-talker level + 4, user level - 8), `voice.gate_abs_min_db`,
+ceiling) where ceiling = user level - 4 dB (or `voice.gate_ceiling_db`). The user level
+(`voice.gate_user_level_db`) is measured by the enrollment and learned (EMA) from the first utterance after a
+click or any voiceprint-verified one. Failing frames are silence for the endpointer. `Endpointer.frames_so_far()`.
+
+**"Only my voice" (`sam/voice/voiceprint.py`, `enroll.py`).** sherpa-onnx 1.13.8 (+ `sherpa-onnx-core`
+1.13.8, add to requirements.txt) CAM++ `3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx`
+(Apache-2.0, 28.3 MB, SHA-256 checked, downloaded to `%LOCALAPPDATA%\SAM2\models` only when the user starts
+the enrollment; `voice.speaker_model_path` overrides). `app.voice.speaker_check: SpeakerCheck`
+(`enrolled`, `enabled`, `threshold(speech_ms)`, `await verify(pcm, speech_ms=) -> VerifyResult(ok, score,
+threshold, ms, reason)`, `status()`). Voiceprint = one embedding, DPAPI-protected, table `voice_profile`
+(namespace `voiceprint`, row id 1). Settings `voice.only_my_voice` (True: active once enrolled),
+`voice.only_my_voice_sensitivity` low/normal/high = 0.40/0.50/0.60 (speech < 1 s: -0.10). A rejected
+utterance costs no STT/model call (`VoiceNotice(kind="ignored")`, activity `not_my_voice`). New
+`VoiceEngine` methods: `request_enrollment(source)`, `await enroll_begin() -> {ok, sentences}`,
+`await enroll_record(index) -> {ok, reason, speech_ms, level_db}`, `await enroll_finish() -> {ok,
+consistency, level_db, clips}`, `await enroll_cancel()`, `await voiceprint_delete()`, `voiceprint_status()`,
+`admit_transcript(text, meta) -> text | None` (cascade hook), `listening_status()`; `status()` adds
+`listening_window`, `gate`, `voiceprint`, `rests`.
+
+**Live (`frames.py`, `live_config.py`).** Audio is sent only for accepted utterances (held until
+`voice.gate_min_voiced_ms` of near-field speech and, with a voiceprint, a match on the first 1.2 s; pre-roll
+included; `audio_stream_end` at local end of speech). `start_of_speech_sensitivity` =
+`voice.live_start_sensitivity` ("low").
+
+**Never stall on TTS/STT (`sam/voice/genai_client.py`, `quota.py`).** Voice Gemini clients never retry inside
+the SDK (`HttpRetryOptions(attempts=1)` + the Interactions client's `retry_config = None`; an httpx mock
+proves exactly one request per 429). Gemini TTS must deliver audio within `voice.tts_first_audio_s` (2.5 s);
+429/timeout/5xx rest the provider (`quota.rests(app)`: daily 429 -> next Pacific midnight = 10:00 Iraq in
+summer; per-minute -> retryDelay clamped 60-180 s; unlabelled 120 s, a second within 10 min -> daily;
+timeout/5xx 60 s), stored in setting `voice.rests` (survives restarts). Gemini STT: `voice.stt_gemini_timeout_s`
+(8 s) and the same rests. `voice.tts_prewarm` is False (lazy caching; an opted-in prewarm never uses Gemini);
+the automatic self-test runs at most once per `voice.selftest_min_interval_s` (86400) and never while Gemini
+TTS rests.
+
+**Events (`sam/voice/notices.py`, compatible: subclasses of `sam.events.Event`, forwarded to the UI).**
+`VoiceNotice(kind closed|ignored|quota|models|enroll, text_ckb, detail, until)` and `VoiceEnrollRequest(source)`.
+The island (`sam/ui/island_hints.py`) shows every notice as its caption; a `models` notice (the brain's
+SORANI_NO_MODEL reply) shows «سنووری ئەمڕۆ پڕە» as the idle status until the reset or a normal answer.
+Settings has a card «گوێگرتن و دەنگی من» (`sam/ui/voice_profile.py`: follow-up seconds, how strictly far/quiet
+speech is ignored, «تەنها دەنگی من», sensitivity, «ناساندنی دەنگی من», «سڕینەوەی دەنگی من»); the enrollment
+dialog also opens when the user says «دەنگم بناسە». `CascadeVoice.submit_utterance(..., meta=)`,
+`CascadeVoice.reply_active`.

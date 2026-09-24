@@ -237,6 +237,23 @@ STRINGS: dict[str, tuple[str, str]] = {
     "set.about": ("دەربارە", "About"),
     "set.home": ("فۆڵدەری داتا", "Data folder"),
     "set.logs": ("فۆڵدەری لۆگ", "Log folder"),
+    # --- accessible names (UI Automation: screen readers, SAM itself, tests) ------------------------------
+    # One unique name per control: before, the five key rows all read «پاشەکەوت» / «تاقیکردنەوە» and the
+    # fields, voice list, hotkey, timeout and switch had no name at all (UIA walk 2026-09-24).
+    "a11y.key.field": ("کلیلی {name}", "{name} key"),
+    "a11y.key.save": ("پاشەکەوتکردنی کلیلی {name}", "Save the {name} key"),
+    "a11y.key.test": ("تاقیکردنەوەی کلیلی {name}", "Test the {name} key"),
+    "a11y.key.get": ("وەرگرتنی کلیلی {name}", "Get a {name} key"),
+    "a11y.key.status": ("دۆخی کلیلی {name}", "{name} key status"),
+    "a11y.omniroute.test": ("تاقیکردنەوەی OmniRoute", "Test OmniRoute"),
+    "a11y.engine": ("بزوێنەری دەنگ: {choice}", "Voice engine: {choice}"),
+    "a11y.selftest": ("دەستپێکردنی تاقیکردنەوەی دەنگ", "Run the voice self-test"),
+    "a11y.voice_name": ("هەڵبژاردنی ناوی دەنگ", "Voice name"),
+    "a11y.hotkey": ("کورتەڕێگای کیبۆرد بۆ گوێگرتن", "Listening hotkey"),
+    "a11y.timeout": ("ماوەی گفتوگۆ دوای بێدەنگی بە چرکە", "Conversation timeout in seconds"),
+    "a11y.always": ("هەمیشە گوێ بگرە", "Always listen"),
+    "a11y.tv.connect": ("پەیوەستکردنی ترەیدینگ ڤیو", "Connect TradingView"),
+    "a11y.mt5.check": ("پشکنینی مێتاتڕەیدەر", "Check MetaTrader 5"),
     # --- statuses -------------------------------------------------------------------------------------
     "status.ok": ("کار دەکات", "OK"),
     "status.degraded": ("لاوازە", "Degraded"),

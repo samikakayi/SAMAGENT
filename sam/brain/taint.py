@@ -36,6 +36,9 @@ class TaintState:
     user_text: str = ""
     tainted: bool = False
     sources: list[str] = field(default_factory=list)
+    # Result links of this scope's own web searches: reading one of them is
+    # not egress the model built (see ``check``).
+    result_urls: set[str] = field(default_factory=set)
 
     def mark(self, tool_name: str) -> None:
         self.tainted = True
@@ -55,6 +58,7 @@ def begin(user_text: str = "", *, inherit: bool = False) -> TaintState:
     if inherit and parent is not None and parent.tainted:
         state.tainted = True
         state.sources = list(parent.sources)
+        state.result_urls = set(parent.result_urls)
     _SCOPE.set(state)
     return state
 
@@ -74,6 +78,50 @@ def current() -> TaintState | None:
 def carries_untrusted(result: Any) -> bool:
     data = result.get("data") if isinstance(result, dict) else None
     return isinstance(data, dict) and bool(data.get("untrusted"))
+
+
+def _url_key(url: str) -> str:
+    """A link as compared: scheme/host lower-cased, fragment and a trailing
+    slash dropped, query string kept (a model-built query must not match)."""
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return ""
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}" + (f"?{parsed.query}" if parsed.query else "")
+
+
+# Tools whose results list links chosen by the search engine, not by page text.
+_RESULT_LINK_TOOLS = frozenset({"web_search"})
+_LINK_KEYS = ("url", "link", "href", "uri")
+
+
+def _links(value: Any, found: set[str], depth: int = 0) -> None:
+    if depth > 4:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _LINK_KEYS and isinstance(item, str):
+                link = _url_key(item)
+                if link:
+                    found.add(link)
+            elif isinstance(item, (dict, list)):
+                _links(item, found, depth + 1)
+    elif isinstance(value, list):
+        for item in value[:50]:
+            _links(item, found, depth + 1)
+
+
+def note(state: TaintState | None, name: str, result: Any) -> None:
+    """After a tool ran: taint the scope when its result carries untrusted
+    data, and remember a web search's result links (verify review
+    2026-09-24: every page read after a search asked for a spoken yes, which
+    made delegated research unusable)."""
+    if state is None or not carries_untrusted(result):
+        return
+    state.mark(name)
+    if name in _RESULT_LINK_TOOLS:
+        data = result.get("data") if isinstance(result, dict) else None
+        _links((data or {}).get("untrusted"), state.result_urls)
 
 
 def _host_named(url: str, user_text: str) -> bool:
@@ -105,6 +153,8 @@ def check(name: str, args: dict[str, Any], state: TaintState) -> tuple[str, str]
         url = str(args.get("url") or "")
         if _host_named(url, state.user_text):
             return None
+        if name == "fetch_page" and _url_key(url) and _url_key(url) in state.result_urls:
+            return None      # a result link of this scope's own search, exactly as the engine gave it
         host = urlparse(url).hostname or "?"
         return "confirm", f"{after}، ماڵپەڕی {host} بکەمەوە؟"
     if name == "web_search":
@@ -122,4 +172,4 @@ def check(name: str, args: dict[str, Any], state: TaintState) -> tuple[str, str]
     return None
 
 
-__all__ = ["TaintState", "begin", "use", "current", "check", "carries_untrusted"]
+__all__ = ["TaintState", "begin", "use", "current", "check", "carries_untrusted", "note"]

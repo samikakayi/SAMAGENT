@@ -21,6 +21,8 @@ from ..textnorm import is_arabic_script
 
 DONE = "تەواو بوو."
 NOT_DONE = "ببورە، نەکرا."
+NO_MODEL_YET = "ببورە، ئێستا ناتوانم ئەوە بکەم؛ کەمێکی تر هەوڵ بدەرەوە."
+NO_RESULTS = "هیچ ئەنجامێکم نەدۆزییەوە."
 
 _SPECIAL = {
     "declined": "باشە، نەمکرد.",
@@ -40,12 +42,12 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
     "run_powershell": ("فەرمانەکە جێبەجێ کرا.", "فەرمانەکە سەرکەوتوو نەبوو."),
     "files": ("کارەکە لەسەر فایلەکە کرا.", "نەمتوانی ئەو کارە لەسەر فایلەکە بکەم."),
     "open_url": ("ماڵپەڕەکە کرایەوە.", "نەمتوانی ماڵپەڕەکە بکەمەوە."),
-    "web_search": ("گەڕانەکەم کرد، ئەنجامەکان لەسەر شاشەن.", "گەڕانەکە سەرکەوتوو نەبوو."),
+    "web_search": ("گەڕام، بەڵام ئێستا ناتوانم ئەنجامەکان بخوێنمەوە.", "گەڕانەکە سەرکەوتوو نەبوو."),
     "fetch_page": ("پەڕەکەم خوێندەوە.", "نەمتوانی پەڕەکە بخوێنمەوە."),
     "build_project": ("پرۆژەکە دروست کرا.", "نەمتوانی پرۆژەکە تەواو بکەم."),
     "system_control": ("کرا.", "نەمتوانی ئەوە بکەم."),
     "remember": ("باشە، لەبیرم دەبێت.", "نەمتوانی لەبیری بکەم."),
-    "recall": ("ئەوەی لەبیرم بوو لەسەر شاشەیە.", "هیچم لەبیر نییە دەربارەی ئەوە."),
+    "recall": ("شتێکم لەبیرە، بەڵام ئێستا ناتوانم بیڵێم.", "هیچم لەبیر نییە دەربارەی ئەوە."),
     "forget": ("لەبیرم بردەوە.", "شتێکی وام لەبیر نەبوو."),
     "delegate_task": ("دەستم پێکرد، کە تەواو بوو پێت دەڵێم.", "نەمتوانی ئەرکەکە دەست پێ بکەم."),
     "tv_open": ("ترەیدینگ ڤیو ئامادەیە.", "نەمتوانی ترەیدینگ ڤیو بکەمەوە."),
@@ -56,19 +58,23 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
     "get_price": ("نرخەکەم هێنا.", "نەمتوانی نرخەکە بدۆزمەوە."),
     "analyze_market": ("شیکارییەکە تەواو بوو.", "نەمتوانی شیکارییەکە بکەم."),
     "set_alert": ("ئاگادارکردنەوەکە دانرا.", "نەمتوانی ئاگادارکردنەوەکە دابنێم."),
-    "list_alerts": ("لیستی ئاگادارکردنەوەکان لەسەر شاشەیە.", "نەمتوانی لیستەکە بهێنم."),
+    "list_alerts": ("لیستەکەم هێنا، بەڵام ئێستا ناتوانم بیخوێنمەوە.", "نەمتوانی لیستەکە بهێنم."),
     "cancel_alert": ("ئاگادارکردنەوەکە هەڵوەشێنرایەوە.", "هیچ ئاگادارکردنەوەیەکی وا نەبوو."),
     "strategy_save": ("ستراتیژییەکە پاشەکەوت کرا.", "نەمتوانی ستراتیژییەکە پاشەکەوت بکەم."),
-    "strategy_list": ("ستراتیژییەکان لەسەر شاشەن.", "نەمتوانی ستراتیژییەکان بهێنم."),
-    "strategy_get": ("ستراتیژییەکە لەسەر شاشەیە.", "ئەو ستراتیژییەم نەدۆزییەوە."),
-    "theory_info": ("زانیارییەکە لەسەر شاشەیە.", "ئەو تیۆرییەم نەدۆزییەوە."),
+    "strategy_list": ("ستراتیژییەکانم هێنا، بەڵام ئێستا ناتوانم بیانخوێنمەوە.", "نەمتوانی ستراتیژییەکان بهێنم."),
+    "strategy_get": ("ستراتیژییەکەم دۆزییەوە، بەڵام ئێستا ناتوانم بیخوێنمەوە.", "ئەو ستراتیژییەم نەدۆزییەوە."),
+    "theory_info": ("زانیارییەکەم هەیە، بەڵام ئێستا ناتوانم بیخوێنمەوە.", "ئەو تیۆرییەم نەدۆزییەوە."),
+    # more_tools only attaches tools: nothing was done yet (acceptance review:
+    # "cancel my gold alert" answered «تەواو بوو.» while the alert stayed).
+    "more_tools": (NO_MODEL_YET, NO_MODEL_YET),
     "stop_all": ("هەموو شتێکم ڕاگرت.", "نەمتوانی ڕایبگرم."),
 }
 
 _WINDOW_OK = {"focus": "پەنجەرەکە هێنرایە پێشەوە.", "minimize": "پەنجەرەکە بچووک کرایەوە.",
               "maximize": "پەنجەرەکە گەورە کرا.", "restore": "پەنجەرەکە گەڕایەوە بارە ئاساییەکەی.",
               "close": "پەنجەرەکە داخرا.", "snap_left": "پەنجەرەکە بردرا بۆ لای چەپ.",
-              "snap_right": "پەنجەرەکە بردرا بۆ لای ڕاست.", "list": "لیستی پەنجەرەکان لەسەر شاشەیە."}
+              "snap_right": "پەنجەرەکە بردرا بۆ لای ڕاست.",
+              "list": "لیستی پەنجەرەکانم هێنا، بەڵام ئێستا ناتوانم بیخوێنمەوە."}
 
 
 def _app_name(args: dict[str, Any]) -> str:
@@ -92,6 +98,8 @@ def tool_sentence(name: str, args: dict[str, Any] | None, result: dict[str, Any]
     summary = str(result.get("summary") or "").strip()
     if summary and len(summary) <= 240 and is_arabic_script(summary):
         return summary
+    if name == "web_search" and good and summary.startswith("No results"):
+        return NO_RESULTS
     if name == "window_control":
         if good:
             return _WINDOW_OK.get(str(args.get("action") or ""), DONE)
@@ -102,4 +110,4 @@ def tool_sentence(name: str, args: dict[str, Any] | None, result: dict[str, Any]
     return template[0 if good else 1].format(name=_app_name(args))
 
 
-__all__ = ["tool_sentence", "DONE", "NOT_DONE"]
+__all__ = ["tool_sentence", "DONE", "NOT_DONE", "NO_MODEL_YET", "NO_RESULTS"]

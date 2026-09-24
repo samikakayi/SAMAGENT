@@ -189,3 +189,15 @@ async def test_a_tradingview_sourced_alert_uses_the_chart_price(make_app):
     app.trading.tv._bars = flat_bars(30, "M1", end=T0 + 60, price=2701.0)
     fired = await app.trading.monitor.check_once(now=T0 + 61)
     assert len(fired) == 1 and "2701" in fired[0]["text_ckb"]
+
+
+async def test_a_level_with_decimals_is_followed_by_the_price_at_the_same_precision(make_app):
+    """Live run 2026-09-24: «گەیشتە سەرووی 4265.36؛ نرخی ئێستا 4265» sounded like a contradiction."""
+    feed = FakeFeed({"M1": m1(2700.0, end=T0)}, price=2700.0)
+    app, events = setup_app(make_app, feed)
+    app.trading.monitor.add({"kind": "price_cross", "symbol": "gold", "level": 2700.35, "direction": "up"},
+                            price=2700.0)
+    feed.price = 2700.41
+    feed.bars_by_tf["M1"] = m1(2700.41, end=T0 + 4)
+    fired = await app.trading.monitor.check_once(now=T0 + 4)
+    assert len(fired) == 1 and "2700.35" in fired[0]["text_ckb"] and "2700.41" in fired[0]["text_ckb"]

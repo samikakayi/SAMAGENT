@@ -42,6 +42,7 @@ from .common import Bar, canonical_symbol, from_tv_resolution
 from .tv_app import TvProcess
 from .tv_js import BUNDLE, LOCATION_EXPRESSION, VISIBILITY_EXPRESSION, call_expression
 from .symbols import resolve_instrument
+from .tv_feeds import FeedMemory
 from .tv_owner import Ownership, match_shapes
 from .tv_parse import (MAX_ITEMS, clean_tag, instrument_key, normalize_item, parse_tv_resolution,
                        resolution_label_ckb, same_resolution, tv_symbol_for)
@@ -83,8 +84,8 @@ class TradingViewBridge:
         self.last_bars_source = ""
         self.last_screenshot: dict[str, Any] = {}
         self.owner = Ownership()
-        self._sam_set = ""                   # the symbol SAM itself set last (not learned as the user's feed)
-        self._learned_seen = ""
+        # The user's own feed per instrument, never one SAM put on the chart (tv_feeds.py).
+        self.feeds = FeedMemory(app.config, resolve_instrument)
 
     # -- connection -------------------------------------------------------------------------------------------
     @property
@@ -343,7 +344,7 @@ class TradingViewBridge:
         began = time.perf_counter()
         raw = await self._call("state")
         shape_ids = {str(s.get("id")) for s in raw.get("shapes") or []}
-        self._learn(str(raw.get("symbol", "")))
+        self.feeds.observe(str(raw.get("symbol", "")))
         mine = await self._reconcile(self._owned_rows(), shape_ids, str(raw.get("symbol", "")),
                                      loading=bool(raw.get("loading")))
         my_count = sum(1 for r in mine if r["tv_id"] in shape_ids)
@@ -379,7 +380,7 @@ class TradingViewBridge:
             self._record("set_symbol", (time.perf_counter() - began) * 1000.0, ok=bool(res.get("ok")))
             now = str(res.get("symbol", ""))
             self.owner.note_symbol(now)
-            self._sam_set = now
+            self.feeds.note_sam_set(now)
             if not res.get("ok"):
                 return {**base, "ok": False, "changed": False, "error": "symbol_failed", "tried": target,
                         "detail": str(res.get("error", ""))[:200], "restored": bool(res.get("restored")), "symbol": now}
@@ -579,20 +580,6 @@ class TradingViewBridge:
                 break
             await asyncio.sleep(0.3)
         return rows, present
-
-    def _learn(self, symbol: str) -> None:
-        """Remember the feed the user's chart shows for an instrument (his gold is
-        PEPPERSTONE:XAUUSD): ``tv_symbol_for`` then keeps it when SAM switches back."""
-        if not symbol or ":" not in symbol or symbol == self._learned_seen or symbol == self._sam_set:
-            return
-        self._learned_seen = symbol
-        canonical = resolve_instrument(symbol)
-        if not canonical:
-            return
-        learned = dict(self.app.config.get("trading.tv_learned_symbols", {}) or {})
-        if learned.get(canonical) != symbol:
-            learned[canonical] = symbol
-            self.app.config.set("trading.tv_learned_symbols", learned)
 
     def _mark_removed(self, db_ids: list[int]) -> None:
         if db_ids:

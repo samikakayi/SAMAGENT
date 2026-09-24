@@ -319,6 +319,23 @@ class Windows:
             return scored[0][3]
         return None
 
+    def find_sync(self, query: str) -> WindowInfo | None:
+        """``find`` for risk classifiers (synchronous, ~2 ms): the window a
+        tool with ``window=query`` will act on (hwnd, 'this', alias, title)."""
+        text = normalize_ckb(str(query or ""), strip_punct=True)
+        with _win.dpi_aware():
+            windows = self.api.enum()
+        if str(query).strip().isdigit() and len(str(query).strip()) > 4:
+            return next((w for w in windows if w.hwnd == int(str(query).strip())), None)
+        if not text or text in CURRENT_WORDS:
+            return self.foreground_sync()
+        alias = match_alias(str(query))
+        processes = alias[0].processes if alias else ()
+        candidates = [w for w in windows if w.pid != self.own_pid and w.cls not in ("Progman", "WorkerW")]
+        scored = sorted(((_score_window(text, w, processes), not w.minimized, w.foreground, w) for w in candidates),
+                        key=lambda item: item[:3], reverse=True)
+        return scored[0][3] if scored and scored[0][0] >= 72.0 else None
+
     async def find_by_process(self, processes: Iterable[str]) -> WindowInfo | None:
         """The best visible window of any of these exe names (foreground first)."""
         wanted = {p.lower() for p in processes}

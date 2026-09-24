@@ -94,20 +94,53 @@ class Ownership:
         return missing, forget
 
 
+# SAM's drawing kinds as ``getAllShapes()`` names them: the createShape name
+# itself, or TradingView's internal line-tool class for the same tool.
+SHAPE_NAMES: dict[str, frozenset[str]] = {
+    "horizontal_line": frozenset({"horizontal_line", "linetoolhorzline"}),
+    "horizontal_ray": frozenset({"horizontal_ray", "linetoolhorzray"}),
+    "trend_line": frozenset({"trend_line", "linetooltrendline"}),
+    "rectangle": frozenset({"rectangle", "linetoolrectangle"}),
+    "fib_retracement": frozenset({"fib_retracement", "linetoolfibretracement"}),
+    "text": frozenset({"text", "linetooltext"}),
+    "arrow_up": frozenset({"arrow_up", "linetoolarrowmarkup"}),
+    "arrow_down": frozenset({"arrow_down", "linetoolarrowmarkdown"}),
+    "long_position": frozenset({"long_position", "linetoolriskrewardlong"}),
+    "short_position": frozenset({"short_position", "linetoolriskrewardshort"}),
+}
+
+
+def same_kind(kind: str, shape_name: str) -> bool:
+    """A chart shape is of SAM's drawing kind (unknown names never match)."""
+    name = str(shape_name or "").strip().lower()
+    return bool(name) and name in SHAPE_NAMES.get(str(kind or ""), frozenset())
+
+
 def match_shapes(missing: list[dict[str, Any]], shapes: list[dict[str, Any]],
                  owned_ids: set[str]) -> dict[int, str]:
     """{db_id: new tv_id} for missing rows whose drawing is on the chart under
-    another id (same label text and same prices; never an id SAM already owns)."""
+    another id: same kind, same label text and same prices; never an id SAM
+    already owns.
+
+    A row without a label is never re-adopted (verify review 2026-09-24: an
+    unlabelled SAM line matched a user's horizontal ray at the same magnet-
+    snapped candle high, and ``clear`` then deleted the user's drawing). Such a
+    row is forgotten after its misses instead: SAM may leave one of its own
+    lines behind, but never removes one of the user's."""
     taken = set(owned_ids)
     found: dict[int, str] = {}
     for row in missing:
         want_prices = _prices(row.get("points"))
         label = str(row.get("text") or "")
+        if not label.strip():
+            continue
         for shape in shapes:
             sid = str(shape.get("id"))
             if sid in taken:
                 continue
-            if label and str(shape.get("text") or "") != label:
+            if not same_kind(str(row.get("kind") or ""), str(shape.get("name") or "")):
+                continue
+            if str(shape.get("text") or "") != label:
                 continue
             if not _same_prices(want_prices, _prices(shape.get("points"))):
                 continue
@@ -117,4 +150,4 @@ def match_shapes(missing: list[dict[str, Any]], shapes: list[dict[str, Any]],
     return found
 
 
-__all__ = ["Ownership", "match_shapes", "SETTLE_S", "MISSES", "MISS_SPAN_S"]
+__all__ = ["Ownership", "match_shapes", "same_kind", "SHAPE_NAMES", "SETTLE_S", "MISSES", "MISS_SPAN_S"]

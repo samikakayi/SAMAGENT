@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import socket
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
@@ -108,6 +109,9 @@ def is_public_host(host: str, resolver: Callable[..., Any] = socket.getaddrinfo)
     return bool(infos)
 
 
+GEMINI_SEARCH_REST_S = 300.0
+
+
 class Web:
     def __init__(self, app: Any, *, client_factory: Callable[[], Any] | None = None,
                  genai_factory: Callable[[str], Any] | None = None, startfile_fn: Any = None,
@@ -119,6 +123,7 @@ class Web:
         self._genai_fp: str | None = None
         self._startfile = startfile_fn or (lambda url: os.startfile(url))  # type: ignore[attr-defined]
         self._resolver = resolver
+        self._gemini_rest_until = 0.0   # monotonic: grounded search failed lately, use DuckDuckGo meanwhile
 
     def _client(self) -> Any:
         if self._client_factory is not None:
@@ -137,12 +142,26 @@ class Web:
         cleaned = " ".join(str(query or "").split())[:400]
         if not cleaned:
             return {"ok": False, "summary": "A search needs a query."}
-        if self.app.secrets.has("gemini_api_key"):
+        if self.app.secrets.has("gemini_api_key") and self._gemini_usable():
             try:
                 return await self._search_gemini(cleaned)
             except Exception as exc:  # noqa: BLE001 - fall back to DuckDuckGo
+                self._gemini_rest_until = time.monotonic() + GEMINI_SEARCH_REST_S
                 log.info("gemini grounded search failed: %s", type(exc).__name__)
         return await self._search_ddg(cleaned, limit)
+
+    def _gemini_usable(self) -> bool:
+        """Grounded search uses the conversation's own Gemini model and quota:
+        skip it while it rests (a 429 cost every search a request on the user's
+        evening test, 2026-09-24 20:55-20:56, before DuckDuckGo answered)."""
+        if time.monotonic() < self._gemini_rest_until:
+            return False
+        model = str(self.app.config.get("hands.search_model", "gemini-3.5-flash-lite"))
+        llm = getattr(self.app, "llm", None)
+        try:
+            return not (llm is not None and llm.cooling(f"gemini:{model}"))
+        except Exception:  # noqa: BLE001
+            return True
 
     async def _search_ddg(self, query: str, limit: int) -> dict[str, Any]:
         try:

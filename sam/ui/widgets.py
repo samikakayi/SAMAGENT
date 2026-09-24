@@ -310,7 +310,21 @@ def call_safely(fn: Callable[..., Any] | None, *args: Any) -> None:
         fn(*args)
 
 
+def accessible(widget: QWidget, key: str, *, object_name: str = "", **fmt: Any) -> QWidget:
+    """Give ``widget`` its UI Automation name (Sorani, ``strings.tr``) and
+    description (English). ``object_name`` makes Qt's AutomationId unique
+    (Qt builds it from the objectName chain) -- only for widgets whose
+    objectName is not a style-sheet selector (#Primary, #Chip ...)."""
+    from .strings import en, tr
+
+    widget.setAccessibleName(tr(key, **fmt))
+    widget.setAccessibleDescription(en(key, **fmt))
+    if object_name:
+        widget.setObjectName(object_name)
+    return widget
+
+
 __all__ = ["A_RIGHT", "A_LEFT", "A_CENTER", "is_rtl", "direction_of", "bidi_text", "elide", "clock_text", "when_text",
            "StatusDot", "ToggleSwitch", "Card",
            "Badge", "IconLabel", "EmptyState", "HLine", "row", "label", "set_auto_direction", "Clickable",
-           "paint_bar", "pen", "call_safely"]
+           "paint_bar", "pen", "call_safely", "accessible"]

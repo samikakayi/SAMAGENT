@@ -408,8 +408,7 @@ class ToolRegistry:
         finally:
             self._running.pop(call_id, None)
         duration = (time.perf_counter() - started) * 1000.0
-        if scope is not None and taint.carries_untrusted(result):
-            scope.mark(name)
+        taint.note(scope, name, result)
         result = self._cap(self._redact_obj(result))
         if self.timing is not None:
             self.timing.record(f"tool:{name}", duration, kind="tool", turn_id=call_id, ok=result["ok"], source=source)

@@ -54,6 +54,12 @@ FUZZY_NAMES: dict[str, str] = {
     "usdx": "USDX", "gold": "XAUUSD", "silver": "XAGUSD", "bitcoin": "BTCUSD", "ethereum": "ETHUSD",
     "nasdaq": "NAS100", "btcusdt": "BTCUSD", "ethusdt": "ETHUSD",
 }
+# Real tickers one edit away from a FUZZY_NAMES key: never "corrected".
+# Acceptance review 2026-09-24: UK100 (FTSE, on this broker) and US500 became
+# Nasdaq, UKOIL (Brent) became USOIL, USDT became the dollar index.
+NOT_NEAR_MISSES = frozenset({"ukoil", "usdt", "usdc", "brent", "wti", "dxy"})
+# base+quote currency pairs (ETCUSD, LTCUSD, EURGBP ...) are real tickers.
+_PAIR_SHAPE = re.compile(r"^[a-z]{3}(?:usd|usdt|usdc|eur|gbp|jpy|chf|aud|cad|nzd|btc)$")
 KNOWN: frozenset[str] = frozenset(set(SYMBOL_ALIASES.values()) | set(TV_SYMBOL_EQUIVALENTS.values())
                                   | set(FUZZY_NAMES.values()) | {"GBPUSD", "USDJPY", "US30", "USOIL"})
 _EXPLICIT = re.compile(r"^([A-Za-z0-9_]{1,24}):([A-Za-z0-9_.!/-]{1,32})$")
@@ -70,6 +76,14 @@ def _edit1(a: str, b: str) -> bool:
         return sum(x != y for x, y in zip(a, b)) == 1
     short, long_ = (a, b) if len(a) < len(b) else (b, a)
     return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def _near_miss_candidate(compact: str) -> bool:
+    """Only a word that is not itself a plausible ticker may be read as a
+    near-miss of a known name ('xuusd', 'goldd', 'nasdak'): tickers carry
+    digits (US500, UK100, GER40) or are currency pairs (ETCUSD, LTCUSD)."""
+    return (len(compact) >= 4 and compact.isascii() and compact.isalpha()
+            and compact not in NOT_NEAR_MISSES and not _PAIR_SHAPE.match(compact))
 
 
 def _alias(word: str) -> str | None:
@@ -115,7 +129,7 @@ def resolve_instrument(text: str | None) -> str | None:
     upper = canonical_symbol(raw)
     if upper in KNOWN:
         return upper
-    if len(compact) >= 4 and compact.isascii():
+    if _near_miss_candidate(compact):
         near = {v for k, v in FUZZY_NAMES.items() if _edit1(compact, k)}
         if len(near) == 1:
             return near.pop()

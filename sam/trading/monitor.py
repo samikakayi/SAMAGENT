@@ -324,8 +324,12 @@ class Monitor:
                 state["direction"] = "down" if direction == "up" else "up"
             sym, digits = symbol_ckb(alert["symbol"]), snap.get("digits")
             where = "گەیشتە سەرووی" if direction == "up" else "هاتە خوارووی"
+            # A level with decimals (4265.36) is followed by the price at the same
+            # precision: "reached 4265.36; the price is now 4265" read as a contradiction
+            # in the live acceptance run (2026-09-24).
+            now_text = fmt_price(price, digits) if float(level) != round(float(level)) else spoken_price(price)
             return self._with_note(alert, f"ئاگاداری: {sym} {where} {fmt_price(level, digits)}؛ نرخی ئێستا "
-                                          f"{spoken_price(price)}.")
+                                          f"{now_text}.")
         return None
 
     def _touch_zone(self, alert: dict[str, Any], snap: dict[str, Any], state: dict[str, Any]) -> str | None:

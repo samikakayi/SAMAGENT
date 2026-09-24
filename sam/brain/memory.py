@@ -370,7 +370,7 @@ class Memory:
         return int(self.db.scalar("SELECT COUNT(*) FROM turns WHERE conversation_id=?", (int(conversation_id),)) or 0)
 
     # -- extraction -------------------------------------------------------------------------
-    def _ladder_available(self, ladder: str) -> bool:
+    def _ladder_available(self, ladder: str | list[str]) -> bool:
         llm = getattr(self.app, "llm", None)
         if llm is None:
             return False
@@ -386,18 +386,23 @@ class Memory:
                 return True
         return False
 
-    async def extract_facts(self, conversation_id: int) -> list[dict[str, Any]]:
+    async def extract_facts(self, conversation_id: int, *, ladder: str | list[str] | None = None
+                            ) -> list[dict[str, Any]]:
         """ONE cheap LLM call (ladder ``memory.extract_ladder``, JSON schema)
         that turns a finished conversation into durable user facts. Skipped
         (returns []) with fewer than 2 user turns, when already done, or when
-        no model is configured."""
+        no model is configured. ``ladder`` (the conversation's background
+        budget passes exactly one rung, brain/budget.py) overrides the setting;
+        a given ladder is asked once, without same-rung retries."""
         conv = self.get_conversation(conversation_id)
         if conv is None or conv.get("facts_extracted"):
             return []
         turns = self.recent_turns(conversation_id, limit=40, roles=("user", "assistant"))
         if sum(1 for t in turns if t["role"] == "user") < 2:
             return []
-        ladder = str(self.app.config.get("memory.extract_ladder", "extract") or "extract")
+        chosen = ladder is not None
+        if ladder is None:
+            ladder = str(self.app.config.get("memory.extract_ladder", "extract") or "extract")
         if not self._ladder_available(ladder):
             log.info("fact extraction skipped: no model configured for ladder %s", ladder)
             return []
@@ -419,7 +424,8 @@ class Memory:
 
         try:
             response = await self.app.llm.chat(messages, ladder=ladder, json_schema=EXTRACT_SCHEMA,
-                                               reasoning="low", timeout_s=45)
+                                               reasoning="low", timeout_s=20 if chosen else 45,
+                                               retry_transient=not chosen)
             payload = response.json()
         except LLMError as err:
             log.info("fact extraction failed: %s", err.kind)

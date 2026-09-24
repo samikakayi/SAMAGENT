@@ -58,4 +58,66 @@ def dark_title_bar(widget: QWidget) -> bool:
         return False
 
 
-__all__ = ["apply_no_activate", "dark_title_bar"]
+def bring_to_front(widget: QWidget) -> bool:
+    """Win32: make a window the user asked for (the panel) the foreground window.
+
+    Windows' foreground lock lets a process activate its window only in a few
+    cases (it is the foreground process, it got the last input, ...). SAM's
+    panel is opened by a launch, a second launch, the tray or the island while
+    another app is in front, so ``activateWindow`` alone may only flash the
+    taskbar button and leave the panel behind that app. Order: restore if
+    minimised, SetForegroundWindow, and when Windows refuses, attach to the
+    foreground thread's input for the call (only ever for a window the user
+    asked to see). Returns True when the panel is the foreground window."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        if QGuiApplication.platformName() != "windows":
+            return False
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        own = int(widget.winId())
+        hwnd = wintypes.HWND(own)
+        SW_RESTORE, SW_SHOW = 9, 5
+        user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
+
+        def front() -> bool:
+            current = user32.GetForegroundWindow()
+            return bool(current) and int(current) == own
+
+        if front() or (user32.SetForegroundWindow(hwnd) and front()):
+            return True
+        foreground = user32.GetForegroundWindow()
+        other = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        mine = kernel32.GetCurrentThreadId()
+        if other and other != mine and user32.AttachThreadInput(mine, other, True):
+            try:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                user32.AttachThreadInput(mine, other, False)
+        return front()
+    except Exception:  # noqa: BLE001 - never break the UI over window order
+        return False
+
+
+def allow_any_foreground() -> bool:
+    """Let another process (the running SAM) take the foreground once. Called
+    by a second launch before it signals: Windows gave that launch foreground
+    rights because the user started it (AllowSetForegroundWindow(ASFW_ANY))."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.AllowSetForegroundWindow(-1))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+__all__ = ["apply_no_activate", "dark_title_bar", "bring_to_front", "allow_any_foreground"]

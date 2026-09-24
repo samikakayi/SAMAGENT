@@ -102,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.after_pid:
         _wait_for_exit(args.after_pid)
     if not acquire_single_instance():
+        try:   # this launch has the user's foreground right: pass it to the running SAM's panel
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except (AttributeError, OSError):
+            pass
         signal_show()
         return 0
 

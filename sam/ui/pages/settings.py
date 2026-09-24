@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QGridLayout, QHBoxLayout
 from ...events import ComponentStatus, Error, SettingsChanged
 from .. import theme
 from ..strings import GEMINI_VOICES, ckb_digits, en, tr, tr_or
-from ..widgets import Card, StatusDot, ToggleSwitch
+from ..widgets import Card, StatusDot, ToggleSwitch, accessible
 from . import SCROLL_GUTTER, Page, scroll_area
 
 GEMINI_KEY_URL = "https://aistudio.google.com/apikey"
@@ -52,6 +52,9 @@ class KeyRow(QWidget):
         self.page = page
         self.name = name
         self.provider = provider
+        # A unique AutomationId per row (Qt builds it from objectNames): "...Card.KeyRow_groq_api_key.QLineEdit".
+        self.setObjectName(f"KeyRow_{name}")
+        label = tr(f"set.key.{name}")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 6, 0, 6)
         lay.setSpacing(8)
@@ -76,6 +79,7 @@ class KeyRow(QWidget):
             get.setToolTip(link)
             get.setCursor(Qt.CursorShape.PointingHandCursor)
             get.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(link)))
+            accessible(get, "a11y.key.get", name=label)
             top.addWidget(get)
         lay.addLayout(top)
         line = QHBoxLayout()
@@ -86,11 +90,15 @@ class KeyRow(QWidget):
         self.edit.setLayoutDirection(Qt.LayoutDirection.LeftToRight)   # keys are Latin
         self.edit.setClearButtonEnabled(True)
         self.edit.returnPressed.connect(self.save)
+        accessible(self.edit, "a11y.key.field", object_name="key", name=label)
         self.save_button = QPushButton(tr("set.save"))
         self.save_button.setObjectName("Primary")
         self.save_button.clicked.connect(self.save)
+        accessible(self.save_button, "a11y.key.save", name=label)
         self.test_button = QPushButton(tr("set.test"))
         self.test_button.clicked.connect(self.test)
+        accessible(self.test_button, "a11y.key.test", object_name="test", name=label)
+        accessible(self.status, "a11y.key.status", name=label)
         line.addWidget(self.edit, 1)
         line.addWidget(self.save_button)
         line.addWidget(self.test_button)
@@ -136,6 +144,11 @@ class KeyRow(QWidget):
         self.save_button.setEnabled(True)
         self._show(tr("set.saved"), "ok")
         self.page.refresh_keys()
+        llm = getattr(self.page.app, "llm", None)
+        if self.provider and llm is not None and hasattr(llm, "reset_provider"):
+            # A new key: forget the rests the old one earned (a wrong-key rest is
+            # persisted for 10 minutes; verify review 2026-09-24).
+            self.page.bridge.on_core(llm.reset_provider, self.provider, on_err=lambda _e: None)
 
     def _save_failed(self, error: BaseException) -> None:
         self.save_button.setEnabled(True)
@@ -188,6 +201,10 @@ class SettingsPage(Page):
         col.setSpacing(16)
         col.addWidget(self._keys_card())
         col.addWidget(self._voice_card())
+        # Listening windows + «تەنها دەنگی من» (sam/ui/voice_profile.py, voice package owner).
+        from ..voice_profile import VoiceProfileCard
+        self.voice_profile = VoiceProfileCard(app, bridge)
+        col.addWidget(self.voice_profile)
         col.addWidget(self._trading_card())
         col.addWidget(self._privacy_card())
         col.addWidget(self._about_card())
@@ -217,6 +234,7 @@ class SettingsPage(Page):
         self.omni_status.setObjectName("Muted")
         test = QPushButton(tr("set.test"))
         test.clicked.connect(self.test_omniroute)
+        accessible(test, "a11y.omniroute.test", object_name="omniroute_test")
         omni.addWidget(self.omni_dot)
         omni.addWidget(title)
         omni.addWidget(base)
@@ -244,7 +262,10 @@ class SettingsPage(Page):
             chip.setObjectName("Chip")
             chip.setCheckable(True)
             chip.setChecked(key == current)
-            chip.clicked.connect(lambda _=False, k=key: self._set("voice.engine", k))
+            # toggled, not clicked: UI Automation's Toggle (screen readers, SAM, tests) checks
+            # the chip without a click, and the choice must still be saved.
+            chip.toggled.connect(lambda on, k=key: self._choose_engine(k, on))
+            accessible(chip, "a11y.engine", choice=tr(f"set.voice.{key}"))
             self.engine_group.addButton(chip)
             self.engine_buttons[key] = chip
             engines.addWidget(chip)
@@ -255,6 +276,7 @@ class SettingsPage(Page):
         test_line = QHBoxLayout()
         self.selftest_button = QPushButton(tr("set.voice.selftest"))
         self.selftest_button.clicked.connect(self.run_selftest)
+        accessible(self.selftest_button, "a11y.selftest", object_name="selftest")
         self.selftest_result = QLabel(self._selftest_text(self.cfg("voice.selftest")))
         self.selftest_result.setToolTip(self.selftest_details(self.cfg("voice.selftest")))
         self.selftest_result.setObjectName("Muted")
@@ -277,6 +299,7 @@ class SettingsPage(Page):
         self.voice_name.currentIndexChanged.connect(
             lambda i: self._set("voice.voice_name", self.voice_name.itemData(i)))
         self.voice_name.setMaximumWidth(280)
+        accessible(self.voice_name, "a11y.voice_name", object_name="voice_name")
         grid.addWidget(_key_label(tr("set.voice.name")), r, 0)
         grid.addWidget(self.voice_name, r, 1, Qt.AlignmentFlag.AlignLeading)
         r += 1
@@ -284,6 +307,7 @@ class SettingsPage(Page):
         self.hotkey.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.hotkey.setMaximumWidth(280)
         self.hotkey.editingFinished.connect(self._save_hotkey)
+        accessible(self.hotkey, "a11y.hotkey", object_name="hotkey")
         self.hotkey_hint = QLabel("")
         self.hotkey_hint.setObjectName("Faint")
         hk = QHBoxLayout()
@@ -299,12 +323,14 @@ class SettingsPage(Page):
         self.timeout.setValue(int(self.cfg("voice.conversation_timeout_s", 45) or 45))
         self.timeout.setMaximumWidth(160)
         self.timeout.valueChanged.connect(lambda _v: self._timeout_timer.start())
+        accessible(self.timeout, "a11y.timeout", object_name="conversation_timeout")
         grid.addWidget(_key_label(tr("set.voice.timeout")), r, 0)
         grid.addWidget(self.timeout, r, 1, Qt.AlignmentFlag.AlignLeading)
         r += 1
         self.always = ToggleSwitch()
         self.always.setChecked(bool(self.cfg("voice.always_listening", False)))
         self.always.toggled.connect(lambda on: self._set("voice.always_listening", bool(on)))
+        accessible(self.always, "a11y.always", object_name="always_listening")
         grid.addWidget(_key_label(tr("set.voice.always")), r, 0)
         grid.addWidget(self.always, r, 1, Qt.AlignmentFlag.AlignLeading)
         card.body.addLayout(grid)
@@ -321,6 +347,7 @@ class SettingsPage(Page):
         self.tv_button = QPushButton(tr("set.tv.connect"))
         self.tv_button.setObjectName("Primary")
         self.tv_button.clicked.connect(self.connect_tradingview)
+        accessible(self.tv_button, "a11y.tv.connect")
         tv.addWidget(self.tv_dot)
         tv.addWidget(tv_title)
         tv.addStretch(1)
@@ -339,6 +366,7 @@ class SettingsPage(Page):
         self.mt5_status.setObjectName("Muted")
         self.mt5_button = QPushButton(tr("set.mt5.refresh"))
         self.mt5_button.clicked.connect(self.check_mt5)
+        accessible(self.mt5_button, "a11y.mt5.check", object_name="mt5_check")
         mt5.addWidget(self.mt5_dot)
         mt5.addWidget(mt5_title)
         mt5.addStretch(1)
@@ -400,6 +428,10 @@ class SettingsPage(Page):
         if getattr(self.app, "voice", None) is None:
             self.selftest_button.setEnabled(False)
             self.selftest_button.setToolTip(tr("island.voice_missing"))
+
+    def _choose_engine(self, key: str, on: bool) -> None:
+        if on and str(self.cfg("voice.engine", "auto")) != key:
+            self._set("voice.engine", key)
 
     def _set(self, key: str, value: Any) -> None:
         config = getattr(self.app, "config", None)

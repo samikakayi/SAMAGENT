@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, AsyncIterator
 
 from ..events import Error, Transcript
@@ -51,9 +52,12 @@ _LOOKING = frozenset({"analyze_market", "screen_look", "chart_state", "web_searc
 
 MORE_TOOLS = "more_tools"
 # The review's core tier (measured 10,361 characters full, 8,533 compact).
+# list_alerts / cancel_alert joined it in the acceptance review: "cancel my gold
+# alert" needed a more_tools round first, and when that round found no model
+# the user heard «تەواو بوو.» while the alert stayed active.
 CORE_TOOLS = ["open_app", "tv_open", "tv_set_chart", "analyze_market", "draw_on_chart", "clear_my_drawings",
-              "get_price", "set_alert", "web_search", "remember", "recall", "delegate_task", "window_control",
-              "system_control", "stop_all"]
+              "get_price", "set_alert", "list_alerts", "cancel_alert", "web_search", "remember", "recall",
+              "delegate_task", "window_control", "system_control", "stop_all"]
 SHORT_REPLY_CHARS = 40
 
 
@@ -69,8 +73,8 @@ class AnswerText(str):
 @tool(MORE_TOOLS,
       description="Attach more of SAM's tools to your next step when none of the tools you have fits: files, "
                   "run_powershell, screen_look, click, type_text, press_keys, screen_act, open_url, fetch_page, "
-                  "build_project, chart_state, list_alerts, cancel_alert, strategy_save, strategy_list, "
-                  "strategy_get, theory_info, forget. Name the ones you need.",
+                  "build_project, chart_state, strategy_save, strategy_list, strategy_get, theory_info, forget. "
+                  "Name the ones you need.",
       params={"type": "object", "properties": {
           "tools": {"type": "array", "items": {"type": "string"}, "description": "tool names you need"},
           "need": {"type": "string", "description": "what you want to do, if unsure which tool"}}},
@@ -214,6 +218,8 @@ class Responder:
             """The honest result when the model gave no words (outcome.py)."""
             return SORANI_NOT_UNDERSTOOD if last is None else tool_sentence(*last)
 
+        # A turn in progress: background model calls wait for a pause (budget.py).
+        self.active_turns = int(getattr(self, "active_turns", 0) or 0) + 1
         try:
             for round_no in range(max_rounds + 1):
                 tool_choice = "none" if round_no == max_rounds else None
@@ -273,9 +279,11 @@ class Responder:
                 for call in calls:
                     args = clean_tool_args(self.app.tools, call.name, call.arguments)
                     result = await self._run_tool(call, source, seen)
-                    last = (call.name, args if isinstance(args, dict) else {}, result)
                     if call.name == MORE_TOOLS:
+                        # Only attaches tools: it is never the outcome the user hears.
                         extra |= set(((result.get("data") or {}).get("tools")) or [])
+                    else:
+                        last = (call.name, args if isinstance(args, dict) else {}, result)
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
                                      "content": json.dumps(result, ensure_ascii=False, default=str)})
             if not said:
@@ -283,6 +291,7 @@ class Responder:
                 yield emit(outcome())
             completed = True
         finally:
+            self.active_turns = max(0, int(getattr(self, "active_turns", 1) or 1) - 1)
             reply_text = " ".join(parts).strip()
             if reply_text:
                 self.app.bus.publish(Transcript(role="assistant", text=reply_text, source=source,
@@ -321,15 +330,26 @@ class Responder:
         if not ladders.is_fast_picker(response.model_ref):
             return False
         reply = fix_letters(response.text or "").strip()
-        if not reply or not self._wording_refs():
+        refs = self._wording_refs()
+        if not reply or not refs:
             return False
-        if len(reply) > SHORT_REPLY_CHARS or _echoes(reply, user_text):
-            return True
-        return is_arabic_script(user_text) and not is_arabic_script(reply)
+        wanted = (len(reply) > SHORT_REPLY_CHARS or _echoes(reply, user_text)
+                  or (is_arabic_script(user_text) and not is_arabic_script(reply)))
+        if not wanted:
+            return False
+        # A reword is a second request for words the user already has: it is
+        # skipped while any rung rests or the day's budget is low (budget.py).
+        budget = getattr(self, "budget", None)
+        if budget is not None:
+            reason = budget.reason_to_skip("reword", refs, allow_live=True)
+            budget.record("reword", "skipped" if reason else "ran", reason or "")
+            if reason:
+                return False
+        return True
 
     async def _reword(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
                       turn: Any) -> LLMResponse | None:
-        refs = self._wording_refs()
+        refs = self._wording_refs()[:1]     # one request at most (budget.py): else Groq's own words stand
         if not refs:
             return None
         try:
@@ -360,7 +380,7 @@ class Responder:
         kwargs = {"tools": tools, "tool_choice": tool_choice, "turn": turn, "timeout_s": self._llm_timeout(),
                   "rung_timeouts": ladders.rung_caps(), "deadline_s": deadline_s, "retry_transient": False,
                   "reasoning": str(self.app.config.get("conversation.reasoning", "minimal") or "minimal")}
-        response = await self.app.llm.chat(messages, ladder=refs, **kwargs)
+        response = await self._chat_reserving(messages, refs, kwargs)
         if (response.text or "").strip() or response.tool_calls:
             return response
         rest = refs[refs.index(response.model_ref) + 1:] if response.model_ref in refs else []
@@ -371,6 +391,32 @@ class Responder:
             except LLMError:
                 pass
         return response
+
+    async def _chat_reserving(self, messages: list[dict[str, Any]], refs: list[str],
+                              kwargs: dict[str, Any]) -> LLMResponse:
+        """``llm.chat`` over ``refs``, but the slow rungs ahead of the first
+        healthy fast picker share only ``ladders.head_budget`` of the round's
+        deadline, and one is not started with less than MIN_SLOW_RUNG_S left:
+        a healthy Groq is always asked before the deadline (ladders.py has the
+        measurements)."""
+        deadline_s = kwargs.get("deadline_s")
+        head, rest = ladders.split_head(self.app, refs) if deadline_s else ([], refs)
+        if not head:
+            return await self.app.llm.chat(messages, ladder=refs, **kwargs)
+        started = time.monotonic()
+        budget = ladders.head_budget(float(deadline_s))
+        for ref in head:
+            left = budget - (time.monotonic() - started)
+            if left < ladders.MIN_SLOW_RUNG_S:
+                log.info("skipping %s: %.1f s left for the slow rungs", ref, left)
+                break
+            try:
+                return await self.app.llm.chat(messages, ladder=[ref], **{**kwargs, "deadline_s": left})
+            except LLMError as err:
+                log.info("%s gave no answer (%s); next rung", ref, self.app.redact(str(err))[:160])
+        left = float(deadline_s) - (time.monotonic() - started)
+        return await self.app.llm.chat(messages, ladder=rest,
+                                       **{**kwargs, "deadline_s": max(left, ladders.FAST_RESERVE_S)})
 
     async def _run_tool(self, call: ToolCall, source: str, seen: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """Dispatch one call; an identical repeat inside the same turn is not

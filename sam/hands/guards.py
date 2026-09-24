@@ -47,10 +47,18 @@ CONSOLE_PROCESSES = frozenset({"cmd.exe", "powershell.exe", "pwsh.exe", "windows
 CONSOLE_CLASSES = frozenset({"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty"})
 RUN_TITLES = frozenset({"run", "اجرا", "تشغيل", "ڕاکردن"})
 TRADING_PROCESSES = frozenset({"terminal64.exe", "terminal.exe", "tradingview.exe"})
+# 'Algo Trading' / AutoTrading and Expert Advisors start automated trading in
+# MT5 (acceptance review 2026-09-24: 'Algo Trading' was a safe click).
 TRADING_WORDS = re.compile(
-    r"(?i)\b(?:buy|sell|orders?|positions?|close|flatten|reverse|modify|lots?|trade|one[ -]?click|"
-    r"market execution|pending|take profit|stop loss)\b|"
+    r"(?i)\b(?:buy|sell|orders?|positions?|close|flatten|reverse|modify|lots?|trade|trading|autotrading|algo|"
+    r"experts?|expert advisors?|one[ -]?click|market execution|pending|take profit|stop loss)\b|"
+    r"ئەلگۆ|ئالگۆ|ئێکسپێرت|ئیکسپێرت|"
     r"کڕین|بکڕە|بیکڕە|فرۆشتن|بفرۆشە|بیفرۆشە|پۆزیشن|ئۆردەر|داخستن|دابخە|لۆت|مامەڵە|خرید|فروش|معامله|سفارش")
+# A window argument that names a trading app (used when the window cannot be
+# resolved, e.g. while it is still opening).
+TRADING_WINDOW_WORDS = re.compile(
+    r"(?i)metatrader|\bmt[45]\b|terminal64|trading ?view|ترەیدینگ|تریدینگ|ترێدینگ|تڕەیدینگ|مێتا ?ت[ڕر]ەیدەر|"
+    r"میتا ?ت[ڕر]ەیدەر|مێتا ?ت[ڕر]ێدەر")
 # Programs whose arguments are code or commands.
 SHELL_NAMES = frozenset({"cmd", "cmd.exe", "command prompt", "commandprompt", "powershell", "powershell.exe",
                          "windows powershell", "pwsh", "pwsh.exe", "powershell 7", "terminal", "windows terminal",
@@ -62,10 +70,11 @@ SCRIPT_HOSTS = frozenset({"wscript", "wscript.exe", "cscript", "cscript.exe", "m
 
 
 def _order_chords() -> set[tuple[int, ...]]:
-    # F9 (MT5 "New Order"), Alt/Shift(+Alt)+B/S (TradingView buy/sell panel shortcuts).
-    F9, ALT, SHIFT, B, S = 0x78, 0x12, 0x10, 0x42, 0x53
+    # F9 (MT5 "New Order"), Alt/Shift(+Alt)+B/S (TradingView buy/sell panel shortcuts),
+    # Ctrl+E (MT5 "Algo Trading" on/off: starts any attached Expert Advisor trading).
+    F9, ALT, SHIFT, CTRL, B, S, E = 0x78, 0x12, 0x10, 0x11, 0x42, 0x53, 0x45
     return {(F9,), (ALT, B), (ALT, S), (SHIFT, B), (SHIFT, S), (ALT, SHIFT, B), (ALT, SHIFT, S),
-            (SHIFT, ALT, B), (SHIFT, ALT, S)}
+            (SHIFT, ALT, B), (SHIFT, ALT, S), (CTRL, E)}
 
 
 ORDER_CHORDS = _order_chords()
@@ -184,6 +193,38 @@ def keys_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     return "safe", None
 
 
+def click_windows(args: dict[str, Any], app: Any = None) -> list[Any]:
+    """The windows a ``click`` with these arguments acts on, resolved the way
+    the tool resolves them: ``window`` through ``Windows.find_sync`` (hwnd,
+    Sorani alias, title words; the foreground when empty), plus -- for a
+    numbered target -- the window of the last screen_look, where that numbered
+    control lives.
+
+    Acceptance review 2026-09-24: the guard looked only at the foreground, so
+    click(target='Close Position', window='مێتاتڕەیدەر') with Chrome in front
+    was 'safe', and the tool then brought MT5 forward and clicked it."""
+    hands = getattr(app or APP.get("app"), "hands", None)
+    if hands is None:
+        return []
+    found: list[Any] = []
+    wanted = str(args.get("window") or "").strip()
+    try:
+        window = hands.windows.find_sync(wanted) if wanted else hands.windows.foreground_sync()
+    except Exception:  # noqa: BLE001 - the words of the argument still count (click_risk)
+        window = None
+    if window is not None:
+        found.append(window)
+    last = getattr(getattr(hands, "uia", None), "last_hwnd", None)
+    if str(args.get("target") or "").strip().isdigit() and last:
+        try:
+            snapped = hands.windows.find_sync(str(int(last)))
+        except Exception:  # noqa: BLE001
+            snapped = None
+        if snapped is not None:
+            found.append(snapped)
+    return found
+
+
 def click_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     from .vision import looks_dangerous
 
@@ -193,9 +234,8 @@ def click_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     hands = getattr(app, "hands", None)
     target = str(args.get("target", ""))
     label = hands.uia.label_of(target) if hands is not None else target
-    window = foreground(app)
     wanted = str(args.get("window") or "")
-    trading = is_trading(window) or bool(re.search(r"(?i)metatrader|mt5|tradingview|ترەیدینگ|مێتاترەیدەر", wanted))
+    trading = any(is_trading(w) for w in click_windows(args, app)) or bool(TRADING_WINDOW_WORDS.search(wanted))
     if trading and trading_label(label, target):
         return "blocked", "Blocked: SAM never clicks buy, sell, order or position controls (analysis and alerts only)."
     if looks_dangerous(label, target):
@@ -203,6 +243,6 @@ def click_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     return "safe", None
 
 
-__all__ = ["open_app_risk", "type_risk", "keys_risk", "click_risk", "messaging_foreground", "is_console",
-           "is_trading", "trading_label", "is_run_box", "TRADING_PROCESSES", "SHELL_NAMES", "SCRIPT_HOSTS",
-           "RISKY_CHORDS", "ORDER_CHORDS", "APP"]
+__all__ = ["open_app_risk", "type_risk", "keys_risk", "click_risk", "click_windows", "messaging_foreground",
+           "is_console", "is_trading", "trading_label", "is_run_box", "TRADING_PROCESSES", "TRADING_WINDOW_WORDS",
+           "SHELL_NAMES", "SCRIPT_HOSTS", "RISKY_CHORDS", "ORDER_CHORDS", "APP"]

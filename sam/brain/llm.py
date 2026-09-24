@@ -272,6 +272,27 @@ class LLMClient:
         if self._strikes.pop(ref, None) is not None:
             self._save_health(ref)
 
+    def reset_provider(self, provider: str, *, auth_only: bool = False) -> list[str]:
+        """Forget the rests (and strikes) of ``provider``: the user saved a new
+        key, or its Settings test passed (``auth_only``: only the provider-wide
+        rest a 401/403 set). Verify review 2026-09-24: a wrong-key rest is
+        persisted, so after pasting the corrected key Gemini stayed skipped for
+        up to 10 minutes and across restarts while 'Test' said connected."""
+        self._load_health()
+        wide = f"{provider}:*"
+        if auth_only:
+            keys = [wide] if wide in self._cooldown else []
+        else:
+            keys = sorted({k for k in [*self._cooldown, *self._strikes] if k.split(":", 1)[0] == provider})
+        for key in keys:
+            self._cooldown.pop(key, None)
+            self._strikes.pop(key, None)
+            self._strike_at.pop(key, None)
+            self._save_health(key)
+        if keys:
+            log.info("llm rests of %s cleared (%d)", provider, len(keys))
+        return keys
+
     # Persistence: a restart must not forget that a rung keeps failing.
     _HEALTH_SQL = ("CREATE TABLE IF NOT EXISTS llm_health (ref TEXT PRIMARY KEY, strikes INTEGER NOT NULL DEFAULT 0, "
                    "until REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL)")
@@ -399,7 +420,8 @@ class LLMClient:
         ``timeout_s`` (e.g. OmniRoute's first reply: good answers came in 1-5 s,
         busy ones failed after 15-40 s); a rung that misses its cap is not
         retried and rests like a slow failure. ``deadline_s`` bounds the whole
-        ladder: a rung cut short by it is NOT blamed (no rest).
+        ladder: a rung cut short by it is NOT blamed (no rest) unless it had
+        already used 3/4 of its own cap.
         ``retry_transient=False`` moves on after a 5xx/network error instead of
         asking the same rung again (a spoken turn has other rungs; Gemini
         direct answered 503 twice in a row, 3.9 s, in the repair probe)."""
@@ -436,6 +458,11 @@ class LLMClient:
                 self._count(provider, model, current, error=err)
                 elapsed_s = time.perf_counter() - started
                 if err.kind == "timeout" and cut_by_deadline:
+                    if cap is not None and elapsed_s >= 0.75 * cap:
+                        # It had most of its own cap and still said nothing: blame it like a
+                        # missed cap, or the next turn pays the same wait again (acceptance
+                        # review 2026-09-24: an unblamed hanging Gemini rung cost every turn 7 s).
+                        self._on_error(provider, ref, err, max(elapsed_s, self._slow_s()))
                     attempts.append(f"{ref}: deadline")
                     raise LLMError("exhausted", "; ".join(attempts), attempts=attempts)
                 attempts.append(f"{ref}: {err.kind}{f' {err.status}' if err.status else ''}")
@@ -596,6 +623,7 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "provider": provider, "status": "error", "detail": type(exc).__name__,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+        self.reset_provider(provider, auth_only=True)   # the key works: a wrong-key rest is over
         return {"ok": True, "provider": provider, "status": "connected", "models": len(models),
                 "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
 

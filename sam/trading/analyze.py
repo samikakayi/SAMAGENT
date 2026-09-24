@@ -60,12 +60,63 @@ VISION_PROMPT = ("You judge trading-strategy rules on a TradingView chart screen
                  "Return JSON {\"verdicts\": [{\"rule_id\", \"verdict\": pass|fail|unclear, \"why\"}]}.")
 # Below this share of price, TradingView and MT5 are treated as the same feed.
 OFFSET_NOISE = 0.0002
+# The chart-minus-MT5 offset is only a feed difference when both quotes are
+# from about the same moment. Verify review 2026-09-24: if MT5 freezes (broker
+# server trouble) while TradingView stays live, "chart close - MT5 bid" is the
+# price move since the freeze, and every MT5 level was shifted by it. So the
+# offset is not applied when the MT5 quote is older than the chart's newest bar
+# by more than FROZEN_GAP_S, or when it is larger than MAX_OFFSET_SHARE of price
+# (futures-vs-spot basis on gold is well under 1%).
+FROZEN_GAP_S = 300.0
+MAX_OFFSET_SHARE = 0.02
 # Said when the user asked for drawings and none were made (the model got "drawing: 6 horizontal_line"
 # with drawn: 0 before and could claim it drew).
 NOT_DRAWN_CKB = {
     "chart_shows_another_symbol": "چارتەکە بازاڕێکی تر پیشان دەدات، بۆیە هیچم لەسەری نەکێشا.",
     "tradingview_not_connected": "ترەیدینگ ڤیو پەیوەست نییە، بۆیە هیچم نەکێشا.",
+    "stale_feed": "داتای مێتاتڕەیدەر نوێ نییە و بازاڕ کراوەیە، بۆیە هیچم لەسەر چارتەکە نەکێشا.",
+    "stale_chart": "چارتی ترەیدینگ ڤیو نوێ نابێتەوە (مۆمی نوێی بۆ نایەت)، بۆیە هیچم لەسەری نەکێشا.",
 }
+
+
+def stale_open_mt5(report: dict[str, Any]) -> bool:
+    """Stale data on an open market, and some timeframe came from MT5 (a closed
+    market's levels are still drawn: both feeds stopped at the same moment)."""
+    sources = report.get("sources") or {}
+    return bool(report.get("stale") and not report.get("market_closed")
+                and any(str(s) == "mt5" for s in sources.values()))
+
+
+def stale_reason(report: dict[str, Any]) -> str | None:
+    """Why nothing may be drawn on an open market: "stale_feed" (a timeframe
+    that came from MT5 is stale) or "stale_chart" (only the chart's own bars
+    are stale). Acceptance run 2026-09-24 23:19: TradingView's 1-minute
+    series had formed no new bar for 7.8 h while MT5 was live, and SAM said
+    the MetaTrader data was old -- the wrong feed."""
+    if not report.get("stale") or report.get("market_closed"):
+        return None
+    sources = report.get("sources") or {}
+    stale_tfs = report.get("stale_timeframes")
+    if not stale_tfs:
+        return "stale_feed" if stale_open_mt5(report) else None
+    if any(str(sources.get(tf)) == "mt5" for tf in stale_tfs):
+        return "stale_feed"
+    return "stale_chart"
+
+
+def feed_offset(chart_bars: list[dict[str, Any]], tick: dict[str, Any]) -> tuple[float, str | None]:
+    """(chart close - MT5 bid, reason it must not be applied or None)."""
+    reference = tick.get("bid") or tick.get("last")
+    if not reference or not chart_bars:
+        return 0.0, "no quote"
+    measured = float(chart_bars[-1]["close"]) - float(reference)
+    tick_time = float(tick.get("time") or 0.0)
+    chart_time = float(chart_bars[-1].get("time") or 0.0)
+    if tick_time and chart_time and chart_time - tick_time > FROZEN_GAP_S:
+        return measured, "mt5 quote is older than the chart"
+    if abs(measured) > abs(float(reference)) * MAX_OFFSET_SHARE:
+        return measured, "feeds differ too much"
+    return measured, None
 
 
 async def _with_timeout(coro: Any, seconds: float) -> Any:
@@ -122,8 +173,12 @@ async def gather_bars(app: Any, symbol: str, timeframes: list[str], chart: dict[
     if chart_bars and tick and any(s == "mt5" for s in sources.values()):
         reference = tick.get("bid") or tick.get("last")
         if reference:
-            offset = measured = float(chart_bars[-1]["close"]) - float(reference)
-            if abs(offset) >= abs(float(reference)) * OFFSET_NOISE:
+            offset, refused = feed_offset(chart_bars, tick)
+            measured = offset
+            if refused:
+                errors["feed_offset"] = refused
+                offset = 0.0
+            if offset and abs(offset) >= abs(float(reference)) * OFFSET_NOISE:
                 for tf, source in sources.items():
                     if source == "mt5":
                         bars[tf] = [{**b, "open": b["open"] + offset, "high": b["high"] + offset,
@@ -206,6 +261,12 @@ async def draw_report(app: Any, report: dict[str, Any], mode: str, chart: dict[s
         result["draw_plan"] = items
         result["reason"] = ("nothing to draw" if not items else "tradingview_not_connected" if tv is None or not chart
                             else "chart_shows_another_symbol")
+        return result
+    stale = stale_reason(report)
+    if stale:
+        # A frozen feed while the market trades: its levels may sit anywhere on
+        # the live chart (verify review 2026-09-24 drew 6 lines + 2 zones from it).
+        result.update(draw_plan=items, reason=stale)
         return result
     try:
         if previous_tag:

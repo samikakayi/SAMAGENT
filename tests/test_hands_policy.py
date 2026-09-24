@@ -234,3 +234,33 @@ def test_secret_detection() -> None:
     assert contains_secret("password: hunter22hunter")
     assert contains_secret("-----BEGIN RSA PRIVATE KEY-----")
     assert not contains_secret("<h1>ماڵپەڕی من</h1> password field below")
+
+
+# PowerShell accepts Unicode dashes and curly quotes (adversarial review 2026-09-24, ps_probe.py).
+@pytest.mark.parametrize("command", [
+    "Remove-Item C:\\Users\\samit\\Documents \u2013Recurse \u2013Force",
+    "ri ~\\Documents \u2013r",
+    "gci ~ \u2013Recurse -File | Remove-Item",
+    "Remove-Item \u201cC:\\Users\\samit\\Documents\u201d \u2014Recurse",
+    "Remove-Item ~\\Desktop \u2015Recurse",
+    # a property changed on every item of a recursive listing of home / a main folder
+    "gci ~ -Recurse -File | % { $_.Attributes = 'Hidden' }",
+    "gci ~\\Documents -Recurse -File | % { $_.IsReadOnly = $true }",
+])
+def test_unicode_dashes_and_mass_property_changes_are_blocked(command: str) -> None:
+    assert classify_powershell(command)[0] == "blocked"
+
+
+@pytest.mark.parametrize("command", [
+    "Get-Process | % { $_.PriorityClass = 'Idle' }",
+    "Get-Process | % { $_.ProcessorAffinity = 1 }",
+    "Get-ChildItem C:\\temp\\x -File | % { $_.IsReadOnly = $true }",
+    "$f = Get-Item C:\\temp\\a.txt; $f.LastWriteTime = Get-Date",
+])
+def test_property_assignments_need_confirmation(command: str) -> None:
+    assert classify_powershell(command)[0] == "confirm"
+
+
+@pytest.mark.parametrize("command", ["$x = 5; $x", "Get-Process | Where-Object { $_.CPU -gt 10 }", "gci | % Name"])
+def test_plain_variables_and_comparisons_stay_read_only(command: str) -> None:
+    assert classify_powershell(command)[0] == "safe"

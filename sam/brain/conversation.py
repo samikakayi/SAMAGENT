@@ -7,9 +7,13 @@ Sorani commands no tools, so TradingView opened 0 of 7 times
 (reports/audit-latency.json). Here:
 
 - ONE conversation lives until the voice window sleeps or the user is idle for
-  ``conversation.idle_timeout_s``; older turns are folded into a summary (one
-  cheap background call) and the newest ``conversation.history_turns`` are
-  sent verbatim.
+  ``conversation.idle_timeout_s``; older turns are folded into a summary and
+  the newest ``conversation.history_turns`` are sent verbatim.
+- Summaries and fact extraction are optional model calls: they run in a pause
+  (never during a live exchange), one request each, and only when no rung
+  rests and the day's budget allows (``budget.py``, measured on the user's
+  first evening test); otherwise the summary is folded without a model and the
+  extraction waits.
 - The turn loop itself (tool tiers, ladders, deadlines, rewording, Sorani
   outcomes) is ``responder.Responder``; model choice is ``ladders.py``.
 - Every ``Transcript`` event (Live, cascade, typed, worker) and every finished
@@ -26,6 +30,9 @@ from typing import Any
 
 from ..events import Caption, SpeakRequest, ToolFinished, ToolStarted, Transcript, VoiceState
 from ..textnorm import normalize_ckb
+from .budget import DEFAULTS as BUDGET_DEFAULTS
+from .budget import BackgroundBudget, quota_reason
+from .confirm import ASK_AGAIN_CKB
 from .llm import LLMError
 from .responder import (ACKS_DO, ACKS_LOOK, CORE_TOOLS, SORANI_CUT_OFF, SORANI_DONE, SORANI_NO_MODEL,
                         SORANI_NOT_DONE, SORANI_NOT_UNDERSTOOD, Responder, clean_tool_args, more_tools)
@@ -42,6 +49,9 @@ DEDUP_WINDOW_S = 8.0
 ASSISTANT_DEDUP_WINDOW_S = 90.0
 SUMMARY_BATCH = 8
 PREVIOUS_CONVERSATION_S = 2 * 3600
+BACKGROUND_TICK_S = 15.0
+EXTRACT_DEFER_MAX_S = 24 * 3600.0   # a deferred extraction older than a day is dropped
+BACKGROUND_TIMEOUT_S = 20.0
 
 SUMMARY_PROMPT = (
     "Summarise this part of a conversation between a Kurdish user and his assistant SAM for SAM's own "
@@ -99,6 +109,15 @@ class Conversation(Responder):
         self._idle_task: asyncio.Task[Any] | None = None
         self._last_ack = ""
         self._ack_index = -1
+        self.active_turns = 0                          # respond_stream calls running now
+        self.budget = BackgroundBudget(app)
+        self._summary_due: set[int] = set()            # conversations with old turns to fold
+        self._extract_due: dict[int, float] = {}       # ended conversations whose extraction waits
+
+    @property
+    def last_activity(self) -> float:
+        """Wall time of the last transcript or tool result (budget.py)."""
+        return self._last_activity
 
     # -- wiring ----------------------------------------------------------------------------
     def attach(self) -> None:
@@ -145,24 +164,74 @@ class Conversation(Responder):
 
     async def on_sleep(self) -> None:
         """The voice window slept (or the user went idle): close the
-        conversation and extract durable facts with one cheap call."""
+        conversation and extract durable facts with one cheap call -- now if
+        the budget allows, else later in a pause (``background_tick``)."""
         conversation_id = self.conversation_id
         if conversation_id is None:
             return
         self.conversation_id = None
         self.memory.end_conversation(conversation_id)
         if self.app.config.get("memory.extract_on_sleep", True):
-            try:
-                await self.memory.extract_facts(conversation_id)
-            except Exception:  # noqa: BLE001 - memory must never break the voice loop
-                log.exception("fact extraction failed")
+            await self._extract(conversation_id, ended=True)
 
-    async def idle_watch(self, interval_s: float = 30.0) -> None:
-        """Background task: end a conversation nobody touched for a while."""
+    def _extract_refs(self) -> list[str]:
+        ladder = str(self.app.config.get("memory.extract_ladder", "extract") or "extract")
+        try:
+            return list(self.app.llm.ladder(ladder))
+        except (ValueError, AttributeError):
+            return []
+
+    async def _extract(self, conversation_id: int, *, ended: bool = False) -> None:
+        """Fact extraction under the background budget: one rung, or wait."""
+        refs, reason = self.budget.pick("extract", self._extract_refs(), ended=ended)
+        if not refs:
+            self._extract_due.setdefault(conversation_id, time.time())
+            self.budget.record("extract", "deferred", reason or "")
+            return
+        self._extract_due.pop(conversation_id, None)
+        self.budget.record("extract", "ran")
+        try:
+            await self.memory.extract_facts(conversation_id, ladder=refs)
+        except Exception:  # noqa: BLE001 - memory must never break the voice loop
+            log.exception("fact extraction failed")
+
+    async def background_tick(self) -> None:
+        """One pass over the waiting background jobs (summaries first: they keep
+        the prompt small; then at most one deferred extraction)."""
+        for conversation_id in sorted(self._summary_due):
+            if not self._unsummarized(conversation_id):
+                self._summary_due.discard(conversation_id)
+                continue
+            refs, reason = self.budget.pick("summary", self._summary_refs())
+            if refs:
+                await self.summarize(conversation_id, refs=refs)
+            elif quota_reason(reason) or len(self._unsummarized(conversation_id)) >= 2 * SUMMARY_BATCH:
+                # Quota pressure, or a long exchange without a pause: fold without a model now.
+                self.budget.record("summary", "skipped", reason or "")
+                await self.summarize(conversation_id, refs=[])
+            else:
+                continue
+            self._summary_due.discard(conversation_id)
+        now = time.time()
+        for conversation_id, since in sorted(self._extract_due.items(), key=lambda item: item[1]):
+            if now - since > EXTRACT_DEFER_MAX_S:
+                self._extract_due.pop(conversation_id, None)
+                continue
+            if self.budget.reason_to_skip("extract", self._extract_refs()) is None:
+                await self._extract(conversation_id)
+            break
+
+    async def idle_watch(self, interval_s: float = BACKGROUND_TICK_S) -> None:
+        """Background task: end a conversation nobody touched for a while and
+        run the background jobs that wait for a pause."""
         while True:
             await asyncio.sleep(interval_s)
-            if self.conversation_id is not None and time.time() - self._last_activity > self._idle_timeout():
-                await self.on_sleep()
+            try:
+                if self.conversation_id is not None and time.time() - self._last_activity > self._idle_timeout():
+                    await self.on_sleep()
+                await self.background_tick()
+            except Exception:  # noqa: BLE001 - the watcher must keep running
+                log.exception("conversation background tick failed")
 
     # -- persistence (single writer of `turns`) -----------------------------------------------
     def _mix_source(self, conversation_id: int, source: str) -> None:
@@ -238,18 +307,25 @@ class Conversation(Responder):
         return turns[:-window] if len(turns) > window else []
 
     def _maybe_summarize(self, conversation_id: int) -> None:
-        if self._summarizing or len(self._unsummarized(conversation_id)) < SUMMARY_BATCH:
-            return
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._summarizing = True
-        self.app.spawn(self.summarize(conversation_id), "conversation-summary")
+        """Old turns wait to be folded; ``background_tick`` does it in a pause
+        (it used to run a model call right after every assistant turn, in the
+        middle of the exchange -- four of them at 20:55-20:58 on 2026-09-24)."""
+        if len(self._unsummarized(conversation_id)) >= SUMMARY_BATCH:
+            self._summary_due.add(conversation_id)
 
-    async def summarize(self, conversation_id: int) -> str:
-        """Fold old turns into ``conversations.summary`` (one cheap call; an
-        extractive fallback when no model answers)."""
+    def _summary_refs(self) -> list[str]:
+        try:
+            return list(self.app.llm.ladder(str(self.app.config.get("conversation.summary_ladder", "extract"))))
+        except (ValueError, AttributeError):
+            return []
+
+    async def summarize(self, conversation_id: int, *, refs: list[str] | None = None) -> str:
+        """Fold old turns into ``conversations.summary``: one request to
+        ``refs`` (default: the summary ladder's first rung), or an extractive
+        summary without a model when ``refs`` is empty or the call fails."""
+        if self._summarizing:
+            return ""
+        self._summarizing = True
         try:
             turns = self._unsummarized(conversation_id)
             if not turns:
@@ -259,16 +335,19 @@ class Conversation(Responder):
             lines = [f"{'USER' if t['role'] == 'user' else 'SAM'}: {' '.join(str(t['text']).split())[:300]}"
                      for t in turns]
             summary = ""
-            try:
-                response = await self.app.llm.chat(
-                    [{"role": "system", "content": SUMMARY_PROMPT},
-                     {"role": "user", "content": (f"Previous summary: {previous}\n\n" if previous else "")
-                      + "\n".join(lines)}],
-                    ladder=str(self.app.config.get("conversation.summary_ladder", "extract")), reasoning="low",
-                    timeout_s=30)
-                summary = " ".join((response.text or "").split())[:800]
-            except LLMError as err:
-                log.info("summary call failed (%s); using extractive summary", err.kind)
+            rungs = self._summary_refs()[:1] if refs is None else list(refs)
+            if rungs:
+                self.budget.record("summary", "ran")
+                try:
+                    response = await self.app.llm.chat(
+                        [{"role": "system", "content": SUMMARY_PROMPT},
+                         {"role": "user", "content": (f"Previous summary: {previous}\n\n" if previous else "")
+                          + "\n".join(lines)}],
+                        ladder=rungs, reasoning="low", timeout_s=BACKGROUND_TIMEOUT_S, retry_transient=False)
+                    summary = " ".join((response.text or "").split())[:800]
+                except LLMError as err:
+                    self.budget.record("summary", "failed", err.kind)
+                    log.info("summary call failed (%s); using extractive summary", err.kind)
             if not summary:
                 asks = "; ".join(" ".join(str(t["text"]).split())[:60] for t in turns if t["role"] == "user")
                 summary = (previous + " | " if previous else "") + "User asked: " + asks
@@ -373,6 +452,13 @@ class Conversation(Responder):
         if self.app.confirm.offer_transcript(text):
             self.app.bus.publish(Transcript(role="user", text=text, source=source))
             return ""
+        needs_answer = getattr(self.app.confirm, "needs_clear_answer", None)
+        if callable(needs_answer) and needs_answer(text):
+            # «باشە» while a question waits: ask again instead of starting a new turn
+            # beside the one that waits for this answer (verify review 2026-09-24).
+            self.app.bus.publish(Transcript(role="user", text=text, source=source))
+            self.app.bus.publish(Caption(text=ASK_AGAIN_CKB, role="assistant", final=True))
+            return ASK_AGAIN_CKB
         forward = self._live_forwarder()
         if forward is not None:
             try:
@@ -414,6 +500,7 @@ CREATE TABLE IF NOT EXISTS brain_conversation_state (
 
 def register(app: Any) -> None:
     app.config.register_defaults(DEFAULTS)
+    app.config.register_defaults(BUDGET_DEFAULTS)
     app.db.ensure_schema("brain", BRAIN_MIGRATIONS)
     app.conversation = Conversation(app)
     app.conversation.attach()

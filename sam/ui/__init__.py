@@ -20,6 +20,11 @@ from typing import Any
 
 log = logging.getLogger("sam.ui")
 
+# After the island's first frame and the start-up 'island_visible' mark (both
+# queued with 0 ms before this): the panel build (~0.8 s under load) must not
+# delay the island.
+PANEL_AFTER_ISLAND_MS = 30
+
 UI_DEFAULTS = {
     "ui.island_pos": None,          # [centre_x, top_y] of the pill (logical px) after a drag
     "ui.font_family": "Vazirmatn",  # first choice; falls back to installed Sorani-capable fonts
@@ -116,11 +121,19 @@ def _make_controller_class() -> type:
                 QTimer.singleShot(0, self._set_window_icon)
             # The panel is built right after the island is on screen (start-up
             # budget: island visible < 3 s), so it already collects events.
-            QTimer.singleShot(200, self.ensure_panel)
-            # SAM.pyw sets SAM_BACKGROUND=1 for the sign-in start: island only,
-            # even when the user asked for the panel at start-up.
-            if self._cfg("ui.panel_on_start", False) and os.environ.get("SAM_BACKGROUND") != "1":
-                QTimer.singleShot(250, lambda: self.show_panel())
+            # SAM.pyw sets SAM_BACKGROUND=1 for the sign-in start (island only,
+            # even with ui.panel_on_start) and SAM_SHOW_PANEL=1 for a normal
+            # launch: then the UI opens the panel itself right after the
+            # island's first frame. It used to wait for SAM.pyw's show request
+            # (polled every 0.5 s, then an 0.8 s panel build): on the user's
+            # evening test (2026-09-24) that left ~8 s with no window, the user
+            # launched again, and the panel came up behind the app in front.
+            background = os.environ.get("SAM_BACKGROUND") == "1"
+            wanted = os.environ.get("SAM_SHOW_PANEL") == "1" or bool(self._cfg("ui.panel_on_start", False))
+            if wanted and not background:
+                QTimer.singleShot(PANEL_AFTER_ISLAND_MS, lambda: self.show_panel())
+            else:
+                QTimer.singleShot(200, self.ensure_panel)
 
         def _set_window_icon(self) -> None:
             from .orb import orb_icon

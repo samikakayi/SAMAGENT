@@ -329,6 +329,7 @@ def build_report(*, symbol: str, requested_symbol: str, broker_symbol: str, time
         "reasons": setup.get("reasons") or [],
         "checks": checks.get("checks") or [], "self_check_passed": bool(checks.get("passed")),
         "stale": stale, "market_closed": any(a["metadata"].get("market_closed") for a in analyses.values()),
+        "stale_timeframes": [tf for tf, a in analyses.items() if a["metadata"].get("stale")],
         "data_errors": errors, "confidence": confidence(setup, checks),
         "strategy": None, "theories": theories or None, "potential_plan": None, "drawn": [],
     }
