@@ -1,27 +1,35 @@
+# Python / tooling
 .venv/
-.env
+# scripts/install.ps1 moves an older venv aside as .venv.old-<timestamp>
+.venv.old-*/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
 htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Scratch output of tests and scripts (pytest --basetemp, logs, probes)
 work/
-tools/ollama-v*/
-data/*.db
-data/*.db-*
+logs/
+*.log
+
+# Local configuration and secrets: never committed. SAM 2 reads them at
+# runtime from SAM_HOME (.env and the DPAPI store data/secrets.json).
+.env
+data/secrets.json
 data/*.sqlite3
 data/*.sqlite3-*
+data/*.db
+data/*.db-*
 data/*.jsonl
-data/secrets.json
-# The library index is a cache of a public repository, not source: it is
-# rebuilt on demand and would otherwise be committed the first time anyone
-# searches.
-data/workflow-library/
-data/ollama-models/
-data/ollama-user/
-data/piper-voices/
+data/logs/
+
 workspace/*
 !workspace/.gitkeep
+
 .freebuff/*.log
 .freebuff/*.log.err
 .freebuff/project-id

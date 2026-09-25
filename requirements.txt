@@ -1,0 +1,50 @@
+# SAM 2 runtime + test dependencies, pinned to the versions installed and
+# import-checked on Python 3.13.15 (Windows 11, 2026-09-24).
+# Install: .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Voice + LLM
+google-genai==2.25.0
+websockets==16.1.1
+httpx==0.28.1
+numpy==2.5.3
+sounddevice==0.5.6
+webrtcvad-wheels==2.0.14
+# «only my voice»: CAM++ speaker embeddings (sam/voice/voiceprint.py); the 28 MB model is
+# downloaded only when the user starts the voice enrollment.
+sherpa-onnx==1.13.8
+sherpa-onnx-core==1.13.8
+
+# UI
+PySide6==6.11.2
+
+# Trading (MetaTrader5 ships a cp313 wheel since 5.0.6180; read-only use)
+MetaTrader5==5.0.6180
+
+# Windows desktop control
+pywin32==312
+comtypes==1.4.17
+uiautomation==2.0.29
+mss==10.2.0
+pillow==12.3.0
+rapidfuzz==3.14.6
+
+# Windows.Media.Ocr through the modular WinRT projections (py3.13 wheels)
+winrt-runtime==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Storage.Streams==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+
+# Knowledge library: the PDF text layer (pure Python; sam/knowledge/extract.py). DOCX is read with
+# the standard library, scanned pages with the Windows OCR above.
+pypdf==6.19.0
+
+# zoneinfo has no IANA database on Windows without this (Asia/Baghdad,
+# America/Los_Angeles for Gemini's daily quota reset).
+tzdata==2026.4
+
+# Tests
+pytest==9.1.1
+pytest-asyncio==1.4.0

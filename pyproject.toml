@@ -1,0 +1,18 @@
+# Project metadata only. Dependencies are pinned in requirements.txt (installed by
+# scripts/install.ps1); pytest is configured in pytest.ini.
+[project]
+name = "sam2"
+version = "2.0.0.dev0"
+description = "SAM 2: a voice-first Sorani desktop assistant and trading analyst for Windows"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "samikakayi" }]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Private :: Do Not Upload",
+]
+
+[project.gui-scripts]
+sam = "sam.__main__:main"
