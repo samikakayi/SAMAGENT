@@ -21,10 +21,14 @@ demand, stopped on quit (only when SAM started it).
 - Port: 11434 is shared with SAM v1's server on purpose. A second server
   would hold a second ~5 GB copy of qwen3:8b on a PC that had ~2 GB free
   while other work ran; v1 is retired by scripts/install.ps1.
-- GPU: this PC's Radeon 890M is not used. Ollama 0.33.1 drops integrated GPUs
-  unless ``OLLAMA_IGPU_ENABLE=1``; with it, llama-server crashed while fitting
-  either model to Vulkan memory (exit 0xe06d7363, "AMD driver is too old";
-  measured 2026-09-24). The child therefore never gets that variable.
+- GPU: Ollama 0.33.1 drops integrated GPUs unless ``OLLAMA_IGPU_ENABLE=1``,
+  which SAM sets when ``llm.local.gpu`` is on (default). With the ASUS OEM
+  driver (32.0.13058, 2026-08-12) llama-server crashed while fitting either
+  model to Vulkan memory ("AMD driver is too old"); after the user installed
+  AMD Adrenalin 32.0.31041 (2026-09-25) qwen3:8b loads fully on the Radeon
+  890M (37/37 layers, 10.7 s): prompt 100 tok/s and generation 18-20 tok/s,
+  against 36-45 and 6-8.4 on the CPU. Set ``llm.local.gpu`` off if a driver
+  change breaks it again.
 """
 
 from __future__ import annotations
@@ -44,7 +48,7 @@ log = logging.getLogger("sam.local_brain")
 DEFAULT_HOST = "127.0.0.1:11434"
 START_WAIT_S = 20.0
 # Variables of the parent that would change how the child uses the GPU or
-# where it listens: SAM decides those itself.
+# where it listens: SAM decides those itself (the GPU from llm.local.gpu).
 _DROP_ENV = ("OLLAMA_IGPU_ENABLE", "OLLAMA_HOST", "OLLAMA_MODELS")
 
 
@@ -161,6 +165,8 @@ class OllamaServer:
     # -- start / stop -----------------------------------------------------------------------------
     def _env(self) -> dict[str, str]:
         env = {k: v for k, v in os.environ.items() if k not in _DROP_ENV}
+        if self._setting("llm.local.gpu", True) not in (False, "false", "0", 0):
+            env["OLLAMA_IGPU_ENABLE"] = "1"
         name, port = split_host(self.host)
         env["OLLAMA_HOST"] = f"{name}:{port}"
         models = self.models_dir()

@@ -395,7 +395,7 @@ async def test_the_server_is_found_under_sam_home_and_started_hidden(make_app, h
     app.config.set("llm.local.host", "127.0.0.1:11999")
     up = {"value": False}
     FakePopen.instances.clear()
-    monkeypatch.setenv("OLLAMA_IGPU_ENABLE", "1")         # must never reach the child (Vulkan crash)
+    monkeypatch.setenv("OLLAMA_IGPU_ENABLE", "7")         # the parent's value never reaches the child
     server = OllamaServer(app.config, popen=FakePopen, listening=lambda host: up["value"])
     killed = []
     monkeypatch.setattr(server, "_kill_tree", lambda proc: killed.append(proc.pid) or True)
@@ -414,7 +414,9 @@ async def test_the_server_is_found_under_sam_home_and_started_hidden(make_app, h
     assert not flags & subprocess.DETACHED_PROCESS
     env = proc.kwargs["env"]
     assert env["OLLAMA_HOST"] == "127.0.0.1:11999" and env["OLLAMA_MODELS"] == str(home / "data" / "ollama-models")
-    assert "OLLAMA_IGPU_ENABLE" not in env
+    assert env["OLLAMA_IGPU_ENABLE"] == "1"               # llm.local.gpu on by default
+    app.config.set("llm.local.gpu", False)
+    assert "OLLAMA_IGPU_ENABLE" not in server._env()
     assert await server.ensure() and len(FakePopen.instances) == 1     # already up: nothing new
     assert await server.stop() and killed == [4242]
 

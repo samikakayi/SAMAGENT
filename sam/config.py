@@ -93,6 +93,7 @@ LOCAL_BRAIN_DEFAULTS: dict[str, Any] = {
     "llm.local.timeout_s": 150,        # a cold first answer took 8 s load + 86 s prompt (busy PC)
     "llm.local.temperature": 0.3,
     "llm.local.think": False,          # Qwen3 would think before every tool call
+    "llm.local.gpu": True,             # Radeon 890M via Vulkan: 18-20 tok/s vs 6-8 on CPU (needs AMD Adrenalin 32.0.31041+)
     "llm.local.vision": False,         # qwen3:8b has no vision; images never go to the local rung
     "llm.local.stop_on_quit": True,    # only a server SAM started itself
     "llm.local.prewarm": True,         # load the model while the cloud rests, before the user waits for it
