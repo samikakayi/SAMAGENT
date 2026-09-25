@@ -10,6 +10,14 @@ and mapped onto SAM 2's three tiers, decided by code and never by the model:
 - ``blocked``: credential dumping or reading key stores, disabling security
   tools, obfuscated/elevated execution, disk wiping, mass deletion, trading
   orders, device/ADS path tricks.
+
+Full authority (setting ``safety.full_authority``, 2026-09-25): a ``confirm``
+verdict is split by ``command_question`` / ``Policy.path_question`` into
+``routine`` (ordinary: runs without a question while the user gives SAM full
+authority) and a question that stays: permanent deletion, anything touching
+more than ~20 files, registry / security / account / service changes,
+passwords and credentials, sending data, shutdown, force-stopping programs,
+removing software.
 """
 
 from __future__ import annotations
@@ -370,6 +378,48 @@ def _member_call_verdict(lowered: str) -> Verdict | None:
 
 
 _LISTING = re.compile(r"\b(?:get-childitem|gci|dir|ls|get-item|gi)\b")
+# Under full authority these "confirm" commands still ask (see the module docstring).
+_SERIOUS_PS: tuple[tuple[str, str], ...] = (
+    (_DELETE_VERB + r"|\bclear-(?:content|item|recyclebin)\b", "it deletes files for good (not to the Recycle Bin)"),
+    (r"\breg(?:\.exe)?\s+(?:add|delete|import|restore)\b|\b(?:set|new|remove|rename|clear)-itemproperty\b|"
+     r"\bhk(?:lm|cu|cr|u|cc):|\bhkey_|\[(?:microsoft\.win32\.)?registry(?:key)?\]", "it changes the registry"),
+    (r"\bset-executionpolicy\b|\bicacls\b|\btakeown\b|\bset-acl\b|\bnet\s+(?:user|localgroup|share)\b|"
+     r"\b(?:new|set|remove|disable|enable)-local(?:user|group)\b|\bnetsh\b|\b\w+-netfirewall\w*\b|\b\w+-mppreference\b|"
+     r"\bschtasks\b|\bregister-scheduledtask\b|\bnew-service\b|\bset-service\b|\bsc(?:\.exe)?\s+(?:create|delete|config)\b",
+     "it changes security, accounts, permissions, services or scheduled tasks"),
+    (r"\bget-credential\b|\bcmdkey\b|\bvaultcmd\b|\bget-clipboard\b|\bconvertto-securestring\b|\bpasswords?\b|"
+     r"\bpasswd\b|\bsecrets?\b|\bcredentials?\b", "it touches passwords, credentials or private data"),
+    (r"\bsend-mailmessage\b|\b(?:invoke-webrequest|invoke-restmethod|iwr|irm)\b[^|;]*-(?:method\s+['\"]?(?:post|put|"
+     r"patch|delete)|body|infile|form)\b|\bcurl(?:\.exe)?\b[^|;]*\s(?:-d|--data\S*|-f|--form|-t|--upload-file|"
+     r"-x\s*['\"]?(?:post|put|patch))\b|\bwget\b[^|;]*--post|\bstart-bitstransfer\b[^|;]*-transfertype\s+upload",
+     "it sends data to another computer"),
+    (r"\bshutdown\b|\brestart-computer\b|\bstop-computer\b|\blogoff\b", "it shuts down or restarts the computer"),
+    (r"\bstop-process\b|\bspps\b|\bkill\b|\btaskkill\b|\bstop-service\b|\bsc(?:\.exe)?\s+stop\b",
+     "it force-stops programs (unsaved work would be lost)"),
+    (r"\b(?:winget|choco|scoop)\s+(?:uninstall|remove)\b|\bmsiexec\b[^|;]*\s/x\b|\bnpm\s+(?:uninstall|publish)\b|"
+     r"\buninstall-\w+\b|\bremove-appxpackage\b", "it removes software or publishes a package"),
+    (r"\binvoke-cimmethod\b|\binvoke-wmimethod\b|-methodname\b", "it calls a system method"),
+    (r"(?:^|[\s;|(&])(?:remove|clear|disable|uninstall|unregister|reset|format|revoke|block|dismount|suspend|"
+     r"lock|protect|unprotect)-[a-z]+\b", "it removes, clears or disables something"),
+)
+_SERIOUS_REASONS = ("on each item", "changes a property", "built from variables")
+
+
+def command_question(command: str, reason: str = "") -> str | None:
+    """For a command ``classify_powershell`` marks 'confirm': why it must still
+    be asked while the user gives SAM full authority, or None (an ordinary
+    command -- writing, copying, moving, renaming, starting a program,
+    downloading, installing, a network probe -- that then runs without a question)."""
+    if any(marker in (reason or "") for marker in _SERIOUS_REASONS):
+        return reason                           # per-item method calls / property changes / computed paths
+    text = " ".join(str(command or "").translate(_PS_CHARS).split()).lower()
+    code = _strip_literals(text)
+    if _DESTRUCTIVE_METHOD.search(code):
+        return "it calls a delete/move/stop method"
+    for pattern, why in _SERIOUS_PS:
+        if re.search(pattern, code, re.I) or re.search(pattern, text, re.I):
+            return why
+    return None
 # powershell -Command "..." / pwsh -c '...': the quoted inner command is classified too.
 _NESTED_SHELL = re.compile(r"\b(?:powershell|pwsh)(?:\.exe)?\b[^|;]*?\s-(?:c|co|com|comm|comma|comman|command)\s+"
                            r"(?:'([^']*)'|\"([^\"]*)\"|(.+))", re.I)
@@ -475,6 +525,8 @@ EXECUTABLE_SUFFIXES = frozenset({".exe", ".bat", ".cmd", ".ps1", ".vbs", ".vbe",
                                  ".msix", ".appx", ".scr", ".com", ".lnk", ".reg", ".hta", ".pif", ".cpl", ".jar"})
 READ_ACTIONS = frozenset({"list", "read", "search", "reveal"})
 MASS_DELETE_LIMIT = 200
+# Full authority: a delete or move of a folder with more items than this still asks.
+AUTHORITY_ITEM_LIMIT = 20
 
 FOLDER_ALIASES: dict[str, tuple[str, ...]] = {
     "desktop": ("desktop", "دێسکتۆپ", "دیسکتۆپ", "دێسکتۆب", "سەر مێز", "سەرمێز", "ڕووی مێز", "سەر دێسکتۆپ"),
@@ -659,6 +711,24 @@ class Policy:
             return "confirm", f"{action.capitalize()} {path.name} to {target}."
         return "blocked", f"Unknown file action '{action}'."
 
+    def path_question(self, raw: str, action: str, *, dest: str | None = None) -> str | None:
+        """For a file action ``classify_path`` marks 'confirm': why it must still
+        be asked while the user gives SAM full authority, or None (ordinary:
+        writing, copying, renaming, moving, opening a program, deleting one file
+        or a small folder to the Recycle Bin)."""
+        action = (action or "").lower()
+        path = self.resolve(raw)
+        if action == "open" and path.suffix.lower() == ".reg":
+            return "it imports settings into the registry"
+        if action == "delete":
+            if not _recycle_bin_drive(path):
+                return "this drive has no Recycle Bin: the delete would be permanent"
+            if path.is_dir() and self._count_entries(path, AUTHORITY_ITEM_LIMIT) > AUTHORITY_ITEM_LIMIT:
+                return f"the folder has more than {AUTHORITY_ITEM_LIMIT} items"
+        if action == "move" and path.is_dir() and self._count_entries(path, AUTHORITY_ITEM_LIMIT) > AUTHORITY_ITEM_LIMIT:
+            return f"the folder has more than {AUTHORITY_ITEM_LIMIT} items"
+        return None
+
     @staticmethod
     def _dest_raw(raw: str, dest: str, action: str) -> str:
         """For rename, a bare new name stays in the same folder."""
@@ -685,6 +755,20 @@ class Policy:
         return "safe", "Opening a web page."
 
 
+def _recycle_bin_drive(path: Path) -> bool:
+    """A local fixed drive (only those have a Recycle Bin: on USB sticks and
+    network shares SHFileOperation's FOF_ALLOWUNDO deletes for good)."""
+    anchor = path.anchor
+    if not anchor or anchor.startswith(("\\\\", "//")):
+        return False
+    try:
+        import ctypes
+
+        return int(ctypes.windll.kernel32.GetDriveTypeW(anchor)) == 3        # DRIVE_FIXED
+    except Exception:  # noqa: BLE001 - cannot tell: treat it as permanent
+        return False
+
+
 _SECRET_SHAPES = re.compile(
     r"(?:sk-or-v1-[A-Za-z0-9._-]{16,}|sk-ant-[A-Za-z0-9._-]{16,}|sk-proj-[A-Za-z0-9._-]{16,}|sk-[A-Za-z0-9]{32,}"
     r"|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z._-]{30,}"
@@ -699,5 +783,5 @@ def contains_secret(text: str) -> bool:
     return bool(_SECRET_SHAPES.search(text or "") or _SECRET_ASSIGNMENT.search(text or ""))
 
 
-__all__ = ["FOLDER_ALIASES", "Policy", "READ_ONLY_CMDLETS", "classify_powershell", "command_words",
-           "contains_secret", "windows_path_violation"]
+__all__ = ["FOLDER_ALIASES", "Policy", "READ_ONLY_CMDLETS", "classify_powershell", "command_question", "command_words",
+           "contains_secret", "windows_path_violation", "AUTHORITY_ITEM_LIMIT"]

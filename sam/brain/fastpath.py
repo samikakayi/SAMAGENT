@@ -15,7 +15,7 @@ model = intent name), so the panel's activity numbers show what it saved.
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from ..textnorm import is_arabic_script
 from .intents import Intent, match
@@ -48,8 +48,12 @@ def intent_for(app: Any, text: str) -> Intent | None:
     return intent
 
 
-async def run(app: Any, intent: Intent, *, source: str) -> AsyncIterator[tuple[str, str]]:
-    """Yield ("ack", text) for slow tools, then ("answer", text)."""
+async def run(app: Any, intent: Intent, *, source: str,
+              proceed: Callable[[], bool] | None = None) -> AsyncIterator[tuple[str, str]]:
+    """Yield ("ack", text) for slow tools, then ("answer", text).
+
+    ``proceed`` is asked right before the tool runs: False = a newer user turn
+    replaced this one (conversation.py), so nothing runs and nothing is said."""
     args = dict(intent.args)
     if intent.chart_symbol:
         symbol = await _chart_symbol(app)
@@ -57,8 +61,13 @@ async def run(app: Any, intent: Intent, *, source: str) -> AsyncIterator[tuple[s
             args["symbol"] = symbol
     if intent.slow:
         yield "ack", ACK_LOOK
+    if proceed is not None and not proceed():
+        return
     result = await app.tools.dispatch(intent.tool, args, source=source)
     _count(app, intent, bool(result.get("ok")))
+    if intent.name == "quiet" and source in ("cascade", "live") and result.get("ok"):
+        yield "answer", ""          # the user asked for quiet: SAM says nothing more
+        return
     yield "answer", reply(intent, args, result)
 
 
@@ -101,6 +110,8 @@ def reply(intent: Intent, args: dict[str, Any], result: dict[str, Any]) -> str:
         return f"ئاگادارکردنەوەی ژمارە {str(args.get('alert_id')).translate(_DIGITS_CKB)} نەدۆزرایەوە."
     if intent.name == "stop":
         return "ڕاگیرا."
+    if intent.name == "quiet":
+        return "باشە، بێدەنگ بووم." if good else "نەمتوانی دەنگم ببڕم."
     return tool_sentence(intent.tool, args, result)
 
 

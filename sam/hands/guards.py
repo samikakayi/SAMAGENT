@@ -41,6 +41,8 @@ MESSAGING_TITLES = re.compile(r"(?i)gmail|outlook|whatsapp|telegram|messenger|fa
                               r"linkedin|twitter|\bx\.com\b|inbox|mail")
 RISKY_CHORDS = {(0x12, 0x73): "alt+f4", (0x11, 0x57): "ctrl+w", (0x10, 0x2E): "shift+delete",
                 (0x11, 0x10, 0x2E): "ctrl+shift+delete", (0x5B, 0x4C): "win+l"}
+# Of those, the ones that delete for good: they ask even with full authority.
+PERMANENT_CHORDS = frozenset({(0x10, 0x2E), (0x11, 0x10, 0x2E)})
 CONSOLE_PROCESSES = frozenset({"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "wt.exe",
                                "conhost.exe", "openconsole.exe", "bash.exe", "wsl.exe", "mintty.exe",
                                "python.exe", "node.exe"})
@@ -124,13 +126,16 @@ def messaging_foreground(app: Any = None) -> bool:
 
 
 def _shell_verdict(command: str) -> tuple[str, str | None]:
-    from .policy import classify_powershell
+    """run_powershell's rules; a 'confirm' command that is not serious is
+    ``routine`` (no question while the user gives SAM full authority)."""
+    from .policy import classify_powershell, command_question
 
     risk, reason = classify_powershell(command)
     if risk == "blocked":
         return "blocked", reason
     if risk == "confirm":
-        return "confirm", "ئەم فەرمانە لە تێرمیناڵ جێبەجێ بکەم؟ فەرمانەکە لەسەر شاشەیە."
+        serious = command_question(command, reason)
+        return ("confirm" if serious else "routine"), "ئەم فەرمانە لە تێرمیناڵ جێبەجێ بکەم؟ فەرمانەکە لەسەر شاشەیە."
     return "safe", None
 
 
@@ -147,8 +152,10 @@ def open_app_risk(args: dict[str, Any]) -> tuple[str, str | None]:
         risk, _ = _shell_verdict(extra)
         if risk == "blocked":
             return "blocked", "Blocked by SAM's safety rules: the arguments are a command run_powershell blocks."
-        return "confirm", "ئەم بەرنامەیە بە فەرمانێکەوە بکەمەوە؟ فەرمانەکە لەسەر شاشەیە."
-    return "confirm", "ئەم بەرنامەیە بە ئەو ڕێکخستنانەوە بکەمەوە کە لەسەر شاشەن؟"
+        return ("routine" if risk in ("safe", "routine") else "confirm"), \
+            "ئەم بەرنامەیە بە فەرمانێکەوە بکەمەوە؟ فەرمانەکە لەسەر شاشەیە."
+    # ordinary arguments (a file to open, a flag): no question while SAM has full authority
+    return "routine", "ئەم بەرنامەیە بە ئەو ڕێکخستنانەوە بکەمەوە کە لەسەر شاشەن؟"
 
 
 def type_risk(args: dict[str, Any], app: Any = None) -> tuple[str, str | None]:
@@ -160,7 +167,11 @@ def type_risk(args: dict[str, Any], app: Any = None) -> tuple[str, str | None]:
             return "safe", None
         return _shell_verdict(text.replace("\r", " ").replace("\n", " "))
     if enter and is_run_box(window):
-        return "confirm", "ئەمە لە پەنجەرەی Run جێبەجێ بکەم؟ دەقەکە لەسەر شاشەیە."
+        risk, _ = _shell_verdict(text.replace("\r", " ").replace("\n", " "))
+        if risk == "blocked":
+            return "blocked", "Blocked by SAM's safety rules: run_powershell blocks this command."
+        return ("routine" if risk in ("safe", "routine") else "confirm"), \
+            "ئەمە لە پەنجەرەی Run جێبەجێ بکەم؟ دەقەکە لەسەر شاشەیە."
     if enter and is_trading(window):
         return "confirm", "لە بەرنامەی ترەیدینگدا ئینتەر دابگرم؟ دەقەکە لەسەر شاشەیە."
     messaging = _messaging(window) if window is not None else messaging_foreground(app)
@@ -179,18 +190,25 @@ def keys_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     except ValueError:
         return "safe", None  # the handler reports the bad key name
     window = foreground()
+    verdict: tuple[str, str | None] = ("safe", None)
     for chord in chords:
         name = RISKY_CHORDS.get(tuple(chord))
         if name:
-            return "confirm", f"کلیلەکانی {name} دابگرم؟ لەوانەیە شتێک دابخات یان بسڕێتەوە."
+            question = f"کلیلەکانی {name} دابگرم؟ لەوانەیە شتێک دابخات یان بسڕێتەوە."
+            if tuple(chord) in PERMANENT_CHORDS:
+                return "confirm", question            # shift+delete / clearing browser data: for good
+            verdict = ("routine", question)         # closing a window or locking the screen: ordinary
+            continue
         if is_trading(window) and tuple(chord) in ORDER_CHORDS:
             return "blocked", "Blocked: SAM never uses order hotkeys in MetaTrader or TradingView."
         if chord in ([0x0D], [0x11, 0x0D]):
-            if is_console(window) or is_run_box(window):
-                return "confirm", "ئینتەر دابگرم؟ فەرمانێک جێبەجێ دەکات."
             if _messaging(window) if window is not None else messaging_foreground():  # noqa: SIM108
                 return "confirm", "ئینتەر دابگرم؟ لەوانەیە نامەکە بنێردرێت."
-    return "safe", None
+            if is_console(window) or is_run_box(window):
+                # the command typed before is unknown here (type_text without Enter is "safe"), so
+                # Enter alone keeps its question even with full authority: type_text(press_enter) is classified
+                return "confirm", "ئینتەر دابگرم؟ فەرمانێک جێبەجێ دەکات."
+    return verdict
 
 
 def click_windows(args: dict[str, Any], app: Any = None) -> list[Any]:

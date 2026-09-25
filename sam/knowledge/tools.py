@@ -106,7 +106,8 @@ async def knowledge_list(ctx: ToolContext, **_ignored: Any) -> dict[str, Any]:
 def _remove_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     ref = str(args.get("document") or "").strip().lower()
     if ref in ("all", "هەموو", "هەمووی", "*"):
-        return "confirm", "هەموو کتێبەکان لە کتێبخانەکە لابەرم؟ (خودی فایلەکان ناسڕدرێنەوە)"
+        # the files stay and can be added again: routine (no question while SAM has full authority)
+        return "routine", "هەموو کتێبەکان لە کتێبخانەکە لابەرم؟ (خودی فایلەکان ناسڕدرێنەوە)"
     return "safe", None
 
 

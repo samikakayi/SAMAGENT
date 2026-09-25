@@ -85,6 +85,14 @@ def parse_tv_resolution(value: str | int | None) -> str | None:
     canonical = normalize_timeframe(raw)
     if canonical:
         return to_tv_resolution(canonical)
+    # TradingView-only intervals in compact form ('M3', '3m', 'H2', '45min'): the
+    # fast path sends «٣ خولەکی» as 'M3' (live session 2026-09-25: "3 minutes").
+    compact = re.fullmatch(r"(?:(m|h)(\d{1,3})|(\d{1,3})(m|min|mins|h|hr))", raw.lower().replace(" ", ""))
+    if compact:
+        unit = (compact.group(1) or compact.group(4) or "m")[0]
+        count = int(compact.group(2) or compact.group(3))
+        minutes = count * (60 if unit == "h" else 1)
+        return str(minutes) if minutes in ALLOWED_MINUTES else None
     text = normalize_ckb(raw, strip_punct=True)
     text = text.replace("چل و پێنج", "چلوپێنج").replace("forty five", "fortyfive").replace("forty-five", "fortyfive")
     number: float | None = None

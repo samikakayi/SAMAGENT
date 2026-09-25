@@ -64,11 +64,13 @@ def install_fakes(app, windows_list: list, foreground: int | None = None):
 def test_risk_is_decided_by_code(app) -> None:
     install_fakes(app, [win(1, "Chat - Telegram", "Telegram.exe")], foreground=1)
     risk = app.tools.risk_of
-    assert risk("window_control", {"action": "close", "target": "کرۆم"}) == ("confirm", "پەنجەرەی «کرۆم» دابخەم؟")
+    # "routine" = ordinary: no question while the user gives SAM full authority (2026-09-25), else asked
+    assert risk("window_control", {"action": "close", "target": "کرۆم"}) == ("routine", "پەنجەرەی «کرۆم» دابخەم؟")
     assert risk("window_control", {"action": "minimize"})[0] == "safe"
-    assert risk("press_keys", {"keys": "alt+f4"})[0] == "confirm"
-    assert risk("press_keys", {"keys": "ctrl+shift+delete"})[0] == "confirm"
-    assert risk("press_keys", {"keys": "win+l"})[0] == "confirm"
+    assert risk("press_keys", {"keys": "alt+f4"})[0] == "routine"
+    assert risk("press_keys", {"keys": "ctrl+shift+delete"})[0] == "confirm"    # clears data for good
+    assert risk("press_keys", {"keys": "shift+delete"})[0] == "confirm"         # deletes for good
+    assert risk("press_keys", {"keys": "win+l"})[0] == "routine"
     assert risk("press_keys", {"keys": "ctrl+s"})[0] == "safe"
     assert risk("press_keys", {"keys": "enter"})[0] == "confirm"          # Telegram is in front: sends
     assert risk("type_text", {"text": "سڵاو", "press_enter": True})[0] == "confirm"
@@ -77,12 +79,13 @@ def test_risk_is_decided_by_code(app) -> None:
     assert risk("click", {"target": "بیسڕەوە"})[0] == "confirm"
     assert risk("click", {"target": "Save"})[0] == "safe"
     assert risk("run_powershell", {"command": "Get-Date"})[0] == "safe"
-    assert risk("run_powershell", {"command": "Remove-Item a.txt"})[0] == "confirm"
+    assert risk("run_powershell", {"command": "Remove-Item a.txt"})[0] == "confirm"     # permanent deletion
+    assert risk("run_powershell", {"command": "Copy-Item a.txt b.txt"})[0] == "routine"
     assert risk("run_powershell", {"command": "Get-Content .env"})[0] == "blocked"
     assert risk("open_url", {"url": "file:///C:/x"})[0] == "blocked"
     assert risk("open_url", {"url": "https://example.com"})[0] == "safe"
     assert risk("files", {"action": "read", "path": "Desktop/a.txt"})[0] == "safe"
-    assert risk("files", {"action": "delete", "path": "Desktop/a.txt"})[0] == "confirm"
+    assert risk("files", {"action": "delete", "path": "Desktop/a.txt"})[0] == "routine"      # to the Recycle Bin
     assert risk("files", {"action": "delete", "path": "Desktop"})[0] == "blocked"
 
 

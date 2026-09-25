@@ -21,9 +21,10 @@ from ..brain.tools import ToolContext, fail, ok, tool
 from ..textnorm import normalize_ckb
 from .common import DRAWING_KINDS, canonical_symbol
 from .engine.sorani import spoken_price, symbol_ckb
-from .symbols import recent_user_text, resolve_instrument, same_instrument, user_named
+from .symbols import (chart_symbol, mentioned_instruments, recent_user_text, resolve_instrument, same_instrument,
+                      user_named)
 from .tradingview import TradingViewBridge, TvError
-from .tv_parse import canonical_request, kinds_summary_ckb, resolution_label_ckb
+from .tv_parse import kinds_summary_ckb, resolution_label_ckb
 
 # draw_on_chart: a model-sent price further than this from the chart price is
 # refused unless the user said the number (review 2026-09-24: SAM offered gold
@@ -70,12 +71,21 @@ async def _ready(ctx: ToolContext, *, start: bool, focus: bool = False) -> dict[
     if tv.connected and not focus and await tv.connect(wait_ready_s=5):
         return None
     if start:
-        result = await tv.ensure_running(allow_restart=True, confirm=ctx.confirm, focus=focus)
+        result = await tv.ensure_running(allow_restart=True, confirm=ctx.confirm_routine, focus=focus)
         return None if result.get("ok") else fail(_state_text(result), **_data(result))
     if await tv.connect(wait_ready_s=10):
         return None
     return fail(f"{TV_CKB} کراوە نییە یان پەیوەستی نیم؛ ئەگەر بتەوێت دەیکەمەوە.", connected=False,
                 hint="call tv_open to start TradingView")
+
+
+# Said in front of a chart answer when SAM restarted TradingView without asking (full authority).
+RESTARTED_NOTE_CKB = "ترەیدینگ ڤیوم دووبارە کردەوە بۆ ئەوەی کار لەسەر چارتەکە بکەم."
+
+
+def _acted_note(ctx: ToolContext) -> list[str]:
+    """[RESTARTED_NOTE_CKB] when this call restarted TradingView without a question."""
+    return [RESTARTED_NOTE_CKB] if getattr(ctx, "acted", None) else []
 
 
 def _name(state: dict[str, Any]) -> str:
@@ -103,7 +113,9 @@ async def tv_open(ctx: ToolContext) -> dict[str, Any]:
     tv = _bridge(ctx)
     if tv is None:
         return fail("بەشی چارتی ترەیدینگ ڤیو ئامادە نییە.", unavailable=True)
-    result = await tv.ensure_running(allow_restart=True, confirm=ctx.confirm, focus=True)
+    # A TradingView without SAM's port is restarted: routine (with full authority SAM does it without
+    # asking and says so -- the user, 2026-09-25: "don't ask me yes or no").
+    result = await tv.ensure_running(allow_restart=True, confirm=ctx.confirm_routine, focus=True)
     if not result.get("ok"):
         return fail(_state_text(result), **_data(result))
     try:
@@ -120,7 +132,8 @@ async def tv_open(ctx: ToolContext) -> dict[str, Any]:
                   "کاتژمێرێک, ڕۆژانە). Gold keeps the user's own gold symbol when the chart already shows gold.",
       params={"type": "object", "properties": {
           "symbol": {"type": "string", "description": "Only when the user named an instrument: as the user said "
-                                                      "it (Sorani is fine), e.g. زێڕ, بیتکۆین, XAUUSD"},
+                                                      "it (Sorani is fine), e.g. زێڕ, گۆڵد, گوڵت, بیتکۆین, XAUUSD. "
+                                                      "Never a number or a word you are unsure of: leave it out"},
           "timeframe": {"type": "string", "description": "Timeframe in any form, e.g. '15', 'H1', '١٥ خولەک'"}}},
       description_ckb="گۆڕینی سیمبۆڵ و کاتی چارت",
       examples_ckb=("گۆڵد لەسەر ١٥ خولەک پیشان بدە", "بیکە بە کاتژمێرێک", "بیتکۆین بکەرەوە"),
@@ -134,7 +147,7 @@ async def tv_set_chart(ctx: ToolContext, symbol: str | None = None, timeframe: s
     tv = _bridge(ctx)
     assert tv is not None
     data: dict[str, Any] = {}
-    parts: list[str] = []
+    parts: list[str] = _acted_note(ctx)
     if (symbol or "").strip():
         symbol, refusal = await _checked_symbol(ctx, tv, symbol.strip(), bool((timeframe or "").strip()), data)
         if refusal is not None:
@@ -160,31 +173,77 @@ async def tv_set_chart(ctx: ToolContext, symbol: str | None = None, timeframe: s
     # Spoken: the Kurdish name, not the broker ticker («زێڕ», not "PEPPERSTONE:XAUUSD").
     where = f"{_name(state)} لەسەر {state['timeframe_ckb']}"
     parts.append(f"چارتەکە گۆڕا بۆ {where}." if changed else f"چارتەکە پێشتر {where} بوو.")
+    ignored = data.get("symbol_ignored") or {}
+    if ignored.get("why") == "not a known instrument":
+        # «مەبەستت زێڕە؟»: the timeframe was clear, the instrument was not (live 2026-09-25: '100')
+        parts.append(f"«{ignored['requested']}» وەک بازاڕێک نەناسرایەوە، بۆیە بازاڕەکەم نەگۆڕی؛ "
+                     f"مەبەستت {ignored.get('guess_ckb') or 'زێڕ'}ە؟")
     return ok(" ".join(parts), symbol=state["symbol"], canonical=state["canonical"], resolution=state["resolution"],
               timeframe=state["timeframe"], price=state["price"], changed=changed, **data)
 
 
+def _feeds(app: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The user's own TradingView feeds: (learned, mapped) settings."""
+    try:
+        learned = dict(app.config.get("trading.tv_learned_symbols", {}) or {})
+        mapped = dict(app.config.get("trading.symbol_map", {}) or {})
+    except Exception:  # noqa: BLE001
+        return {}, {}
+    return learned, mapped
+
+
+def _guess_ckb(app: Any) -> str:
+    """The instrument the user most likely meant: his main one (setting trading.default_symbol)."""
+    try:
+        main = resolve_instrument(str(app.config.get("trading.default_symbol", "XAUUSD") or "XAUUSD"))
+    except Exception:  # noqa: BLE001
+        main = None
+    return symbol_ckb(main or "XAUUSD") or "زێڕ"
+
+
 async def _checked_symbol(ctx: ToolContext, tv: Any, symbol: str, has_timeframe: bool,
                           data: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
-    """(symbol to set or None, refusal). A symbol the user did not name is not
-    applied: live 2026-09-24 the user asked only for the 1-minute timeframe, the
-    model sent symbol='z' and the chart became BATS:Z (a Nasdaq stock)."""
-    known = resolve_instrument(symbol) or canonical_request(symbol)
-    named = user_named(ctx.app, symbol, ctx.source)
+    """(symbol to set or None, refusal).
+
+    Only a KNOWN instrument (``symbols.chart_symbol``: aliases incl. «گوڵت»/«گوڵ»,
+    or the user's own learned/mapped feed) is ever applied -- never a bare number,
+    one or two letters or an unknown word. Live 2026-09-25 «بڕۆ 100 چار 3 خولەکی
+    یەکسەر لە گوڵت» ("the gold chart, 3 minutes"; STT wrote "100") became
+    tv_set_chart(symbol='100') and the chart switched to a symbol named "100".
+    When the user's own last words name exactly one instrument, that one is used
+    instead of the model's garbage; else the chart keeps its symbol (the
+    timeframe is still applied) and the answer asks «مەبەستت زێڕە؟».
+    A known symbol the user did not name is not applied either: live
+    2026-09-24 the user asked only for the 1-minute timeframe, the model sent
+    symbol='z' and the chart became BATS:Z (a Nasdaq stock)."""
+    learned, mapped = _feeds(ctx.app)
+    known = chart_symbol(symbol, learned=learned, mapped=mapped)
     if not known:
-        if has_timeframe:  # e.g. symbol='z' next to the timeframe the user asked for: apply only that
-            data["symbol_ignored"] = {"requested": symbol, "why": "not a known instrument"}
+        latest = recent_user_text(ctx.app, turns=1) if ctx.source not in ("worker", "ui") else None
+        spoken = mentioned_instruments(latest, context=True) if latest else set()
+        if len(spoken) == 1:
+            known = next(iter(spoken))
+            data["symbol_from_words"] = {"requested": symbol, "used": known}
+            return known, None
+        guess = _guess_ckb(ctx.app)
+        if has_timeframe:  # e.g. symbol='z' / '100' next to the timeframe the user asked for: apply only that
+            data["symbol_ignored"] = {"requested": symbol, "why": "not a known instrument", "guess_ckb": guess}
             return None, None
-        return None, fail(f"«{symbol}» وەک بازاڕێک نەناسرایەوە؛ ناوی بازاڕەکە بڵێ.", error="unknown_symbol",
-                          requested=symbol, hint="ask the user which instrument; never invent a ticker")
+        return None, fail(f"«{symbol}» وەک بازاڕێک نەناسرایەوە، بۆیە چارتەکەم نەگۆڕی. مەبەستت {guess}ە؟",
+                          error="unknown_symbol", requested=symbol,
+                          hint="ask the user which instrument; never invent a ticker or copy a number as a symbol")
+    # An explicit feed ('PEPPERSTONE:XAUUSD') goes as is; anything else as the instrument,
+    # so the bridge picks the user's own feed for it (tv_symbol_for: same / learned / mapped).
+    target = symbol if ":" in symbol else known
+    named = user_named(ctx.app, symbol, ctx.source)
     if named is not False:
-        return symbol, None
+        return target, None
     try:
         current = str((await tv.chart_state()).get("symbol") or "")
     except TvError:
         current = ""
     if current and same_instrument(current, known):
-        return symbol, None
+        return target, None
     if has_timeframe:
         data["symbol_ignored"] = {"requested": symbol, "why": "the user did not name this instrument"}
         return None, None
@@ -264,7 +323,8 @@ async def draw_on_chart(ctx: ToolContext, items: list[dict[str, Any]], tag: str 
     if not result.get("drawn"):
         reason = errors[0]["error"] if errors else "unknown"
         return fail(f"هیچ شتێکم نەکێشا لەسەر چارتەکە ({reason}).", **_data(result))
-    text = f"لەسەر چارتی {symbol_ckb(canonical_symbol(str(result.get('symbol') or '')))} کێشام: "            f"{kinds_summary_ckb(result['kinds'])}."
+    text = " ".join([*_acted_note(ctx), f"لەسەر چارتی {symbol_ckb(canonical_symbol(str(result.get('symbol') or '')))} "
+                                        f"کێشام: {kinds_summary_ckb(result['kinds'])}."])
     if errors:
         text += f" {len(errors)} دانەیان نەکێشران."
     return ok(text, **_data(result))

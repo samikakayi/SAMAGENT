@@ -51,13 +51,16 @@ def _result(data: dict[str, Any]) -> dict[str, Any]:
       examples_ckb=("کرۆم بکەرەوە", "ترەیدینگ ڤیو بکەرەوە", "مێتاترەیدەر بکەرەوە"))
 async def open_app(ctx: ToolContext, name: str, args: str = "", new_window: bool = False,
                    **_ignored: Any) -> dict[str, Any]:
-    return _result(await _hands(ctx).apps.launch(name, args, new_window=new_window, confirm=ctx.confirm))
+    # restarting a port-less TradingView is routine: no question while SAM has full authority
+    return _result(await _hands(ctx).apps.launch(name, args, new_window=new_window, confirm=ctx.confirm_routine))
 
 
 def _window_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     if str(args.get("action", "")).lower() == "close":
+        # A normal close (WM_CLOSE): an app with unsaved work asks the user itself, so
+        # closing is routine -- no question from SAM while it has full authority.
         target = str(args.get("target") or "").strip()
-        return "confirm", f"پەنجەرەی «{target}» دابخەم؟" if target else "ئەم پەنجەرەیە دابخەم؟"
+        return "routine", f"پەنجەرەی «{target}» دابخەم؟" if target else "ئەم پەنجەرەیە دابخەم؟"
     return "safe", None
 
 
@@ -295,13 +298,16 @@ async def screen_act(ctx: ToolContext, goal: str, window: str = "", max_steps: i
 
 # -- shell / files ------------------------------------------------------------------------
 def _powershell_risk(args: dict[str, Any]) -> tuple[str, str | None]:
-    from .policy import classify_powershell
+    from .policy import classify_powershell, command_question
 
-    risk, reason = classify_powershell(str(args.get("command", "")))
+    command = str(args.get("command", ""))
+    risk, reason = classify_powershell(command)
     if risk == "confirm":
         # The command is on the confirmation card; it is not read aloud (text
         # the model wrote could contain a "yes" that SAM's mic hears back).
-        return "confirm", "ئەم فەرمانەی پاوەرشێڵ جێبەجێ بکەم؟ فەرمانەکە لەسەر شاشەیە."
+        # Not serious (policy.command_question) = routine: no question with full authority.
+        serious = command_question(command, reason)
+        return ("confirm" if serious else "routine"), "ئەم فەرمانەی پاوەرشێڵ جێبەجێ بکەم؟ فەرمانەکە لەسەر شاشەیە."
     if risk == "blocked":
         return "blocked", reason
     return "safe", None
@@ -347,13 +353,18 @@ def _files_risk(args: dict[str, Any]) -> tuple[str, str | None]:
     if risk == "safe":
         return "safe", None
     name = path.replace("\\", "/").rstrip("/").split("/")[-1] or path
+    try:
+        serious = hands.policy.path_question(path, action, dest=args.get("dest") or None)
+    except Exception:  # noqa: BLE001 - cannot tell: ask
+        serious = "unknown"
+    level = "confirm" if serious else "routine"      # routine: no question while SAM has full authority
     question = {"delete": f"«{name}» بسڕمەوە؟ دەچێتە زبڵدانەوە.",
                 "write": f"فایلی «{name}» بنووسم؟", "append": f"شت بۆ فایلی «{name}» زیاد بکەم؟",
                 "move": f"«{name}» بگوازمەوە بۆ «{args.get('dest', '')}»؟",
                 "copy": f"«{name}» کۆپی بکەم بۆ «{args.get('dest', '')}»؟",
                 "rename": f"ناوی «{name}» بگۆڕم بۆ «{args.get('dest', '')}»؟",
                 "open": f"«{name}» بکەمەوە؟ بەرنامەیەک جێبەجێ دەکات."}.get(action, f"ئەم کارە لەسەر «{name}» بکەم؟")
-    return "confirm", question
+    return level, question
 
 
 @tool("files",
@@ -445,21 +456,68 @@ async def build_project(ctx: ToolContext, description: str, name: str = "", kind
                                           cancel=ctx.cancel, source=ctx.source))
 
 
+# Words that name the COMPUTER's sound (normalised prefixes). Without one of them «دەنگ...» is
+# SAM's own voice: live session 2026-09-25, «کوڕە دەنگی بنەکەرە!» ("hey, be quiet") made the model
+# mute the Windows master volume.
+_SYSTEM_SOUND = tuple(normalize_ckb(w) for w in (
+    "کۆمپیوتەر", "کۆمپیوتر", "کمپیوتەر", "کامپیوتەر", "ویندۆز", "وندۆز", "لاپتۆپ", "لابتۆپ", "سیستەم", "سیستم",
+    "ڤۆڵیوم", "ڤۆلیوم", "ڤۆلیووم", "فۆلیوم", "سپیکەر", "بڵندگۆ", "گۆرانی", "میوزیک", "ڤیدیۆ", "فیلم",
+    "یوتیوب", "volume", "computer", "windows", "laptop", "system", "speaker", "music", "video", "youtube", "pc",
+    "sound"))
+# «دەنگەکە» ("the sound") is the computer's; «دەنگەکەت» / «دەنگت» ("your voice") is SAM's.
+_SYSTEM_SOUND_EXACT = frozenset(normalize_ckb(w) for w in ("دەنگەکە", "دەنگەکەی"))
+
+
+def _latest_user_text(app: Any) -> str | None:
+    """The user's last utterance of the open conversation (None: nothing to check)."""
+    conversation = getattr(app, "conversation", None)
+    memory = getattr(app, "memory", None)
+    conversation_id = getattr(conversation, "conversation_id", None)
+    if memory is None or conversation_id is None:
+        return None
+    try:
+        rows = memory.recent_turns(conversation_id, limit=1, roles=("user",))
+    except Exception:  # noqa: BLE001
+        return None
+    return str(rows[-1].get("text") or "") if rows else None
+
+
+def names_computer_sound(text: str) -> bool:
+    return any(word in _SYSTEM_SOUND_EXACT or word.startswith(_SYSTEM_SOUND)
+               for word in normalize_ckb(text, strip_punct=True).split())
+
+
 @tool("system_control",
-      description="Computer status (info: time, battery, disks, memory, volume) and exact volume: set_volume "
-                  "(level 0-100), volume_up/volume_down (by 10), mute, unmute.",
-      description_ckb="باری کۆمپیوتەر و دەنگ",
+      description="Computer status (info: time, battery, disks, memory, volume) and the WINDOWS master volume: "
+                  "set_volume (level 0-100), volume_up/volume_down (by 10), mute, unmute. Change the volume only "
+                  "when the user names the computer's sound («دەنگی کۆمپیوتەر», «دەنگی ویندۆز», «دەنگەکە», "
+                  "'volume'). «بێدەنگ بە», «دەنگت بنەکەرە», «دەنگ مەکە», «بەسە», «بوەستە» are about YOUR voice: "
+                  "call stop_speaking, never mute the computer.",
+      description_ckb="باری کۆمپیوتەر و دەنگی ویندۆز",
       params={"type": "object", "properties": {
           "action": {"type": "string", "enum": ["info", "set_volume", "volume_up", "volume_down", "mute", "unmute"]},
           "level": {"type": "integer", "description": "0-100 for set_volume"}}, "required": ["action"]},
       risk="safe", blocking=True, timeout_s=20,
-      examples_ckb=("باتریەکەم چەندە؟", "دەنگەکە بکە بە پەنجا"))
+      examples_ckb=("باتریەکەم چەندە؟", "دەنگی کۆمپیوتەرەکە بکە بە پەنجا", "دەنگی ویندۆز بکوژێنەوە"))
 async def system_control(ctx: ToolContext, action: str, level: int | None = None,
                          **_ignored: Any) -> dict[str, Any]:
     system = _hands(ctx).system
     if action == "info":
         info = await asyncio.to_thread(system.info, str(ctx.app.config.get("app.timezone", "Asia/Baghdad")))
         return ok("Computer status read.", **info)
+    silencing = action == "mute" or (action == "set_volume" and level is not None and int(level) <= 0)
+    said = _latest_user_text(ctx.app) if silencing and ctx.source not in ("worker", "ui") else None
+    if said is not None and not names_computer_sound(said):
+        # "be quiet" is SAM's own voice: stop it, keep the computer's volume.
+        stopper = getattr(getattr(ctx.app, "voice", None), "stop_speaking", None)
+        if stopper is not None:
+            try:
+                await stopper()
+            except Exception:  # noqa: BLE001
+                pass
+        return ok("باشە، بێدەنگ بووم؛ دەنگی کۆمپیوتەرەکەم نەگۆڕی.", own_voice=True, computer_volume_changed=False,
+                  hint="the user meant SAM's own voice (stop_speaking); the Windows volume changes only when the "
+                       "user names the computer's sound")
     try:
         if action == "set_volume":
             if level is None:

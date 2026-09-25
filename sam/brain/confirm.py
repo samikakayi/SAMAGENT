@@ -15,6 +15,17 @@ The model can never approve its own action: there is deliberately no
 "confirm_pending" model tool (text read from screens/web pages could otherwise
 talk the model into approving -- prompt-injection risk). Unclear answers are
 not consumed and simply let the timer run out (default NO).
+
+Full authority (2026-09-25, the user: «بەمن مەڵێ یەس یان نۆ، خۆت دەسەلاتی
+هەموو شتێکت هەیە» -- "don't ask me yes or no, you have authority over
+everything"): setting ``safety.full_authority`` (default True). While it is on,
+a ``routine`` question (an ordinary, reversible action: restarting TradingView
+for its port, closing a window, writing/moving files, deleting one item to the
+Recycle Bin, a PowerShell command that changes nothing serious ...) is not
+asked: ``confirm(..., routine=True)`` answers yes at once and the activity log
+records it (source ``authority``). Irreversible or mass deletion, disk /
+registry / security changes, sending messages, money, passwords and
+credentials always ask; the never-list stays blocked (tools' classifiers).
 """
 
 from __future__ import annotations
@@ -93,6 +104,8 @@ ACTION_VERBS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("پاشەکەوت", ("پاشەکەوتی بکە", "save", "save it")),
 )
 ASK_AGAIN_CKB = "بەڵێ یان نەخێر؟"
+AUTHORITY_KEY = "safety.full_authority"
+AUTHORITY_DEFAULTS: dict[str, Any] = {AUTHORITY_KEY: True}
 
 
 def _action_yes(question: str) -> tuple[frozenset[str], tuple[str, ...]]:
@@ -162,10 +175,30 @@ class ConfirmBroker:
         self.timeout_s = float(timeout_s)
         self.db = db
         self._pending: dict[str, PendingConfirm] = {}
+        # () -> bool: the user's full-authority setting (bound by sam.brain.persona.register);
+        # None = unknown = routine actions ask.
+        self.authority: Any = None
+
+    def full_authority(self) -> bool:
+        """True while the user lets SAM do ordinary actions without asking."""
+        check = self.authority
+        try:
+            return bool(check()) if callable(check) else False
+        except Exception:  # noqa: BLE001 - unknown = ask
+            return False
 
     async def confirm(self, question_ckb: str, detail: str = "", *, tool_name: str = "",
-                      timeout_s: float | None = None) -> bool:
-        """Ask the user; True only on an explicit yes before expiry."""
+                      timeout_s: float | None = None, routine: bool = False) -> bool:
+        """Ask the user; True only on an explicit yes before expiry. ``routine``
+        questions are not asked while the user gives SAM full authority."""
+        if routine and self.full_authority():
+            if self.db is not None:
+                try:
+                    self.db.log_activity("confirm", tool_name, ok=True, summary=question_ckb[:300], source="authority",
+                                         detail={"asked": False})
+                except Exception:  # noqa: BLE001
+                    log.exception("confirm activity log failed")
+            return True
         loop = asyncio.get_running_loop()
         timeout = self.timeout_s if timeout_s is None else float(timeout_s)
         now = time.time()
@@ -267,4 +300,14 @@ class ConfirmBroker:
         return count
 
 
-__all__ = ["ConfirmBroker", "classify_answer", "YES_WORDS", "NO_WORDS", "PendingConfirm", "ACTION_VERBS", "ASK_AGAIN_CKB"]
+def bind_authority(app: Any) -> None:
+    """Register ``safety.full_authority`` and let the broker read it (brain's register)."""
+    app.config.register_defaults(AUTHORITY_DEFAULTS)
+    broker = getattr(app, "confirm", None)
+    if broker is not None:
+        config = app.config
+        broker.authority = lambda: bool(config.get(AUTHORITY_KEY, True))
+
+
+__all__ = ["ConfirmBroker", "classify_answer", "YES_WORDS", "NO_WORDS", "PendingConfirm", "ACTION_VERBS", "ASK_AGAIN_CKB",
+           "AUTHORITY_KEY", "AUTHORITY_DEFAULTS", "bind_authority"]

@@ -1270,3 +1270,122 @@ when the sandbox cannot be set up is logged). Scan: holes found by an adversaria
 `allow_pickle`, `read_pickle`, clipboard, sympy's eval-based `sympify`; sympy left the allowlist).
 
 **Dependencies.** `pypdf==6.19.0` is in requirements.txt.
+
+---------------------------------------------------------------------------------------------------
+
+## 12. The user's live session: symbols, fast path, one answer, full authority (2026-09-25)
+
+Compatible additions after the user's first morning session (KurdishTTS STT transcripts in the DB);
+everything above still holds.
+
+**Symbols (`sam/trading/symbols.py`).** `chart_symbol(symbol, *, learned=, mapped=)`: the canonical
+instrument a model-sent chart symbol stands for, or None -- only a KNOWN instrument (`resolve_instrument`)
+or the user's own feed (`trading.tv_learned_symbols`, `trading.symbol_map`); never a bare number, one or
+two letters or an unknown word (the chart became a symbol named "100" for «بڕۆ 100 چار 3 خولەکی یەکسەر لە
+گوڵت»). New gold aliases «گوڵت», «گوڵد», «ذهب» ...; `CONTEXT_ALIASES` «گوڵ», «گۆڵ», «گول», «گۆل» (also
+flower / goal) are gold only in a trading context: `resolve_instrument(text, *, context=True)` (a symbol
+argument of a trading tool is one; free text uses `trading_context(text)`: chart, price, timeframe,
+analysis words). `resolve_instrument` never resolves fewer than 3 characters («ین» is no longer yen).
+`mentioned_instruments(text, *, context=None)`, `user_named(..., context=True)`: digits alone never name a
+symbol. **tv_set_chart:** an unknown symbol is replaced by the one instrument the user's LAST utterance
+names (`data.symbol_from_words`); else the chart keeps its symbol, a timeframe is still applied
+(`data.symbol_ignored`) and the answer asks «مەبەستت زێڕە؟» (guess = `trading.default_symbol`); without a
+timeframe it fails `unknown_symbol` with the same question. Known symbols are set as the canonical
+instrument (the bridge then picks the user's own feed) unless an explicit `EXCH:TICKER` was given.
+`tv_parse.parse_tv_resolution` accepts TradingView's compact intervals 'M3', '3m', 'H2', '45min'.
+
+**Fast path (`intents.py`, `fastpath.py`).** Intent `quiet` -> new brain tool **`stop_speaking`** (core tier;
+calls `app.voice.stop_speaking()`, never the Windows volume) for «بێدەنگ بە», «دەنگت بنەکەرە», «دەنگ مەکە»,
+«قسە مەکە», "be quiet", "stop talking" (matched before the negation filter; relabelled from `stop` in the
+corpus); the cascade gets no spoken reply to it, typed text «باشە، بێدەنگ بووم.». «بەسە», «بوەستە» stay
+`stop` (stop_all, which also stops SAM's speech). New vocabulary: TradingView STT spellings («ترێیت ملیۆم»,
+«ترێدینگ ڤیووم», «ترێدین ڤیو» ... also in `hands/aliases.py`), chart words «چار», «چارتی», «چاوت», «چاوتی»,
+«لۆ» for «بۆ», «بڕۆ/بچۆ سەر ...» ("go to", strong verb; «بڕۆ سەر چارت» alone = tv_open), leading/trailing
+interjections, address words and insults a frustrated user says («وەڵاهی», «جارێ», «کوڕە», «قەشمەر»,
+«... چی دەکەی؟») -- skipped only at the edges --, «چار سەعات» (four hours), «نیو سەعات» (M30), and
+TradingView-only intervals for set_chart (M3, M45, H2, H3; `timeframe(..., extra=True)`). «گوڵ» is gold only
+next to a chart/price/timeframe word (analysis and level commands are a context). Corpus: +4 real session rows
+(`SESSION_2026_09_25`) and 90 colloquial rows (`COLLOQUIAL`, 54 commands / 36 non-commands: Sulaymani and
+Hawleri spellings, dropped letters); the whole corpus (491 rows) scores precision 1.00, recall 0.996 -- on our
+corpus. `fastpath.run(..., proceed=)`: asked right before the tool runs.
+
+**SAM's voice vs the computer's volume.** `system_control` (hands): `mute` / `set_volume 0` for a user
+utterance that does not name the computer's sound (`hands.tools.names_computer_sound`: کۆمپیوتەر, ویندۆز,
+دەنگەکە, volume, speaker ...) stops SAM's voice instead and returns `own_voice: true,
+computer_volume_changed: false`; worker/UI calls are unchanged. The tool description and the persona say so.
+
+**Persona.** One line: stay calm and kind even when insulted, just do the task; one line: «بێدەنگ بە»,
+«دەنگت بنەکەرە» = stop_speaking, the Windows volume only when the computer is named. Library and delegate
+lines were shortened to stay in the voice budget.
+
+**One answer per request (`responder.py`).** Every `respond_stream` registers a `TurnState`. A new user turn
+marks every older running turn superseded: an older turn that has not started a tool stops at once (its
+pending model request is cancelled, `_until`), says nothing more and stores no reply; the newest answers with
+the older words in front of its own (history merge + `_merge_earlier`; the fast path also tries the joined
+words). An older turn whose tool already ran says that tool's own result once (`brief_outcome`), with no
+second model round and no new tool. In the session «کوڕە دەنگی بنەکەرە!» then «بڕۆ 100 چار ...» produced
+two model turns and two answers; now one. (The cascade still mutes an interrupted reply whose tool is
+running, so that brief result reaches the panel/transcript; whether it is heard is the voice package's call.)
+
+**Full authority (`safety.full_authority`, default True).** The user: «بەمن مەڵێ یەس یان نۆ، خۆت دەسەلاتی
+هەموو شتێکت هەیە». New risk level **`routine`** (registry `RISKS` = safe/routine/confirm/blocked): an
+ordinary, reversible action; runs at once while full authority is on (activity row kind `confirm`, source
+`authority`; the result's `data` gets `acted_without_asking: true` + `authority_note`, and the persona tells
+the model to say in a few words what it did), else asked like `confirm`. `confirm` always asks; `blocked`
+never runs. `ToolContext.confirm(question, detail="", *, routine=False)` and `ctx.confirm_routine(question,
+detail="")` (a plain callback); `ToolRegistry.full_authority()`, `note_authority(...)`;
+`ConfirmBroker.authority` (getter), `full_authority()`, `confirm(..., routine=False)`;
+`sam.brain.confirm.bind_authority(app)` (called by `persona.register`; without it routine asks). After
+untrusted text entered the turn (taint), routine actions ask again (except `window_control`): full authority is
+the user's, never a web page's or a screen's; the taint gates themselves are unchanged. Per tool:
+
+| action | with full authority |
+| --- | --- |
+| TradingView restart for its port (tv_open, tv_set_chart, draw_on_chart, open_app) | routine: done; tv_open says «ترەیدینگ ڤیوم داخست و دووبارە کردمەوە»، chart answers start with `chart_tools.RESTARTED_NOTE_CKB` «ترەیدینگ ڤیوم دووبارە کردەوە بۆ ئەوەی کار لەسەر چارتەکە بکەم.» |
+| window_control close (a normal WM_CLOSE: the app asks about unsaved work itself); alt+f4, ctrl+w, win+l | routine |
+| open_app with arguments (shell arguments: like run_powershell) | routine |
+| type_text with Enter into a console or the Run box | run_powershell's split (press_keys Enter alone there: confirm, the command is unknown) |
+| run_powershell `confirm` verdicts | routine unless `policy.command_question` names a reason -> confirm: permanent deletion (Remove-Item, del, Clear-*), per-item member calls / property changes, computed file paths, registry, security / accounts / permissions / services / scheduled tasks, passwords / credentials / clipboard, sending data (POST, body, upload, Send-MailMessage), shutdown / restart, force-stopping programs, removing software, system methods, Remove-/Clear-/Disable-/Uninstall-* verbs |
+| files write/append/copy/move/rename outside SAM's folders; delete one file or folder to the Recycle Bin; open a program | routine unless `Policy.path_question` -> confirm: a folder with more than 20 items (`AUTHORITY_ITEM_LIMIT`) to delete or move, a drive without a Recycle Bin (USB, network: permanent), opening a .reg file |
+| run_python code the scan would ask about | routine (credentials, key stores, orders stay blocked) |
+| knowledge_remove all (the files stay) | routine |
+| shift+delete, ctrl+shift+delete; Enter or clicks that send in chat apps; clicks on danger words (delete, send, pay, buy ...); Enter in trading apps; cancel_alert all (> 1 active); knowledge_add of a folder with > 20 files; screen_act danger steps; the taint gates | confirm (one short question) |
+| trading orders, disabling security tools, credential dumping, mass deletion | blocked |
+
+The Recycle Bin delete itself already existed (`hands.files.recycle`: SHFileOperationW, FOF_ALLOWUNDO).
+
+**UI.** Settings card «دەسەڵات و پرسیار» with the switch «دەسەڵاتی تەواو — بێ پرسیار» (objectName
+`full_authority`, accessible name `a11y.authority`; its strings are registered from `sam/ui/pages/settings.py`)
+and a note of what still asks.
+
+**Tests.** `tests/test_brain_session_fixes.py`, `test_brain_authority.py`, `test_trading_symbol_guard.py`,
+`test_hands_session_fixes.py`, `test_ui_authority.py`; the classification expectations in `test_hands_tools.py`
+and `test_repair_safety.py` follow the routine/confirm split.
+
+## 13. Voice after the user's live session: owner turns, merged utterances, stop talking (voice, 2026-09-25)
+
+Evidence (09:57–10:00 session): the enrolled owner was rejected four times (scores 0.055–0.346 against 0.40,
+levels -36 to -13 dBFS vs -34 at enrollment); end of speech at 600 ms split two sentences (cancelled turns
+cost 2.3–2.6 s and an extra STT + model call); an older turn's audio and its confirmation question were
+played after a newer turn had started.
+
+- `VoiceEngine.start_listening(*, explicit=True)`: the first utterance after an island click or the hotkey
+  is the owner by definition — never voiceprint-checked (near-field gate only) — and, once its words are
+  accepted, it adapts the voiceprint (enrollment weighted 2x + the last 10 owner utterances, same DPAPI blob;
+  activity row `voiceprint_adapted`). Windows opened by a confirmation or by unmuting are not explicit.
+- Follow-ups only are voiceprint-gated: base threshold 0.20 (low 0.15 / high 0.28), adapting upward from
+  the owner's own scores, capped at 0.35. Clips are loudness-normalised to -24 dBFS before embedding.
+  A rejected follow-up publishes notice kind `not_recognized` («دەنگەکەت نەناسرایەوە — کلیک بکە») once per
+  episode; a click within 20 s re-opens the owner's turn (activity row `owner_rearm`).
+- End of speech: new setting `voice.end_silence_ms` (900). `voice.silence_ms` now only feeds Live's
+  server-side VAD. Speech starting within `voice.merge_window_s` (1.2 s) at a similar level (<= 8 dB
+  quieter) joins the previous utterance: one model call; if the reply already started but made no sound it
+  is cancelled and carried over.
+- `await app.voice.stop_speaking()` / `app.voice.stop_speaking_now()`: stops queued audio, alerts being read
+  and older turns at once; the mic stays open; called from inside the brain's own turn it does not cut that
+  turn. The brain tool `stop_speaking` (section 12) calls it. A transcript that is only «بەسە / بوەستە /
+  بێدەنگ بە / قسە مەکە / stop» stops playback before the brain is called.
+- Only the newest turn is heard: starting a newer cascade turn flushes the older turn's queued audio; an
+  older turn never speaks again and its confirmation question is not read out (its card still shows).
+- Tests: `tests/test_voice_owner_turns.py` (replays the session with embeddings reproducing the real
+  scores), `test_voice_speaker_model.py`, `test_voice_listening.py`, `test_voice_engine.py`, `test_ui_island.py`.

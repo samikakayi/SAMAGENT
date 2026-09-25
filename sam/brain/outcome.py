@@ -68,6 +68,7 @@ _TEMPLATES: dict[str, tuple[str, str]] = {
     # "cancel my gold alert" answered «تەواو بوو.» while the alert stayed).
     "more_tools": (NO_MODEL_YET, NO_MODEL_YET),
     "stop_all": ("هەموو شتێکم ڕاگرت.", "نەمتوانی ڕایبگرم."),
+    "stop_speaking": ("باشە، بێدەنگ بووم.", "نەمتوانی دەنگم ببڕم."),
 }
 
 _WINDOW_OK = {"focus": "پەنجەرەکە هێنرایە پێشەوە.", "minimize": "پەنجەرەکە بچووک کرایەوە.",

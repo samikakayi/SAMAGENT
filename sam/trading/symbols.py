@@ -13,6 +13,14 @@ Measured problems it fixes (repair review, 2026-09-24):
   instrument at all) went to TradingView as a real ticker and switched the
   user's chart to a Nasdaq stock (BATS:Z). ``user_named`` lets the chart tool
   refuse a symbol the user never said.
+- Live session 2026-09-25: «بڕۆ 100 چار 3 خولەکی یەکسەر لە گوڵت» ("go to the
+  gold chart, 3 minutes"; STT wrote "100") -> tv_set_chart(symbol='100') and the
+  chart became a symbol named "100": the user-named check passed because "100"
+  was in the text. ``chart_symbol`` accepts only a KNOWN instrument (or the
+  user's own learned/mapped TradingView feed): never a bare number, never one or
+  two letters, never an unknown word. The user's gold words «گوڵت», «گوڵد»,
+  «ذهب» ... resolve to gold; «گوڵ» (flower) and «گۆڵ» (goal) only in a
+  trading/chart context (``CONTEXT_ALIASES``, ``trading_context``).
 """
 
 from __future__ import annotations
@@ -32,7 +40,25 @@ EXTRA_ALIASES: dict[str, str] = {normalize_ckb(k): v for k, v in {
     "ئیتریۆم": "ETHUSD", "ئیسریۆم": "ETHUSD", "ئێسریۆم": "ETHUSD", "ئەسریۆم": "ETHUSD", "ئیسریوم": "ETHUSD",
     "یۆرۆ دۆلار": "EURUSD", "eur usd": "EURUSD", "داو جۆنز": "US30", "dow": "US30", "dow jones": "US30",
     "us30": "US30", "نەوت": "USOIL", "زیو": "XAGUSD",
+    # gold as the user and KurdishTTS STT spell it (live session 2026-09-25: «گوڵت», «گوڵ»)
+    "گوڵت": "XAUUSD", "گوڵتی": "XAUUSD", "گوڵد": "XAUUSD", "گوڵدی": "XAUUSD", "گۆلدی": "XAUUSD",
+    "گولدی": "XAUUSD", "گولتی": "XAUUSD", "گۆڵتە": "XAUUSD", "ئاڵتوونی": "XAUUSD", "ذهب": "XAUUSD",
+    "الذهب": "XAUUSD", "ذەهەب": "XAUUSD", "زەهەب": "XAUUSD",
 }.items()}
+# Words that mean gold ONLY when the user talks about the chart / prices / a timeframe:
+# «گوڵ» is also "flower", «گۆڵ» "goal" or "pond". A symbol argument of a trading tool is
+# such a context by itself; free text needs a chart, price or timeframe word (trading_context).
+CONTEXT_ALIASES: dict[str, str] = {normalize_ckb(k): v for k, v in {
+    "گوڵ": "XAUUSD", "گۆڵ": "XAUUSD", "گول": "XAUUSD", "گۆل": "XAUUSD",
+}.items()}
+# Words that make free text a trading/chart context (exact normalised words, and prefixes;
+# «چار», «چاوت» and «چارتی» are how STT writes «چارت»).
+_CONTEXT_EXACT = frozenset(normalize_ckb(w) for w in (
+    "چار", "چاوت", "چاوتی", "چاوتەکە", "chart", "charts", "price", "prices", "timeframe", "tradingview",
+    "trading", "m1", "m3", "m5", "m15", "m30", "h1", "h4", "d1"))
+_CONTEXT_PREFIXES = tuple(normalize_ckb(w) for w in (
+    "چارت", "نرخ", "نەرخ", "قیمەت", "خولەک", "دەقیقە", "کاتژمێر", "سەعات", "ڕۆژانە", "هەفتانە", "تایمفرەیم",
+    "شیکار", "ترەید", "ترێد", "ترید", "مامەڵە", "بازاڕ", "پشتگیری", "بەرگری", "ئاگادارکردنەوە", "minute", "hour"))
 # XAUUSD spoken letter by letter, as KurdishTTS STT wrote it on 2026-09-24 («خاو یوئێزدی») and similar.
 SPELLED: dict[str, str] = {normalize_ckb(k).replace(" ", ""): v for k, v in {
     "خاو یوئێزدی": "XAUUSD", "خاو یو ئێس دی": "XAUUSD", "زاو یو ئێس دی": "XAUUSD", "ئێکس ئەی یو یو ئێس دی": "XAUUSD",
@@ -86,39 +112,55 @@ def _near_miss_candidate(compact: str) -> bool:
             and compact not in NOT_NEAR_MISSES and not _PAIR_SHAPE.match(compact))
 
 
-def _alias(word: str) -> str | None:
-    return EXTRA_ALIASES.get(word) or SYMBOL_ALIASES.get(word) or SPELLED.get(word.replace(" ", ""))
+def _alias(word: str, context: bool = False) -> str | None:
+    return (EXTRA_ALIASES.get(word) or SYMBOL_ALIASES.get(word) or SPELLED.get(word.replace(" ", ""))
+            or (CONTEXT_ALIASES.get(word) if context else None))
 
 
-def _token_hits(tokens: list[str]) -> set[str]:
+def _token_hits(tokens: list[str], context: bool = False) -> set[str]:
     hits: set[str] = set()
     for token in tokens:
         for form in [token] + [token[: -len(s)] for s in SUFFIXES if token.endswith(s) and len(token) > len(s) + 1]:
-            target = _alias(form)
+            target = _alias(form, context)
             if target:
                 hits.add(target)
                 break
     return hits
 
 
-def resolve_instrument(text: str | None) -> str | None:
+def trading_context(text: str | None) -> bool:
+    """The words are about the chart, prices or a timeframe («بڕۆ سەر چاوتی گوڵ»,
+    «نرخی گوڵ», «گوڵ لەسەر ١٥ خولەک»): then «گوڵ»/«گۆڵ» mean gold."""
+    for word in normalize_ckb(text or "", strip_punct=True).split():
+        if word in _CONTEXT_EXACT or word.startswith(_CONTEXT_PREFIXES):
+            return True
+    return False
+
+
+def resolve_instrument(text: str | None, *, context: bool = True) -> str | None:
     """Spoken/typed/model-sent instrument -> canonical symbol ('زێڕەکە',
-    'گۆڵت', 'خاو یوئێزدی', 'XUUSD', 'ZIW', 'OANDA:XAUUSD', 'BINANCE:BTCUSDT'),
+    'گۆڵت', 'گوڵت', 'خاو یوئێزدی', 'XUUSD', 'ZIW', 'OANDA:XAUUSD', 'BINANCE:BTCUSDT'),
     or None when it is not an instrument SAM knows (never guesses from free
-    text or from one or two letters)."""
+    text, from a bare number or from one or two letters).
+
+    ``context``: the text is a trading/chart context, so «گوڵ»/«گۆڵ» mean gold.
+    True for a symbol argument of a trading tool (the default); scanning free
+    text passes ``trading_context(text)`` (``mentioned_instruments``)."""
     raw = (text or "").strip()
     if not raw:
         return None
     if _EXPLICIT.match(raw):
         bare = canonical_symbol(raw)
         return bare if bare in KNOWN else None
+    if len(re.sub(r"[\s/_\-.]", "", raw)) < 3:
+        return None               # 'z', 'x', «ین»: one or two letters are never an instrument
     norm = normalize_ckb(raw)
     stripped = normalize_ckb(raw, strip_punct=True)
     for candidate in (norm, stripped, stripped.replace(" ", "")):
-        target = _alias(candidate)
+        target = _alias(candidate, context)
         if target:
             return target
-    hits = _token_hits(stripped.split())
+    hits = _token_hits(stripped.split(), context)
     if len(hits) == 1:
         return hits.pop()
     compact = re.sub(r"[\s/_\-.]", "", raw).lower()
@@ -169,34 +211,66 @@ def recent_user_text(app: Any, *, turns: int = 3, within_s: float = 600.0) -> st
     return " ".join(texts) if texts else None
 
 
-def mentioned_instruments(text: str) -> set[str]:
-    """Every instrument named in ``text`` (single words and 2-3 word runs)."""
+def mentioned_instruments(text: str, *, context: bool | None = None) -> set[str]:
+    """Every instrument named in ``text`` (single words and 2-3 word runs).
+    ``context`` None = decided from the words (``trading_context``)."""
     words = normalize_ckb(text, strip_punct=True).split()
+    if context is None:
+        context = trading_context(text)
     found: set[str] = set()
     for size in (1, 2, 3, 6):
         for i in range(0, max(0, len(words) - size + 1)):
-            target = resolve_instrument(" ".join(words[i:i + size]))
+            target = resolve_instrument(" ".join(words[i:i + size]), context=context)
             if target:
                 found.add(target)
     return found
 
 
-def user_named(app: Any, symbol: str, source: str = "") -> bool | None:
-    """True when the user's recent words name this instrument (or the symbol
-    literally); False when they do not; None when there is nothing to check
-    (worker/UI calls, no conversation)."""
+def user_named(app: Any, symbol: str, source: str = "", *, context: bool = True) -> bool | None:
+    """True when the user's recent words name this instrument (or the symbol's
+    letters literally, e.g. a typed 'NAS100'); False when they do not; None when
+    there is nothing to check (worker/UI calls, no conversation). ``context``:
+    the call is about the chart (tv_set_chart), so «گوڵ» in the user's words is gold.
+    Digits alone never count: "100" in «بڕۆ 100 چار ...» is not a named symbol."""
     if source in ("worker", "ui"):
         return None
     said = recent_user_text(app)
     if said is None:
         return None
     wanted = resolve_instrument(symbol)
-    if wanted and wanted in mentioned_instruments(said):
+    if wanted and wanted in mentioned_instruments(said, context=context):
         return True
     literal = re.sub(r"[^a-z0-9]", "", str(symbol).split(":")[-1].lower())
     spoken = re.sub(r"[^a-z0-9]", "", normalize_ckb(said))
-    return bool(literal) and len(literal) >= 3 and literal in spoken
+    return len(re.sub(r"[^a-z]", "", literal)) >= 3 and literal in spoken
+
+
+def chart_symbol(symbol: str | None, *, learned: dict[str, Any] | None = None,
+                 mapped: dict[str, Any] | None = None) -> str | None:
+    """The canonical instrument a model-sent chart symbol stands for, or None.
+
+    Only a KNOWN instrument (``resolve_instrument``, any alias, «گوڵ» included:
+    a chart argument is a chart context) or one of the user's own TradingView
+    feeds (``learned`` = setting trading.tv_learned_symbols, ``mapped`` =
+    trading.symbol_map). Never a bare number ('100'), never one or two letters,
+    never an unknown word: live 2026-09-25 the chart became a symbol named "100"."""
+    raw = (symbol or "").strip()
+    compact = re.sub(r"[\s/_\-.:!]", "", raw)
+    if len(compact) < 3 or compact.isdigit():
+        return None
+    known = resolve_instrument(raw)
+    if known:
+        return known
+    upper = raw.upper()
+    for canonical, feed in (learned or {}).items():
+        if isinstance(feed, str) and upper in (feed.strip().upper(), str(canonical).upper()):
+            return str(canonical)
+    for canonical, entry in (mapped or {}).items():
+        feed = entry.get("tv") if isinstance(entry, dict) else None
+        if upper == str(canonical).upper() or (isinstance(feed, str) and upper == feed.strip().upper()):
+            return str(canonical)
+    return None
 
 
 __all__ = ["resolve_instrument", "same_instrument", "instrument", "user_named", "recent_user_text",
-           "mentioned_instruments", "KNOWN"]
+           "mentioned_instruments", "chart_symbol", "trading_context", "CONTEXT_ALIASES", "KNOWN"]

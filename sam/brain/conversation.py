@@ -36,7 +36,7 @@ from .confirm import ASK_AGAIN_CKB
 from .library_context import DEFAULTS as LIBRARY_DEFAULTS
 from .llm import LLMError
 from .responder import (ACKS_DO, ACKS_LOOK, CORE_TOOLS, SORANI_CUT_OFF, SORANI_DONE, SORANI_NO_MODEL,
-                        SORANI_NOT_DONE, SORANI_NOT_UNDERSTOOD, Responder, clean_tool_args, more_tools)
+                        SORANI_NOT_DONE, SORANI_NOT_UNDERSTOOD, Responder, clean_tool_args, more_tools, stop_speaking)
 from .ladders import FAST_TOOL_PICKERS
 
 log = logging.getLogger("sam.conversation")
@@ -530,8 +530,9 @@ def register(app: Any) -> None:
     app.db.ensure_schema("brain", BRAIN_MIGRATIONS)
     app.conversation = Conversation(app)
     app.conversation.attach()
-    if app.tools.get(more_tools.tool_spec.name) is None:
-        app.tools.add(more_tools, owner="brain")
+    for fn in (more_tools, stop_speaking):
+        if app.tools.get(fn.tool_spec.name) is None:
+            app.tools.add(fn, owner="brain")
 
 
 async def start(app: Any) -> None:

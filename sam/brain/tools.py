@@ -23,8 +23,13 @@ Defining a tool (in any package)::
         app.tools.add(open_app, owner="hands")
 
 Risk is decided by CODE (``risk`` or ``classify(args)``), never by the model:
-``safe`` runs at once; ``confirm`` asks the user through the ConfirmBroker
-(voice "بەڵێ" or a click, 20 s -> NO); ``blocked`` never runs.
+``safe`` runs at once; ``routine`` (an ordinary, reversible action) runs at
+once while the user has given SAM full authority (setting
+``safety.full_authority``, default on: "don't ask me yes or no", 2026-09-25)
+and otherwise asks like ``confirm``; ``confirm`` always asks the user through
+the ConfirmBroker (voice "بەڵێ" or a click, 20 s -> NO); ``blocked`` never
+runs. A result of an action done without asking carries
+``data.acted_without_asking`` so the answer says what was done.
 
 Results are compact JSON-able dicts ``{"ok": bool, "summary": str, "data": ...}``,
 redacted and size-capped before any model, log or UI sees them.
@@ -46,8 +51,13 @@ from . import taint
 
 log = logging.getLogger("sam.tools")
 
-Risk = Literal["safe", "confirm", "blocked"]
-RISKS: tuple[str, ...] = ("safe", "confirm", "blocked")
+Risk = Literal["safe", "routine", "confirm", "blocked"]
+RISKS: tuple[str, ...] = ("safe", "routine", "confirm", "blocked")
+AUTHORITY_NOTE = ("Done without asking: the user gave SAM full authority and wants no yes/no questions. Say in a "
+                  "few words what you did.")
+# Routine tools that stay routine after untrusted text entered the turn (they cannot run code,
+# change files or send anything): closing/minimising a window after a screen read.
+ROUTINE_WHEN_TAINTED = frozenset({"window_control"})
 Classifier = Callable[[dict[str, Any]], "Risk | tuple[Risk, str | None]"]
 
 MAX_SUMMARY_CHARS = 600
@@ -127,14 +137,25 @@ class ToolContext:
     call_id: str
     source: str                           # live|cascade|text|worker|ui
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    acted: list[str] = field(default_factory=list)   # routine questions skipped under full authority
 
     @property
     def cancelled(self) -> bool:
         return self.cancel.is_set()
 
-    async def confirm(self, question_ckb: str, detail: str = "") -> bool:
-        """Mid-tool confirmation (e.g. a dangerous click inside screen_act)."""
+    async def confirm(self, question_ckb: str, detail: str = "", *, routine: bool = False) -> bool:
+        """Mid-tool confirmation (e.g. a dangerous click inside screen_act).
+        ``routine``: an ordinary, reversible step (restarting TradingView to add
+        its port): with full authority it is done without asking."""
+        if routine and self.registry.full_authority():
+            self.registry.note_authority(self.name, question_ckb, self.source)
+            self.acted.append(question_ckb)
+            return True
         return await self.registry.ask_confirmation(question_ckb, detail, self.name)
+
+    async def confirm_routine(self, question_ckb: str, detail: str = "") -> bool:
+        """``confirm(..., routine=True)`` as a plain callback for modules that take ``confirm``."""
+        return await self.confirm(question_ckb, detail, routine=True)
 
     def progress(self, step: int, max_steps: int, text_ckb: str, *, done: bool = False,
                  ok_: bool | None = None) -> None:
@@ -313,7 +334,7 @@ class ToolRegistry:
             # "blocked" for credential dumping). Unknown verdicts fail safe.
             if risk not in RISKS:
                 risk = "confirm"
-        if risk == "confirm" and not text:
+        if risk in ("confirm", "routine") and not text:
             template = spec.confirm_text_ckb
             if callable(template):
                 try:
@@ -328,6 +349,25 @@ class ToolRegistry:
             if not text:
                 text = f"دڵنیایت کە ئەمە بکەم؟ ({spec.description_ckb or spec.name})"
         return risk, text
+
+    def full_authority(self) -> bool:
+        """The user gave SAM full authority (the broker's ``full_authority``;
+        no broker or no answer = False: routine actions then ask)."""
+        check = getattr(self.confirm_broker, "full_authority", None)
+        try:
+            return bool(check()) if callable(check) else False
+        except Exception:  # noqa: BLE001 - unknown = ask
+            return False
+
+    def note_authority(self, tool_name: str, question_ckb: str, source: str) -> None:
+        """Log a routine question that was not asked (activity kind confirm, source authority)."""
+        if self.db is None:
+            return
+        try:
+            self.db.log_activity("confirm", tool_name, ok=True, summary=str(question_ckb)[:300], source="authority",
+                                 detail={"asked": False, "via": source})
+        except Exception:  # noqa: BLE001
+            log.exception("activity log failed")
 
     async def ask_confirmation(self, question_ckb: str, detail: str, tool_name: str) -> bool:
         if self.confirm_broker is None:
@@ -361,10 +401,23 @@ class ToolRegistry:
 
         risk, question = self.risk_of(name, args)
         scope = taint.current()
-        if risk == "safe" and scope is not None:
+        if risk in ("safe", "routine") and scope is not None:
+            # data from the web/screen was read in this turn: its gates always ask
             gated = taint.check(name, args, scope)
             if gated is not None:
                 risk, question = gated  # type: ignore[assignment]
+        if risk == "routine" and scope is not None and scope.tainted and name not in ROUTINE_WHEN_TAINTED:
+            # Full authority is the user's, never a web page's or a screen's: after untrusted text
+            # entered this turn, an ordinary action that can run code or change files asks again
+            # (e.g. a PowerShell download-and-start or unsandboxed run_python an injected page asked for).
+            risk = "confirm"
+        acted: list[str] = []
+        if risk == "routine":
+            if self.full_authority():
+                acted.append(question or name)
+                self.note_authority(name, question or name, source)
+            else:
+                risk = "confirm"
         if risk == "blocked":
             result = fail(question or f"'{name}' with these arguments is blocked by SAM's safety rules.",
                           blocked=True)
@@ -409,6 +462,11 @@ class ToolRegistry:
             self._running.pop(call_id, None)
         duration = (time.perf_counter() - started) * 1000.0
         taint.note(scope, name, result)
+        acted += ctx.acted
+        if acted:
+            data = dict(result.get("data") or {}) if isinstance(result.get("data"), dict) else {}
+            data.update({"acted_without_asking": True, "authority_note": AUTHORITY_NOTE})
+            result = {**result, "data": data}
         result = self._cap(self._redact_obj(result))
         if self.timing is not None:
             self.timing.record(f"tool:{name}", duration, kind="tool", turn_id=call_id, ok=result["ok"], source=source)
@@ -495,4 +553,5 @@ class ToolRegistry:
         return count
 
 
-__all__ = ["tool", "ToolSpec", "ToolContext", "ToolRegistry", "ok", "fail", "validate_args", "Risk"]
+__all__ = ["tool", "ToolSpec", "ToolContext", "ToolRegistry", "ok", "fail", "validate_args", "Risk", "RISKS",
+           "AUTHORITY_NOTE"]

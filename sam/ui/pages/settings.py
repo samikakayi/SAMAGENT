@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QGridLayout, QHBoxLayout
 
 from ...events import ComponentStatus, Error, SettingsChanged
 from .. import theme
-from ..strings import GEMINI_VOICES, ckb_digits, en, tr, tr_or
+from ..strings import GEMINI_VOICES, STRINGS, ckb_digits, en, tr, tr_or
 from ..widgets import Card, StatusDot, ToggleSwitch, accessible
 from . import SCROLL_GUTTER, Page, scroll_area
 
@@ -42,6 +42,22 @@ KEY_ROWS: tuple[tuple[str, str | None, str | None], ...] = (
 HOTKEY_RE = re.compile(r"^((ctrl|alt|shift|win)\+){1,3}([a-z0-9]|space|f([1-9]|1[0-9]|2[0-4])|enter|tab)$")
 STATUS_TO_STATE = {"connected": "ok", "auth_failed": "down", "rate_limited": "degraded", "unreachable": "down",
                    "unconfigured": "unconfigured", "error": "down"}
+# «دەسەڵاتی تەواو — بێ پرسیار» (setting safety.full_authority; the user, 2026-09-25: "don't ask me yes or
+# no, you have authority over everything"). Registered here so the control is self-contained.
+AUTHORITY_KEY = "safety.full_authority"
+AUTHORITY_STRINGS: dict[str, tuple[str, str]] = {
+    "set.safety": ("دەسەڵات و پرسیار", "Authority and questions"),
+    "set.authority": ("دەسەڵاتی تەواو — بێ پرسیار", "Full authority - no questions"),
+    "set.authority.note": ("سام کارە ئاساییەکان بێ پرسیار دەکات و دەڵێت چی کرد. هێشتا تەنها یەک پرسیاری کورت "
+                           "دەکات پێش: سڕینەوەی هەمیشەیی یان زیاتر لە ٢٠ فایل، فۆرمات و ڕێجستری و ئاسایش، ناردنی "
+                           "نامە، پارە، وشەی نهێنی. کڕین و فرۆشتن هەرگیز.",
+                           "SAM does ordinary things without asking and says what it did. It still asks one short "
+                           "question before permanent or mass deletion, disk/registry/security changes, sending "
+                           "messages, money or passwords. Trading orders: never."),
+    "a11y.authority": ("دەسەڵاتی تەواو، بێ پرسیار", "Full authority, no yes/no questions"),
+}
+for _key, _value in AUTHORITY_STRINGS.items():
+    STRINGS.setdefault(_key, _value)
 
 
 class KeyRow(QWidget):
@@ -206,6 +222,7 @@ class SettingsPage(Page):
         self.voice_profile = VoiceProfileCard(app, bridge)
         col.addWidget(self.voice_profile)
         col.addWidget(self._trading_card())
+        col.addWidget(self._safety_card())
         col.addWidget(self._privacy_card())
         col.addWidget(self._about_card())
         col.addStretch(1)
@@ -374,6 +391,24 @@ class SettingsPage(Page):
         mt5.addWidget(self.mt5_button)
         card.body.addSpacing(4)
         card.body.addLayout(mt5)
+        return card
+
+    def _safety_card(self) -> Card:
+        card = Card(tr("set.safety"))
+        line = QHBoxLayout()
+        self.authority = ToggleSwitch()
+        self.authority.setChecked(bool(self.cfg(AUTHORITY_KEY, True)))
+        # toggled, not clicked: UI Automation's Toggle works too (settings accessibility rule)
+        self.authority.toggled.connect(lambda on: self._set(AUTHORITY_KEY, bool(on)))
+        accessible(self.authority, "a11y.authority", object_name="full_authority")
+        line.addWidget(_key_label(tr("set.authority")))
+        line.addStretch(1)
+        line.addWidget(self.authority)
+        card.body.addLayout(line)
+        note = QLabel(tr("set.authority.note"))
+        note.setObjectName("Faint")
+        note.setWordWrap(True)
+        card.body.addWidget(note)
         return card
 
     def _privacy_card(self) -> Card:
@@ -573,6 +608,10 @@ class SettingsPage(Page):
             if ev.key == "voice.selftest":
                 self.selftest_result.setText(self._selftest_text(ev.value))
                 self.selftest_result.setToolTip(self.selftest_details(ev.value))
+            elif ev.key == AUTHORITY_KEY and bool(ev.value) != self.authority.isChecked():
+                self.authority.blockSignals(True)
+                self.authority.setChecked(bool(ev.value))
+                self.authority.blockSignals(False)
             elif ev.key == "voice.engine" and ev.value in self.engine_buttons:
                 self.engine_buttons[ev.value].setChecked(True)
             elif ev.key == "voice.hotkey" and isinstance(ev.value, str) and not self.hotkey.hasFocus():

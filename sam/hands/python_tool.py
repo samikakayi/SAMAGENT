@@ -358,7 +358,9 @@ def _classify(args: dict[str, Any]) -> tuple[str, str | None]:
     if verdict.syntax_error:
         return "safe", None               # nothing will run: the handler reports the error
     if verdict.risk == "confirm":
-        return "confirm", verdict.question_ckb()
+        # code that imports system/network modules or writes outside its folder: ordinary for a user who
+        # gave SAM full authority (routine); credentials, key stores and orders stay blocked (the scan)
+        return "routine", verdict.question_ckb()
     if verdict.risk == "blocked":
         return "blocked", "Blocked by SAM's safety rules: " + "; ".join(verdict.reasons[:3])
     return "safe", None

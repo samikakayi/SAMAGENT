@@ -19,6 +19,14 @@ Rules added by the repair review (2026-09-24, measured):
   were 73% of every request, 3,863 of 5,312 tokens, and drove Groq's 429s).
 - Rounds have deadlines; when no model can word a result, ``outcome.py``
   says the tool's own honest result in Sorani.
+
+One answer per request (live session 2026-09-25): two utterances close
+together ran two model turns side by side and SAM answered both («ئێستا دەیکەم.
+باشە، دەنگەکەم بێدەنگ کرد...» and «باشە. چارتم بۆ 100 ... گۆڕدرا.»). A new user
+turn now replaces an older one that is still thinking (no tool started): the
+older one stops at once and says nothing, and the newest answers with the
+older words in front of its own. An older turn whose tool already ran is not
+undone: it says that tool's own result once, briefly, with no second model round.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 from ..events import Error, Transcript
@@ -67,8 +76,21 @@ MORE_TOOLS = "more_tools"
 # 2026-09-25): questions about his own documents must find their pages at once.
 CORE_TOOLS = ["open_app", "tv_open", "tv_set_chart", "analyze_market", "draw_on_chart", "clear_my_drawings",
               "get_price", "set_alert", "list_alerts", "cancel_alert", "web_search", "remember", "recall",
-              "knowledge_search", "delegate_task", "window_control", "system_control", "stop_all"]
+              "knowledge_search", "delegate_task", "window_control", "system_control", "stop_all", "stop_speaking"]
 SHORT_REPLY_CHARS = 40
+
+
+@dataclass
+class TurnState:
+    """One running ``respond_stream`` (for replacing a turn a newer one overtook)."""
+
+    text: str
+    tool_started: bool = False
+    superseded: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class Superseded(Exception):
+    """A newer user turn replaced this one while it waited for a model."""
 
 
 class AckText(str):
@@ -96,6 +118,30 @@ async def more_tools(ctx: ToolContext, tools: list[str] | None = None, need: str
     wanted = [n for n in (tools or []) if n in known] or known
     return ok("These tools are attached to your next step: " + ", ".join(wanted) + ". Call the one you need now.",
               tools=wanted)
+
+
+STOP_SPEAKING = "stop_speaking"
+
+
+@tool(STOP_SPEAKING,
+      description="Stop SAM's own voice at once. Use it when the user tells YOU to be quiet («بێدەنگ بە», "
+                  "«دەنگت بنەکەرە», «دەنگ مەکە», «قسە مەکە», 'be quiet', 'stop talking'). It never touches the "
+                  "computer's volume: system_control changes the Windows volume only when the user names the "
+                  "computer, Windows or 'volume'.",
+      description_ckb="بێدەنگبوونی دەنگی سام", risk="safe", blocking=True, timeout_s=10,
+      examples_ckb=("بێدەنگ بە", "دەنگت بنەکەرە", "دەنگ مەکە"))
+async def stop_speaking(ctx: ToolContext) -> dict[str, Any]:
+    """Live session 2026-09-25: «کوڕە دەنگی بنەکەرە!» ("hey, be quiet") made the model
+    mute the Windows master volume. SAM's own speech is the voice engine's
+    ``stop_speaking`` (docs/CONTRACTS.md 3.1); the computer's volume stays as it is."""
+    voice = getattr(ctx.app, "voice", None)
+    stopper = getattr(voice, "stop_speaking", None)
+    if stopper is not None:
+        try:
+            await stopper()
+        except Exception:  # noqa: BLE001 - being quiet must never fail loudly
+            log.exception("stop_speaking failed")
+    return ok("باشە، بێدەنگ بووم.", own_voice=True, computer_volume_changed=False)
 
 
 def core_tool_names(app: Any) -> list[str]:
@@ -249,9 +295,16 @@ class Responder:
         self.app.bus.publish(Transcript(role="user", text=text, source=source, conversation_id=conversation_id))
         scope = taint.begin(text)
         mode = "text" if source == "text" else "voice"
+        state = TurnState(text=text)
+        earlier = self._supersede_older(state)
         # Common commands need no model at all (fastpath.py / intents.py).
         intent = fastpath.intent_for(self.app, text)
+        if intent is None and earlier:
+            # «ترەیدینگ ڤیو» ... «بکەرەوە»: the replaced words and the new ones may be one command
+            intent = fastpath.intent_for(self.app, " ".join([*earlier, text]))
         messages = [] if intent is not None else self._messages(conversation_id, text, mode)  # type: ignore[attr-defined]
+        if earlier and messages:
+            _merge_earlier(messages, earlier)
         max_rounds = max(1, int(self.app.config.get("conversation.max_tool_rounds", 6) or 6))
         streaming = bool(self.app.config.get("conversation.stream", False))
         acknowledge = mode == "voice" and bool(self.app.config.get("conversation.voice_ack", True))
@@ -286,12 +339,21 @@ class Responder:
             """The honest result when the model gave no words (outcome.py)."""
             return SORANI_NOT_UNDERSTOOD if last is None else tool_sentence(*last)
 
+        ran: list[tuple[str, dict[str, Any], dict[str, Any]]] = []     # every tool that ran (not more_tools)
+
+        def proceed() -> bool:
+            """Right before a tool runs: False when a newer turn replaced this one."""
+            if state.superseded.is_set() and not state.tool_started:
+                return False
+            state.tool_started = True
+            return True
+
         # A turn in progress: background model calls wait for a pause (budget.py).
         self.active_turns = int(getattr(self, "active_turns", 0) or 0) + 1
         try:
             if intent is not None:
                 turn.mark("fastpath", intent=intent.name)
-                async for kind, piece in fastpath.run(self.app, intent, source=source):
+                async for kind, piece in fastpath.run(self.app, intent, source=source, proceed=proceed):
                     if kind == "ack":
                         if acknowledge:
                             yield emit(piece, ack=True)
@@ -307,6 +369,8 @@ class Responder:
             if local_ack:
                 yield emit(local_ack, ack=True)
             for round_no in range(max_rounds + 1):
+                if state.superseded.is_set():
+                    raise Superseded()
                 tool_choice = "none" if round_no == max_rounds else None
                 after_tools = round_no > 0
                 tools = self._tools_for_round(extra)
@@ -318,8 +382,8 @@ class Responder:
                 calls: list[ToolCall] = []
                 try:
                     if streaming:
-                        async for piece, response, calls in self._streamed_round(
-                                messages, ladder, tools, tool_choice, turn, chunker):
+                        async for piece, response, calls in _until(state, self._streamed_round(
+                                messages, ladder, tools, tool_choice, turn, chunker)):
                             if piece:
                                 said = True
                                 yield emit(piece)
@@ -327,9 +391,9 @@ class Responder:
                         # After a tool with its own Sorani result, no cold local round (up to
                         # 150 s): if no cloud model can word it, that result is said at once.
                         local = False if after_tools and last is not None and own_sentence(*last) else None
-                        async for kind, value in self._ask_announcing(
+                        async for kind, value in _until(state, self._ask_announcing(
                                 messages, ladder, tools, tool_choice, turn, deadline, local,
-                                announce=acknowledge and not local_acked):
+                                announce=acknowledge and not local_acked)):
                             if kind == "ack":
                                 local_acked = True
                                 yield emit(value, ack=True)
@@ -371,6 +435,8 @@ class Responder:
                     break
                 if response is None:
                     response = LLMResponse(text="", tool_calls=calls)
+                if state.superseded.is_set():
+                    raise Superseded()
                 if acknowledge and not parts:
                     # Speak at once instead of staying silent through the tool
                     # and the (slower, quality-first) wording round.
@@ -380,6 +446,10 @@ class Responder:
                 done_now: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
                 for call in calls:
                     args = clean_tool_args(self.app.tools, call.name, call.arguments)
+                    if call.name != MORE_TOOLS:
+                        if state.superseded.is_set():
+                            raise Superseded()        # no new action after a newer request came
+                        state.tool_started = True
                     result = await self._run_tool(call, source, seen)
                     if call.name == MORE_TOOLS:
                         # Only attaches tools: it is never the outcome the user hears.
@@ -387,8 +457,11 @@ class Responder:
                     else:
                         last = (call.name, args if isinstance(args, dict) else {}, result)
                         done_now.append(last)
+                        ran.append(last)
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
                                      "content": json.dumps(result, ensure_ascii=False, default=str)})
+                if state.superseded.is_set():
+                    raise Superseded()           # a newer request came: say this result briefly, no wording round
                 own = self._local_outcome(response, done_now, extra)
                 if own:
                     # The local brain picked the tool: its own Sorani result is the answer
@@ -401,7 +474,19 @@ class Responder:
                 # Never a blanket "done" when no tool ran.
                 yield emit(outcome())
             completed = True
+        except Superseded:
+            # A newer request replaced this turn. Nothing ran: silence (the newest answers).
+            # A tool ran: its own result, once and briefly -- no second model round.
+            turn.mark("superseded", tools=len(ran))
+            passages = []
+            if not ran:
+                parts.clear()                 # at most an acknowledgement was heard: not a reply to store
+            else:
+                for piece in [*chunker.feed(brief_outcome(ran)), *chunker.flush()]:
+                    yield emit(piece)
+            completed = bool(ran)
         finally:
+            self._forget_turn(state)
             self.active_turns = max(0, int(getattr(self, "active_turns", 1) or 1) - 1)
             reply_text = " ".join(parts).strip()
             if reply_text and passages and said:
@@ -412,6 +497,26 @@ class Responder:
                                                 conversation_id=conversation_id))
             if own_turn:
                 turn.finish(completed=completed)
+
+    def _supersede_older(self, state: TurnState) -> list[str]:
+        """Register ``state``; every older running turn is told a newer one came.
+        Returns the words of those that had not started a tool yet (they stop and
+        say nothing; the newest answers them together with its own words)."""
+        running: list[TurnState] = self.__dict__.setdefault("_running_turns", [])
+        earlier: list[str] = []
+        said_now = normalize_ckb(state.text, strip_punct=True)
+        for older in running:
+            older.superseded.set()
+            words = normalize_ckb(older.text, strip_punct=True)
+            if not older.tool_started and words and words not in said_now:   # the cascade may carry it already
+                earlier.append(older.text)
+        running.append(state)
+        return earlier
+
+    def _forget_turn(self, state: TurnState) -> None:
+        running = self.__dict__.get("_running_turns") or []
+        if state in running:
+            running.remove(state)
 
     async def _local_ack(self, mode: str) -> str:
         """A spoken «one moment» when this turn will wait for a cold local
@@ -636,6 +741,61 @@ class Responder:
         return result
 
 
-__all__ = ["Responder", "AckText", "AnswerText", "more_tools", "core_tool_names", "clean_tool_args", "CORE_TOOLS", "MORE_TOOLS",
+def _merge_earlier(messages: list[dict[str, Any]], earlier: list[str]) -> None:
+    """The replaced turns' words go in front of the newest (once): the history
+    may already end with them as the previous user message."""
+    last = messages[-1] if messages else None
+    if last is None or last.get("role") != "user" or not isinstance(last.get("content"), str):
+        return
+    content = last["content"]
+    missing = [t for t in earlier if normalize_ckb(t, strip_punct=True) not in normalize_ckb(content, strip_punct=True)]
+    if missing:
+        last["content"] = "\n".join([*missing, content])
+
+
+def brief_outcome(ran: list[tuple[str, dict[str, Any], dict[str, Any]]]) -> str:
+    """One short sentence per tool that ran (the tools' own Sorani results)."""
+    sentences: list[str] = []
+    for item in ran:
+        sentence = own_sentence(*item) or tool_sentence(*item)
+        if sentence and sentence not in sentences:
+            sentences.append(sentence)
+    return " ".join(sentences)
+
+
+async def _until(state: TurnState, stream: Any) -> AsyncIterator[Any]:
+    """Iterate ``stream`` until it ends, or raise ``Superseded`` as soon as a
+    newer user turn replaces ``state`` (the pending model request is cancelled)."""
+    iterator = stream.__aiter__()
+    stopper = asyncio.ensure_future(state.superseded.wait())
+    step: asyncio.Future[Any] | None = None
+    try:
+        while True:
+            step = asyncio.ensure_future(iterator.__anext__())
+            await asyncio.wait({step, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if not step.done():
+                raise Superseded()
+            try:
+                value = step.result()
+            except StopAsyncIteration:
+                return
+            yield value
+    finally:
+        stopper.cancel()
+        if step is not None and not step.done():
+            # superseded, or the consumer itself was cancelled (the cascade cut the reply):
+            # the model request must not keep running in the background
+            step.cancel()
+            await asyncio.gather(step, return_exceptions=True)
+        closer = getattr(iterator, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001 - the stream is abandoned either way
+                pass
+
+
+__all__ = ["Responder", "AckText", "AnswerText", "more_tools", "stop_speaking", "core_tool_names", "clean_tool_args",
+           "CORE_TOOLS", "MORE_TOOLS", "STOP_SPEAKING", "TurnState", "Superseded", "brief_outcome",
            "ACKS_DO", "ACKS_LOOK", "SORANI_NO_MODEL", "SORANI_CUT_OFF", "SORANI_DONE", "SORANI_NOT_DONE",
            "SORANI_NOT_UNDERSTOOD"]

@@ -129,7 +129,7 @@ POSITIVE: list[Row] = [
     ("ڕاوەستە", "stop", {}),
     ("بەسە", "stop", {}),
     ("هەمووی ڕابگرە", "stop", {}),
-    ("بێدەنگ بە", "stop", {}),
+    ("بێدەنگ بە", "quiet", {}),           # SAM's own voice (2026-09-25: was "stop")
     ("سام بوەستە", "stop", {}),
     ("stop", "stop", {}),
     ("stop everything", "stop", {}),
@@ -298,7 +298,7 @@ HELD_OUT: list[Row] = [
     ("remove all alerts", "cancel_alerts", {"alert_id": "all"}),
     ("ڕابگرە", "stop", {}),
     ("بەسە ئیتر", "stop", {}),
-    ("be quiet", "stop", {}),
+    ("be quiet", "quiet", {}),            # relabelled 2026-09-25: SAM's own voice, not stop_all
     ("cancel", "stop", {}),
     ("نرخی زێڕ لە بازاڕی سلێمانی چەندە", None, {}),
     ("بۆچی بیتکۆین بەرز بووەوە", None, {}),
@@ -372,7 +372,7 @@ REVIEW_HELD_OUT: list[Row] = [
     ("زێڕی ٢٤ چەندە", None, {}), ("هێڵەکانی زێڕ بسڕەوە", None, {}), ("how much is gold worth in dinars", None, {}),
     # true commands (recall)
     ("cancel all my alerts", "cancel_alerts", {"alert_id": "all"}), ("delete alert 7", "cancel_alerts", {"alert_id": "7"}),
-    ("stop", "stop", {}), ("cancel that", "stop", {}), ("کپ بە", "stop", {}),
+    ("stop", "stop", {}), ("cancel that", "stop", {}), ("کپ بە", "quiet", {}),
     ("open task manager", "open_app", {"name": "Task Manager"}),
     ("زیو لەسەر ٣٠ خولەک پیشان بدە", "set_chart", {"timeframe": "M30"}),
     ("show gold on 4 hours", "set_chart", {"timeframe": "H4"}), ("نرخی نەوت چەندە", "price", {}),
@@ -405,7 +405,114 @@ REVIEW_PROBES: list[Row] = [
     ("زێڕ بە چەند مامەڵە دەکرێت لە سلێمانی", None, {}),
 ]
 
-CORPUS: list[Row] = POSITIVE + NEGATIVE + HELD_OUT + REVIEW_HELD_OUT + REVIEW_PROBES
+# The user's live session (2026-09-25, KurdishTTS STT transcripts from the DB) and colloquial
+# variants written for it: Sulaymani and Hawleri spellings, «لۆ» for «بۆ», dropped letters, STT
+# spellings of TradingView («ترێیت ملیۆم») and of the chart («چار», «چاوتی»), fillers and insults
+# around a command, «گوڵ» as gold only next to a chart/price/timeframe word, and "SAM, be quiet"
+# (``quiet`` = SAM's own voice; the Windows volume only when the computer is named).
+SESSION_2026_09_25: list[Row] = [
+    ("وەڵاهی جارێ ترێیت ملیۆم لۆ بکەوە بڕۆ سەر چار چی دەکەی؟", "open_tradingview", {}),
+    # STT wrote "100" for part of «گوڵت»: an unknown word is never guessed; the model answers and
+    # tv_set_chart refuses '100' as a symbol (tests/test_trading_chart_tools.py)
+    ("بڕۆ 100 چار 3 خولەکی یەکسەر لە گوڵت.", None, {}),
+    ("کڕۆکڕۆک قەشمەر بڕۆ سەر چاوتی گوڵ", "set_chart", {"symbol": "گوڵ"}),
+    ("کوڕە دەنگی بنەکەرە!", "quiet", {}),
+]
+COLLOQUIAL: list[Row] = [
+    ("ترەیدینگ ڤیوم لۆ بکەوە", "open_tradingview", {}),
+    ("ترێدینگ ڤیووم بکەرەوە", "open_tradingview", {}),
+    ("ترێدین ڤیو بکەوە", "open_tradingview", {}),
+    ("ترەیدینگ ڤیو لۆم بکەوە", "open_tradingview", {}),
+    ("تریدینگ ڤیو بکەوە", "open_tradingview", {}),
+    ("ترێیت ڤیو بکەرەوە", "open_tradingview", {}),
+    ("ترێیت ملیۆم بکەوە", "open_tradingview", {}),
+    ("بڕۆ سەر چارت", "open_tradingview", {}),
+    ("کوڕە ترەیدینگ ڤیو بکەوە", "open_tradingview", {}),
+    ("ترەیدینگ ڤیو بکەوە ئیتر", "open_tradingview", {}),
+    ("بڕۆ سەر چارتی زێڕ", "set_chart", {"symbol": "زێڕ"}),
+    ("بڕۆ سەر چارتی گوڵت", "set_chart", {"symbol": "گوڵت"}),
+    ("بڕۆ سەر چاوتی گۆڵد", "set_chart", {"symbol": "گۆڵد"}),
+    ("برۆ سەر چارتی زێڕ", "set_chart", {"symbol": "زێڕ"}),
+    ("بچۆ سەر چارتی بیتکۆین", "set_chart", {"symbol": "بیتکۆین"}),
+    ("چارتی گوڵ بکەوە", "set_chart", {"symbol": "گوڵ"}),
+    ("چارتی ذهب پیشان بدە", "set_chart", {"symbol": "ذهب"}),
+    ("گوڵ لەسەر ١٥ خولەک", "set_chart", {"symbol": "گوڵ", "timeframe": "M15"}),
+    ("زێڕ لەسەر ٣ خولەکی", "set_chart", {"timeframe": "M3"}),
+    ("گۆڵد لەسەر 3 خولەکی دابنێ", "set_chart", {"timeframe": "M3"}),
+    ("گۆڵت لەسەر ٣ خولەک پیشان بدە", "set_chart", {"symbol": "گۆڵت", "timeframe": "M3"}),
+    ("چارتەکە بکە بە سێ خولەک", "set_chart", {"timeframe": "M3"}),
+    ("بیکە بە پازدە خولەکی", "set_chart", {"timeframe": "M15"}),
+    ("چارتەکە لۆ بکە بە پازدە خولەک", "set_chart", {"timeframe": "M15"}),
+    ("گۆڵت لەسەر یەک سەعات پیشان بدە", "set_chart", {"timeframe": "H1"}),
+    ("چارتەکە بکە بە سەعاتێک", "set_chart", {"timeframe": "H1"}),
+    ("لە چارتەکە بیگۆڕە لۆ یەک سەعات", "set_chart", {"timeframe": "H1"}),
+    ("زێڕ لەسەر ٤ سەعاتی پیشان بدە", "set_chart", {"timeframe": "H4"}),
+    ("چارتەکە بکە بە چار سەعات", "set_chart", {"timeframe": "H4"}),
+    ("بڕۆ سەر چار ٤ سەعاتی", "set_chart", {"timeframe": "H4"}),
+    ("زێڕ بخەرە سەر چوار سەعات", "set_chart", {"timeframe": "H4"}),
+    ("زێڕ لەسەر نیو سەعات", "set_chart", {"timeframe": "M30"}),
+    ("گوڵد لەسەر ڕۆژانە پیشان بدە", "set_chart", {"timeframe": "D1"}),
+    ("ئاڵتوون لەسەر پازدە خولەک پیشان بدە", "set_chart", {"timeframe": "M15"}),
+    ("نرخی گوڵ چەندە", "price", {"symbol": "گوڵ"}),
+    ("نرخی گوڵت چەندە", "price", {}),
+    ("نرخی ئاڵتون چەندە", "price", {}),
+    ("وەڵاهی نرخی زێڕ چەندە", "price", {}),
+    ("کوڕە نرخی زێڕ چەندە", "price", {}),
+    ("کرۆم لۆ بکەوە", "open_app", {"name": "Google Chrome"}),
+    ("تێلێگرام لۆم بکەوە", "open_app", {"name": "Telegram"}),
+    ("جارێ کرۆم بکەوە", "open_app", {}),
+    ("شیکاری گوڵ بکە", "analyze", {"symbol": "گوڵ"}),
+    ("هێڵی پشتگیری و بەرگری گوڵت بکێشە", "draw_levels", {"symbol": "گوڵت"}),
+    ("هێڵەکانت لابە کوڕە", "clear_drawings", {}),
+    ("ئالێرتەکانم پیشان بدە چی دەکەی", "list_alerts", {}),
+    ("دەنگت بنەکەرە", "quiet", {}),
+    ("بێدەنگ بە ئیتر", "quiet", {}),
+    ("دەنگ مەکە", "quiet", {}),
+    ("قسە مەکە", "quiet", {}),
+    ("stop talking", "quiet", {}),
+    ("shut up", "quiet", {}),
+    ("کوڕە بەسە", "stop", {}),
+    ("قەشمەر بوەستە", "stop", {}),
+    # --- must go to the model ---
+    ("گوڵ پیشان بدە", None, {}),                 # "show the flower": no chart / price / timeframe word
+    ("گوڵێک بکڕە", None, {}),
+    ("گوڵ چەندە", None, {}),
+    ("گوڵێکی جوانە", None, {}),
+    ("گۆڵ بکەرەوە", None, {}),
+    ("گوڵەکان ئاو بدە", None, {}),
+    ("بڕۆ سەر گوڵ", None, {}),
+    ("بڕۆ سەر گوڵ و نرخەکەی بڵێ", None, {}),
+    ("گوڵت چییە", None, {}),
+    ("چاوت بکەرەوە", None, {}),                  # "open your eyes"
+    ("چاوم دێشێت", None, {}),
+    ("دەنگی کۆمپیوتەر بنەکەرە", None, {}),       # the computer's volume: system_control via the model
+    ("دەنگەکە کەم بکەرەوە", None, {}),
+    ("دەنگی ویندۆز بکوژێنەوە", None, {}),
+    ("volume down", None, {}),
+    ("دەنگت بەرز بکەرەوە", None, {}),
+    ("دەنگت خۆشە", None, {}),
+    ("باسی زێڕ مەکە", None, {}),
+    ("بێدەنگ مەبە", None, {}),
+    ("بۆچی بێدەنگی", None, {}),
+    ("تۆ بۆچی قسە ناکەیت", None, {}),
+    ("قسە بکە", None, {}),
+    ("بڕۆ", None, {}),
+    ("بڕۆ بۆ ماڵەوە", None, {}),
+    ("قەشمەر", None, {}),
+    ("کوڕە", None, {}),
+    ("کەر", None, {}),
+    ("وەڵاهی", None, {}),
+    ("چی دەکەی", None, {}),
+    ("چی دەکەی؟ قەشمەر", None, {}),
+    ("کرۆم چی دەکات", None, {}),
+    ("کرۆم مەکەوە", None, {}),
+    ("زێڕ لەسەر ٣", None, {}),
+    ("چارتەکە بکە بە ٧ خولەک", None, {}),
+    ("ترێیت ملیۆم", None, {}),
+    ("بڕۆ سەر چارت و زێڕ پیشان بدە", None, {}),
+]
+
+CORPUS: list[Row] = POSITIVE + NEGATIVE + HELD_OUT + REVIEW_HELD_OUT + REVIEW_PROBES + SESSION_2026_09_25 + COLLOQUIAL
 
 
 def evaluate(match: Any, rows: list[Row] | None = None) -> dict[str, Any]:
@@ -435,4 +542,4 @@ def evaluate(match: Any, rows: list[Row] | None = None) -> dict[str, Any]:
 
 
 __all__ = ["CORPUS", "POSITIVE", "NEGATIVE", "HELD_OUT", "HELD_OUT_FIRST_RUN", "REVIEW_HELD_OUT", "REVIEW_FIRST_RUN",
-           "REVIEW_PROBES", "evaluate"]
+           "REVIEW_PROBES", "SESSION_2026_09_25", "COLLOQUIAL", "evaluate"]
