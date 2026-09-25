@@ -98,6 +98,11 @@ VOICE_DEFAULTS: dict[str, Any] = {
     "voice.tts_chunk_gap_s": 3.0,                    # Gemini TTS: a longer gap after audio ends the piece
     "voice.stt_gemini_timeout_s": 8.0,
     # Listening windows (listening.py) and the near-field gate (gate.py).
+    # End of speech for the local endpointer (cascade and Live's hybrid VAD): the
+    # real use of 2026-09-25 split «... لۆ بکەوە» + «بڕۆ سەر چار ...» at a ~0.7 s
+    # pause with 600 ms (voice.silence_ms stays Live's server-side VAD setting).
+    "voice.end_silence_ms": 900,
+    "voice.merge_window_s": 1.2,                     # speech this soon after an utterance continues it (frames.py)
     "voice.start_timeout_s": 8,                      # a click opens listening for one utterance
     "voice.followup_s": 6,                           # after SAM's answer: one more utterance ...
     "voice.followup_turns": 2,                       # ... at most this many per click (listening.py)
@@ -109,9 +114,10 @@ VOICE_DEFAULTS: dict[str, Any] = {
     "voice.gate_min_voiced_ms": 300,
     "voice.gate_user_level_db": None,                # measured by the enrollment / learned from turns
     "voice.gate_learn": True,
-    # «تەنها دەنگی من» (voiceprint.py): on by default once a voiceprint exists.
+    # «تەنها دەنگی من» (voiceprint.py): on by default once a voiceprint exists; it
+    # gates follow-ups / barge-ins / always-listening, never the first utterance after a click.
     "voice.only_my_voice": True,
-    "voice.only_my_voice_sensitivity": "normal",     # low 0.40 | normal 0.50 | high 0.60
+    "voice.only_my_voice_sensitivity": "normal",     # low 0.15 | normal 0.20 | high 0.28, then owner-adaptive
     "voice.speaker_model_path": "",
 }
 
@@ -250,13 +256,30 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         return selftest_verdict(self.app.config.get("voice.selftest")) == "pass"
 
     async def toggle_listening(self) -> bool:
+        """The island click / the hotkey: an explicit activation (the next
+        utterance is the owner's). Right after «دەنگەکەت نەناسرایەوە — کلیک
+        بکە» a click while listening re-opens the owner's turn instead of
+        closing listening (listening.py)."""
         if self.listening:
+            if self.rearm_on_click():
+                # SAM goes quiet: over his voice the owner's words would be a barge-in (voiceprint-checked).
+                self.stop_speaking_now()
+                self._open_window(explicit=True)
+                self._publish("listening", detail="rearm", force=True)
+                try:
+                    self.app.db.log_activity("voice", "owner_rearm", ok=True, source="voice", summary="click after hint")
+                except Exception:  # noqa: BLE001
+                    pass
+                return True
             await self.stop_listening()
             return False
-        await self.start_listening()
+        await self.start_listening(explicit=True)
         return self.listening
 
-    async def start_listening(self) -> None:
+    async def start_listening(self, *, explicit: bool = True) -> None:
+        """``explicit``: the user asked (click / hotkey / the panel's mic
+        button): the first utterance is the owner by definition. A window
+        opened for a confirmation question or by unmuting passes False."""
         async with self._get_lock():
             if self.listening:
                 return
@@ -280,14 +303,14 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
             self.gate.configure(GateSettings.from_config(self.app.config))
             min_speech = max(int(self.app.config.get("voice.min_speech_ms", 250)),
                              int(self.app.config.get("voice.gate_min_voiced_ms", 300)))
-            self._endpointer = Endpointer(frame_ms=block_ms, silence_ms=int(self.app.config.get("voice.silence_ms", 600)),
+            self._endpointer = Endpointer(frame_ms=block_ms, silence_ms=self._end_silence_ms(),
                                           min_speech_ms=min_speech,
                                           max_utterance_s=float(self.app.config.get("voice.max_utterance_s", 30)))
             self._echo_guard = self._echo_guard_wanted()
             self._utt = None
             self.listening = True
             self.engine_name = engine
-            self._open_window()
+            self._open_window(explicit=explicit)
             self.cascade.start()
             if engine == "cascade":
                 self._start_prewarm()
@@ -316,7 +339,7 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         else:
             self.muted = False
             if self._resume_after_mute:
-                await self.start_listening()
+                await self.start_listening(explicit=False)
             else:
                 self._publish("idle", force=True)
 
@@ -352,10 +375,21 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         return bool(await live.send_user_text(text))
 
     async def stop_speaking(self) -> None:
-        self.speaker.flush()
+        """Silence SAM at once (contract 3.1): the island's stop, ``stop_all``,
+        a spoken «بەسە» / «بوەستە» / «بێدەنگ بە», or the brain's "stop talking"
+        intent (real use 2026-09-25: «کوڕە دەنگی بنەکەرە!»). Queued audio,
+        fixed speech being read and every older turn's reply stop now; called
+        from inside a turn, that turn itself is not cut (its short answer may
+        still be said) and nothing is carried over to the next request. The
+        microphone is untouched (``set_muted`` closes it)."""
+        self.stop_speaking_now()
+
+    def stop_speaking_now(self) -> None:
+        """``stop_speaking`` for synchronous callers (same effect, no await)."""
+        self.speaker.gain = 1.0
         if self.live is not None:
             self.live.stop_output()
-        await self.cascade.stop_speaking()
+        self.cascade.stop_now(reason="stop_speaking")
 
     async def run_selftest(self) -> dict[str, Any]:
         from .selftest import run_selftest
@@ -383,6 +417,7 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
                         "error": getattr(self.speaker, "last_error", None)},
             "listening_window": self.listening_status(), "gate": self.gate.status(),
             "voiceprint": self.speaker_check.status(), "rests": rests(self.app).status(),
+            "turns": self.cascade.status(), "end_silence_ms": self._end_silence_ms(),
         }
 
     # -- hooks used by LiveVoice / CascadeVoice --------------------------------------------------------------
@@ -418,7 +453,8 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         classify = getattr(self.app.confirm, "classify_pending", None)
         if classify is not None and classify(text) is not None:
             return text
-        if self.requires_name():
+        continued = getattr(meta.get("continues"), "stage", "") in ("held", "replying", "merged")
+        if self.requires_name() and not continued:   # a continuation joins an utterance that had the name
             if starts_with_name(text):
                 self.named_request()
             elif not self.name_exempt(meta):
@@ -440,7 +476,33 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
             stored = self.app.config.get("voice.gate_user_level_db", None)
             if learned is not None and (not isinstance(stored, (int, float)) or abs(stored - learned) >= 1.0):
                 self.app.config.set("voice.gate_user_level_db", learned)
+        embed = meta.get("owner_embed")
+        if meta.get("owner") and embed is not None:
+            meta["owner_embed"] = None          # once per utterance
+            self.app.spawn(self._adopt_owner(embed, float(meta.get("speech_ms") or 0.0),
+                                             levels.get("p50_db")), "voice-owner-adapt")
         return text
+
+    async def _adopt_owner(self, embed: Any, speech_ms: float, level: Any) -> None:
+        """The owner's turn after a click produced words: it joins the
+        voiceprint (the last 10 owner utterances with the enrollment,
+        DPAPI-protected), and the follow-up threshold follows how the owner
+        scores against it (voiceprint.py)."""
+        try:
+            vector = await embed
+        except Exception as exc:  # noqa: BLE001 - adaptation is optional, but a broken model is reported
+            self.speaker_check.unavailable_reason = f"{type(exc).__name__}: {exc}"[:160]
+            self._voiceprint_unavailable()
+            return
+        learned = await self.speaker_check.learn_owner(vector, speech_ms=speech_ms)
+        if not learned:
+            return
+        try:
+            self.app.db.log_activity("voice", "voiceprint_adapted", ok=True, source="voice",
+                                     summary=f"score={learned['score']} n={learned['n']} level={level} "
+                                             f"threshold={learned['threshold']}"[:200])
+        except Exception:  # noqa: BLE001
+            pass
 
     def reset_user_level(self) -> dict[str, Any]:
         """Settings «ئاستی دەنگم لەبیر بکە»: forget the learned speech level."""
@@ -470,6 +532,12 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         await self.cascade.speak(text, source=source)
 
     # -- internals -----------------------------------------------------------------------------------------------
+    def _end_silence_ms(self) -> int:
+        try:
+            return max(300, int(self.app.config.get("voice.end_silence_ms", 900)))
+        except (TypeError, ValueError):
+            return 900
+
     def _get_lock(self) -> asyncio.Lock:
         if self._lock is None:
             self._lock = asyncio.Lock()
@@ -563,6 +631,7 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
             live, self.live = self.live, None
             if live is not None:
                 await live.close()
+            self.cascade.release_holds()    # a continuation that was being spoken will not end now
             if reason == "user":
                 await self.cascade.stop_speaking()
             self._utt = None
@@ -636,9 +705,11 @@ class VoiceEngine(EngineSupport, FramePipeline, ListeningPolicy, EnrollmentSuppo
         self.app.spawn(self.speak(event.text_ckb, interrupt=event.interrupt, source=event.source), "voice-speak")
 
     def _on_confirm_request(self, event: ConfirmRequest) -> None:
+        # Runs inside the turn that asked (cascade.REPLY_GEN is inherited by the
+        # task below): an older turn's question is not read out (cascade.speak).
         async def ask() -> None:
             if (self.app.config.get("voice.listen_on_confirm", True) and not self.listening and not self.muted):
-                await self.start_listening()
+                await self.start_listening(explicit=False)
             await self.speak(event.question_ckb, source="confirm")
         self.app.spawn(ask(), "voice-confirm")
 

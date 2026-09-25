@@ -141,7 +141,7 @@ class Island(QWidget):
         self._click = QTimer(self)
         self._click.setSingleShot(True)
         self._click.setInterval(min(QApplication.doubleClickInterval() if QApplication.instance() else 300, 300))
-        self._click.timeout.connect(self.toggleListeningRequested.emit)
+        self._click.timeout.connect(self._clicked)
         self._anim = QPropertyAnimation(self, b"expansion", self)
         self._anim.setDuration(260)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -254,6 +254,12 @@ class Island(QWidget):
     def expanded_target(self) -> bool:
         return (self._anim.endValue() or 0.0) > 0.5 if self._anim.state() else self._expansion > 0.5
 
+    def _clicked(self) -> None:
+        """A single click: listen (or, right after «کلیک بکە», re-open the owner's turn)."""
+        self._hints.clear_hint()
+        self.update()
+        self.toggleListeningRequested.emit()
+
     # -- events from the core (GUI thread, via QtBridge) ----------------------------------------------
     def handle_event(self, ev: Any) -> None:
         if isinstance(ev, VoiceState):
@@ -261,6 +267,8 @@ class Island(QWidget):
         elif isinstance(ev, LevelMeter):
             self.set_level(ev.source, ev.level)
         elif isinstance(ev, Caption):
+            if ev.role == "user":
+                self._hints.on_user_words()
             self.set_caption(ev.text, "user" if ev.role == "user" else
                              "system" if ev.role == "system" else "assistant", ev.final)
         elif is_notice(ev):

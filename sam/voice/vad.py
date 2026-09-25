@@ -11,7 +11,9 @@ webrtcvad (``webrtcvad-wheels``, imported lazily: 0.1 s) classifies 30 ms
 frames; an RMS floor stops it from triggering on hum. The ring-buffer trigger
 follows the py-webrtcvad example. v1's end-of-speech wait was 20 x 30 ms =
 0.6 s (sam_backend/wake.py:79) and the Live docs recommend 500-800 ms of
-silence, so the default is ``voice.silence_ms`` = 600.
+silence; the engine uses ``voice.end_silence_ms`` = 900 since the real use of
+2026-09-25, where 600 ms split one sentence at a ~0.7 s pause into two turns
+(frames.py also joins speech that resumes within ``voice.merge_window_s``).
 """
 
 from __future__ import annotations

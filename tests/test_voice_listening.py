@@ -119,7 +119,7 @@ async def voice(make_app, monkeypatch):
                 await asyncio.gather(task, return_exceptions=True)
 
 
-def say(mic: FakeMic, db: float = -20.0, frames: int = 30, pitch: int = 8, silence: int = 25) -> None:
+def say(mic: FakeMic, db: float = -20.0, frames: int = 30, pitch: int = 8, silence: int = 35) -> None:
     mic.push(frame_at(db, pitch=pitch), frames)
     mic.push(quiet_frame(), silence)
 
@@ -257,8 +257,9 @@ async def test_always_listening_needs_the_name_again_without_trust(voice):
     app.config.set("voice.always_listening", True)
     await eng.start_listening()
     say(mics[0])
-    assert await settle(lambda: len(log) == 1)
-    say(mics[0])
+    assert await settle(lambda: len(log) == 1 and eng.tts.texts)           # SAM answered
+    await asyncio.sleep(1.3)                                                # (a same-level continuation within
+    say(mics[0])                                                            #  voice.merge_window_s would join it)
     assert await settle(lambda: len(eng.stt.calls) == 2)
     await asyncio.sleep(0.1)
     assert log == ["سام، نرخی زێڕ چەندە؟"]
@@ -385,31 +386,46 @@ async def test_live_gets_no_audio_from_the_tv_and_the_user_utterance_with_stream
 
 
 async def test_live_holds_audio_until_the_voiceprint_matches(voice):
+    """The owner's turn after the click is sent without a voiceprint check;
+    after it, someone else close by is held back (nothing sent) and the user's
+    own voice goes through."""
     app, eng, mics, speaker, client, events = await voice(gemini=True, enrolled_pitch=8)
     await eng.start_listening()
     assert await settle(lambda: eng.live is not None and eng.live.ready)
     session = client.sessions[0]
+    say(mics[0], db=-20, frames=20, pitch=8)                                 # the owner's turn after the click
+    assert await settle(lambda: len(session.audio) >= 15)
+    sent = len(session.audio)
     say(mics[0], db=-20, frames=50, pitch=3)                                 # someone else, close by
     await asyncio.sleep(0.4)
-    assert session.audio == []
-    assert notices(events, "ignored")
+    assert len(session.audio) == sent
+    assert notices(events, "not_recognized")[-1].text_ckb == strings.VOICE_NOT_RECOGNIZED
     say(mics[0], db=-20, frames=50, pitch=8)                                 # the user
-    assert await settle(lambda: len(session.audio) >= 40)
+    assert await settle(lambda: len(session.audio) >= sent + 40)
 
 
 # -- (f) only my voice ------------------------------------------------------------------------------------------------------
 
 async def test_other_voices_cost_no_stt_when_a_voiceprint_exists(voice):
+    """After the owner's turn (never checked), a follow-up by another voice
+    costs no STT and shows «دەنگەکەت نەناسرایەوە — کلیک بکە» once; the
+    user's own follow-up is taken."""
     log: list[str] = []
-    app, eng, mics, speaker, _, events = await voice(llm_log=log, enrolled_pitch=8)
+    stt = FakeStt(["نرخی زێڕ چەندە؟", "ئەی زیو؟"])
+    app, eng, mics, speaker, _, events = await voice(llm_log=log, enrolled_pitch=8, stt=stt)
     await eng.start_listening()
-    say(mics[0], pitch=3)                                                    # family member at the headset
-    assert await settle(lambda: notices(events, "ignored"))
-    await asyncio.sleep(0.1)
-    assert eng.stt.calls == [] and log == []
-    assert eng.gate.background_db is not None                               # that talker now stays below
-    say(mics[0], pitch=8)
+    say(mics[0], pitch=8)                                                    # the owner's turn after the click
     assert await settle(lambda: log == ["نرخی زێڕ چەندە؟"])
+    assert await settle(lambda: eng.listening_status()["followup_open"])     # SAM answered: a follow-up window
+    say(mics[0], pitch=3)                                                    # family member at the headset
+    assert await settle(lambda: notices(events, "not_recognized"))
+    say(mics[0], pitch=3)                                                    # ... again: no second notice
+    assert await settle(lambda: len(app.db.query("SELECT 1 FROM activity WHERE name='not_my_voice'")) == 2)
+    assert len(stt.calls) == 1 and len(log) == 1
+    assert len(notices(events, "not_recognized")) == 1
+    assert eng.gate.background_db is not None                               # that talker now stays below
+    say(mics[0], pitch=8)                                                    # the user's follow-up
+    assert await settle(lambda: log == ["نرخی زێڕ چەندە؟", "ئەی زیو؟"])
     last = eng.speaker_check.last
     assert last is not None and last.ok and last.reason == "match"
 
@@ -426,9 +442,13 @@ async def test_speaker_check_thresholds_and_store(make_app):
     app = make_app()
     check = SpeakerCheck(app, embedder_factory=PitchEmbedder, store=plain_store(app))
     assert not check.enrolled and (await check.verify(b"")).reason == "not_enrolled"
-    assert check.threshold() == 0.5 and check.threshold(speech_ms=600) == 0.4
+    # Real use 2026-09-25: the owner scored 0.055-0.346 against his enrollment; 0.40 rejected him.
+    assert check.threshold() == 0.2 and check.threshold(speech_ms=600) == 0.15
     app.config.set("voice.only_my_voice_sensitivity", "high")
-    assert check.threshold() == 0.6
+    assert check.threshold() == 0.28
+    app.config.set("voice.only_my_voice_sensitivity", "low")
+    assert check.threshold() == 0.15 and check.threshold(speech_ms=600) == 0.10   # never below 0.10
+    app.config.set("voice.only_my_voice_sensitivity", "normal")
     check.store.save(PitchEmbedder().embed(frame_at(-20) * 20), model="fake", level_db=-21.0, clips=5,
                      consistency=0.8)
     check.forget_cache()
@@ -557,6 +577,7 @@ async def test_other_speech_while_sam_thinks_is_not_taken_without_a_voiceprint(v
     await eng.start_listening()
     say(mics[0])
     assert await settle(lambda: log == ["نرخی زێڕ چەندە؟"])
+    await asyncio.sleep(1.3)                                                # past voice.merge_window_s: not a continuation
     say(mics[0], pitch=3)                                                   # the TV while SAM thinks
     await asyncio.sleep(0.3)
     assert len(stt.calls) == 1 and log == ["نرخی زێڕ چەندە؟"]
@@ -640,5 +661,6 @@ async def test_a_voiceprint_that_cannot_run_is_reported_not_trusted(voice):
     await eng.start_listening()
     say(mics[0], pitch=3)                                                   # lets the speech through ...
     assert await settle(lambda: len(eng.stt.calls) == 1)
+    assert await settle(lambda: notices(events, "voiceprint"))
     assert notices(events, "voiceprint")[-1].text_ckb == strings.VOICEPRINT_UNAVAILABLE  # ... and says so
     assert not eng.speaker_check.usable and eng.speaker_check.status()["usable"] is False

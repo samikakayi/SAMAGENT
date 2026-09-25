@@ -22,12 +22,57 @@ real people on this PC, so real-voice margins will be smaller):
 CAM++ common_advanced with 2 threads on the first 3 s of speech: median 60 ms,
 p90 78 ms, max 100 ms per utterance (budget 150 ms); load 1.2 s (done in a
 thread when listening starts), +45 MB RSS. Equal-error threshold on the corpus
-0.385; different-persona pairs never above 0.383; the same voice with a second
-talker mixed in at +10 dB SNR still scored >= 0.589 (at 0 dB: 0.248). Hence
-thresholds: low 0.40 / normal 0.50 / high 0.60 (setting
-``voice.only_my_voice_sensitivity``). Utterances under 1 s of speech (a quick
-«بەڵێ») score lower (0.5 s crops: target min 0.397, non-target max 0.319), so
-they use threshold - 0.10.
+0.385; different-persona pairs never above 0.383.
+
+The REAL user (2026-09-25 morning, sam2.log + activity): enrolled with 5 clips
+(consistency 0.686, level -33.9 dBFS), then his own voice scored 0.055 / 0.346
+/ 0.212 / 0.224 at -36.4 / -25.9 / -13.4 / -25.6 dBFS and was rejected four
+times by the old threshold 0.40 -- calibrated on synthetic TTS voices read
+calmly; real speech through a real headset in a real room, louder and
+frustrated, scores far lower against a quiet enrollment. The policy is now
+(listening.py, frames.py):
+
+- the FIRST utterance after an explicit activation (island click / hotkey) is
+  the owner by definition: never rejected here (only the near-field gate
+  applies). Once its words are admitted it adapts the profile
+  (``learn_owner``): the stored vector is the weighted mean of the enrollment
+  (weight = 2 x its clips) and the last ``OWNER_KEEP`` (10) owner utterances
+  -- a bounded running average, stored DPAPI-protected like the enrollment;
+- the voiceprint gates only follow-ups, barge-ins and always-listening. Its
+  threshold is the base -- low 0.15 / normal 0.20 / high 0.28 (3 of the 4
+  rejected real scores pass 0.20) -- raised with how the owner really scores
+  against the CURRENT profile: ``max(base, min(q25 - margin, cap))`` over the
+  leave-one-out scores of the kept owner utterances (unbiased: they were never
+  selected by score; the minimum below 4 of them; normal: margin 0.15, cap
+  0.35); under 1 s of speech -0.05; never below 0.10;
+- loudness does not matter: every clip is normalised to -24 dBFS of active
+  speech (peak-limited) before embedding (``normalize_level``), enrollment and
+  verification alike.
+
+Measured with the real model on the offline corpus (no real recordings exist
+here; enrollment clean at -34 dBFS; use through a simulated room + headset
+channel -- band-limit, brighter vocal effort, reverb, noise at 18 dB SNR,
+optionally shouted at -13.4 dBFS and clipped -- which brings the owner's
+scores against the enrollment to 0.23-0.55, the real user's range; 6 voices,
+every rotation of which clips are the turns after a click; other voices =
+other personas, through the same channel / clean):
+
+    owner turns after clicks        0      1      2      4
+    room: owner rejected (FRR)   0.0 %  2.7 %  1.9 %  1.7 %   (old 0.40: 45.5 %)
+    room: other voice accepted  11.1 %  9.1 % 14.1 %  9.4 %   same room
+    clean/shout: FRR / FAR       0 % / 37.8 %  0 % / 0.1-0.3 %   (old 0.40: 0 % / 0 %)
+    threshold (median)           0.20   0.27   0.28   0.35
+
+A first draft that kept pre-adaptation owner scores (lagging) and compared
+follow-ups with the last owner utterance as well let 93-99 % of the other
+voices of the same room in: the adapted profile learns the room/channel too,
+so the threshold must rise with the owner's scores against the adapted
+profile. Loudness alone barely moves CAM++ (cosine to the same clip: -36 dBFS
+0.995, -13.4 dBFS clipped 0.964; normalised 0.999 / 0.970): clipping and the
+room/channel mismatch lowered the real scores, adaptation restores them.
+Synthetic voices overstate impostor similarity (clean other voices score a
+median 0.19 against an enrolled synthetic voice), so the 0-turn FAR is a
+pessimistic figure; the near-field gate filters far voices before this.
 
 Without a voiceprint (or without sherpa-onnx) every check passes and the
 near-field gate alone decides (gate.py).
@@ -39,9 +84,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
-from dataclasses import dataclass
+from array import array
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,9 +100,22 @@ MODEL_FILE = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
 MODEL_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/" + MODEL_FILE)
 MODEL_SHA256 = "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2"
 MODEL_BYTES = 28_281_164
-SENSITIVITY = {"low": 0.40, "normal": 0.50, "high": 0.60}
+# Follow-up / barge-in / always-listening thresholds (see the module docstring).
+SENSITIVITY = {"low": 0.15, "normal": 0.20, "high": 0.28}
+# How far under the owner's own low (q25) leave-one-out score a voice must fall to be "clearly other",
+# and how high the threshold may rise when the owner scores high (grid on real embeddings: 0.15 / 0.35;
+# enrollment weight 2 x clips: overall owner FRR ~2 %, other-voice FAR ~1 % over the scratch grid).
+ADAPTIVE_MARGIN = {"low": 0.20, "normal": 0.15, "high": 0.10}
+ADAPTIVE_CAP = {"low": 0.30, "normal": 0.35, "high": 0.40}
+ADAPTIVE_QUANTILE = 0.25         # (the minimum while fewer than ADAPTIVE_MIN_SAMPLES owner utterances)
+ADAPTIVE_MIN_SAMPLES = 4
 SHORT_SPEECH_MS = 1000.0
-SHORT_RELIEF = 0.10
+SHORT_RELIEF = 0.05
+THRESHOLD_FLOOR = 0.10           # never below: that is where unrelated voices score
+OWNER_KEEP = 10                  # owner utterances kept in the profile (a bounded running average)
+ENROLL_WEIGHT_PER_CLIP = 2.0     # the enrollment keeps >= half of the profile's weight
+ADAPT_MIN_SPEECH_MS = 800.0      # shorter utterances give noisy embeddings: not used to adapt
+LEVEL_TARGET_DB = -24.0          # loudness every clip is brought to before embedding
 VERIFY_MAX_S = 3.0
 SCHEMA = [(1, """CREATE TABLE IF NOT EXISTS voice_profile (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -84,6 +144,11 @@ class VerifyResult:
     threshold: float | None = None
     ms: float = 0.0
     reason: str = ""          # match | other_voice | off | not_enrolled | unavailable | error
+    vector: list[float] | None = field(default=None, repr=False)   # in memory only, never in status()
+
+    def public(self) -> dict[str, Any]:
+        return {"ok": self.ok, "score": self.score, "threshold": self.threshold, "ms": self.ms,
+                "reason": self.reason}
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -101,6 +166,67 @@ def normalize(vector: list[float]) -> list[float]:
 def mean_vector(vectors: list[list[float]]) -> list[float]:
     count = len(vectors)
     return normalize([sum(column) / count for column in zip(*vectors)])
+
+
+def _total(enroll: list[float], weight: float, owners: list[list[float]]) -> list[float]:
+    total = [weight * e for e in enroll]
+    for vector in owners:
+        total = [t + v for t, v in zip(total, vector)]
+    return total
+
+
+def weighted_profile(enroll: list[float], weight: float, owners: list[list[float]] | None) -> list[float]:
+    """The vector verification uses: the enrollment (``weight``) plus the kept
+    owner utterances (1 each, at most ``OWNER_KEEP``): the enrollment always
+    keeps a real share, one odd utterance moves the profile only a little."""
+    return normalize(_total(enroll, weight, list(owners or [])[-OWNER_KEEP:]))
+
+
+def loo_scores(enroll: list[float], weight: float, owners: list[list[float]] | None) -> list[float]:
+    """How each kept owner utterance scores against the profile built WITHOUT
+    it: how an unseen owner utterance scores against the current profile
+    (with one kept utterance: its score against the enrollment)."""
+    kept = list(owners or [])[-OWNER_KEEP:]
+    total = _total(enroll, weight, kept)
+    return [cosine([t - v for t, v in zip(total, vector)], vector) for vector in kept]
+
+
+def quantile(values: list[float], q: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    position = (len(ordered) - 1) * max(0.0, min(1.0, q))
+    low = int(math.floor(position))
+    high = min(len(ordered) - 1, low + 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def normalize_level(pcm16: bytes, *, target_db: float = LEVEL_TARGET_DB, frame: int = 480) -> bytes:
+    """Scale 16-bit PCM so its ACTIVE speech (30 ms frames within 30 dB of the
+    loudest) has ``target_db`` RMS, peak-limited to -0.3 dBFS: the same voice
+    whispered at -36 dBFS or shouted at -13 dBFS reaches the model alike (real
+    use 2026-09-25). Pure Python (~15 ms for 3 s; runs in the embedding thread)."""
+    samples = array("h")
+    samples.frombytes(pcm16[: len(pcm16) - len(pcm16) % 2])
+    if not samples:
+        return b""
+    energies = []
+    for start in range(0, len(samples), frame):
+        chunk = samples[start:start + frame]
+        energies.append(sum(v * v for v in chunk) / max(1, len(chunk)))
+    loudest = max(energies)
+    if loudest <= 0:
+        return samples.tobytes()
+    floor = loudest * 1e-3                                  # 30 dB under the loudest frame
+    active = [e for e in energies if e >= floor]
+    rms = math.sqrt(sum(active) / len(active)) / 32768.0
+    peak = max(abs(v) for v in samples) / 32768.0
+    if rms <= 0 or peak <= 0:
+        return samples.tobytes()
+    gain = min(10 ** (target_db / 20.0) / rms, 0.966 / peak)
+    if 0.98 <= gain <= 1.02:
+        return samples.tobytes()
+    return array("h", (max(-32768, min(32767, int(v * gain))) for v in samples)).tobytes()
 
 
 # -- model file ----------------------------------------------------------------------------------
@@ -228,14 +354,33 @@ class VoiceprintStore:
             self.db.ensure_schema("voiceprint", SCHEMA)
             self._ready = True
 
+    def _blob(self, state: dict[str, Any]) -> bytes:
+        """Everything about the voice (the profile, the enrollment, the kept
+        owner utterances) in ONE DPAPI-protected blob: nothing voice-related
+        is stored in clear."""
+        payload = {"v": 2, "vector": [round(x, 6) for x in state["vector"]],
+                   "enroll": [round(x, 6) for x in state.get("enroll") or state["vector"]],
+                   "owners": [[round(x, 6) for x in vector] for vector in (state.get("owners") or [])][-OWNER_KEEP:],
+                   "owners_total": int(state.get("owners_total") or 0)}
+        return self._protect(json.dumps(payload).encode("utf-8"))
+
     def save(self, vector: list[float], *, model: str, level_db: float | None, clips: int,
              consistency: float | None) -> None:
+        """A new enrollment: the adaptation and the owner scores start over."""
         self._ensure()
-        blob = self._protect(json.dumps({"v": 1, "vector": [round(x, 6) for x in vector]}).encode("utf-8"))
+        blob = self._blob({"vector": vector, "enroll": vector})
         now = time.time()
         self.db.execute("INSERT OR REPLACE INTO voice_profile (id, blob, model, dims, level_db, clips, consistency, "
                         "created_at, updated_at) VALUES (1,?,?,?,?,?,?,?,?)",
                         (blob, model, len(vector), level_db, clips, consistency, now, now))
+
+    def update(self, state: dict[str, Any]) -> bool:
+        """Store an adapted profile (same protection; the enrollment row's
+        model/level/clips/created_at stay)."""
+        self._ensure()
+        blob = self._blob(state)
+        self.db.execute("UPDATE voice_profile SET blob=?, updated_at=? WHERE id=1", (blob, time.time()))
+        return self.exists()
 
     def load(self) -> dict[str, Any] | None:
         self._ensure()
@@ -247,9 +392,13 @@ class VoiceprintStore:
             log.warning("the voiceprint could not be decrypted (another Windows user?)")
             return None
         data = json.loads(plain.decode("utf-8"))
-        return {"vector": [float(x) for x in data.get("vector", [])], "model": row["model"],
-                "level_db": row.get("level_db"), "clips": row.get("clips"), "consistency": row.get("consistency"),
-                "created_at": row.get("created_at")}
+        vector = [float(x) for x in data.get("vector", [])]
+        return {"vector": vector, "enroll": [float(x) for x in (data.get("enroll") or vector)],
+                "owners": [[float(x) for x in owner] for owner in (data.get("owners") or [])],
+                "owners_total": int(data.get("owners_total") or 0),
+                "model": row["model"], "level_db": row.get("level_db"), "clips": row.get("clips"),
+                "consistency": row.get("consistency"), "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at")}
 
     def exists(self) -> bool:
         self._ensure()
@@ -276,8 +425,10 @@ class SpeakerCheck:
         self._embedder: Any = None
         self._profile: dict[str, Any] | None = None
         self._profile_loaded = False
+        self._adapt_lock: asyncio.Lock | None = None
         self.unavailable_reason = ""
         self.last: VerifyResult | None = None
+        self.last_owner: dict[str, Any] | None = None
 
     # -- state ------------------------------------------------------------------------------------
     def profile(self) -> dict[str, Any] | None:
@@ -312,12 +463,43 @@ class SpeakerCheck:
             return False
         return self._custom_embedder or model_ready(self.app)
 
-    def threshold(self, speech_ms: float | None = None) -> float:
+    def _sensitivity(self) -> str:
         level = str(self.app.config.get("voice.only_my_voice_sensitivity", "normal") or "normal")
-        value = SENSITIVITY.get(level, SENSITIVITY["normal"])
+        return level if level in SENSITIVITY else "normal"
+
+    def base_threshold(self) -> float:
+        return SENSITIVITY[self._sensitivity()]
+
+    @staticmethod
+    def _enroll_weight(profile: dict[str, Any]) -> float:
+        return ENROLL_WEIGHT_PER_CLIP * float(profile.get("clips") or 5)
+
+    def owner_scores(self) -> list[float]:
+        """Leave-one-out scores of the kept owner utterances against the
+        current profile: how the owner really scores now."""
+        profile = self.profile()
+        if not profile or not profile.get("owners"):
+            return []
+        return loo_scores(profile.get("enroll") or profile["vector"], self._enroll_weight(profile), profile["owners"])
+
+    def threshold(self, speech_ms: float | None = None) -> float:
+        """The score a follow-up / barge-in / always-listening utterance needs:
+        the base, raised towards just under the owner's own low scores against
+        the current profile (never selected by score; at most the cap) as the
+        adapted profile fits the owner better -- other voices heard through
+        the same room then stay out (see the module docstring). It never
+        drops below the base: on the measured data that cost no owner
+        rejections and let fewer other voices in."""
+        base = self.base_threshold()
+        value = base
+        scores = self.owner_scores()
+        if scores:
+            level = self._sensitivity()
+            low = quantile(scores, ADAPTIVE_QUANTILE) if len(scores) >= ADAPTIVE_MIN_SAMPLES else min(scores)
+            value = max(base, min(low - ADAPTIVE_MARGIN[level], ADAPTIVE_CAP[level]))
         if speech_ms is not None and speech_ms < SHORT_SPEECH_MS:
             value -= SHORT_RELIEF
-        return round(value, 3)
+        return round(max(THRESHOLD_FLOOR, value), 3)
 
     def embedder(self) -> Any:
         if self._embedder is None:
@@ -339,11 +521,19 @@ class SpeakerCheck:
             log.warning("speaker model unavailable: %s", self.unavailable_reason)
             return False
 
+    def _embed_sync(self, embedder: Any, pcm: bytes) -> list[float]:
+        clip = pcm[: int(VERIFY_MAX_S * MIC_RATE) * 2]
+        return embedder.embed(normalize_level(clip))
+
     async def embed(self, pcm: bytes) -> list[float]:
+        """Speaker embedding of ``pcm`` after loudness normalisation (the
+        enrollment and every check alike: loudness never changes the score)."""
         embedder = self.embedder()
-        return await asyncio.to_thread(embedder.embed, pcm)
+        return await asyncio.to_thread(self._embed_sync, embedder, pcm)
 
     async def verify(self, pcm: bytes, *, speech_ms: float | None = None) -> VerifyResult:
+        """The follow-up / barge-in / always-listening check (the first
+        utterance after a click is never verified: ``learn_owner``)."""
         began = time.perf_counter()
         if not bool(self.app.config.get("voice.only_my_voice", True)):
             return VerifyResult(True, reason="off")
@@ -359,21 +549,66 @@ class SpeakerCheck:
         score = cosine(vector, profile["vector"])
         threshold = self.threshold(speech_ms)
         result = VerifyResult(score >= threshold, round(score, 3), threshold, round(
-            (time.perf_counter() - began) * 1000.0, 1), "match" if score >= threshold else "other_voice")
+            (time.perf_counter() - began) * 1000.0, 1), "match" if score >= threshold else "other_voice",
+            vector=vector)
         self.last = result
         return result
 
+    async def learn_owner(self, vector: list[float] | None = None, *, pcm: bytes | None = None,
+                          speech_ms: float | None = None) -> dict[str, Any] | None:
+        """The owner spoke (the first utterance after an explicit activation,
+        admitted as a request): keep it in the profile (the last
+        ``OWNER_KEEP``, a bounded running average with the enrollment, stored
+        DPAPI-protected). Returns {"score" (against the profile before it),
+        "n", "threshold" (the follow-up threshold now)} or None."""
+        if not self.enabled or self.unavailable_reason:
+            return None
+        if speech_ms is not None and speech_ms < ADAPT_MIN_SPEECH_MS:
+            return None
+        try:
+            if vector is None:
+                if pcm is None:
+                    return None
+                vector = await self.embed(pcm)
+        except Exception as exc:  # noqa: BLE001 - adaptation is optional
+            log.info("owner utterance not embedded: %s", type(exc).__name__)
+            return None
+        if self._adapt_lock is None:
+            self._adapt_lock = asyncio.Lock()
+        async with self._adapt_lock:
+            profile = self.profile()
+            if profile is None:
+                return None
+            score = cosine(vector, profile["vector"])
+            enroll = profile.get("enroll") or profile["vector"]
+            owners = [*(profile.get("owners") or []), normalize(list(vector))][-OWNER_KEEP:]
+            state = {**profile, "enroll": enroll, "owners": owners,
+                     "owners_total": int(profile.get("owners_total") or 0) + 1,
+                     "vector": weighted_profile(enroll, self._enroll_weight(profile), owners)}
+            try:
+                await asyncio.to_thread(self.store.update, state)
+            except Exception as exc:  # noqa: BLE001 - keep the in-memory profile; storage is retried next time
+                log.warning("adapted voiceprint not stored: %s", type(exc).__name__)
+            self._profile, self._profile_loaded = state, True
+            self.last_owner = {"score": round(score, 3), "n": len(owners), "threshold": self.threshold()}
+            return dict(self.last_owner)
+
     def status(self) -> dict[str, Any]:
         profile = self.profile()
+        scores = self.owner_scores()
         return {"enrolled": profile is not None, "enabled": self.enabled,
                 "sensitivity": self.app.config.get("voice.only_my_voice_sensitivity", "normal"),
-                "threshold": self.threshold(), "model_ready": model_ready(self.app), "usable": self.usable,
+                "threshold": self.threshold(), "base_threshold": self.base_threshold(),
+                "model_ready": model_ready(self.app), "usable": self.usable,
                 "sherpa": sherpa_available(), "unavailable": self.unavailable_reason,
                 "clips": profile.get("clips") if profile else None,
                 "created_at": profile.get("created_at") if profile else None,
-                "last": vars(self.last) if self.last else None}
+                "owner_utterances": len(profile.get("owners") or []) if profile else 0,
+                "owner_scores": {"n": len(scores), "min": round(min(scores), 3) if scores else None,
+                                 "q25": round(quantile(scores, ADAPTIVE_QUANTILE), 3) if scores else None},
+                "last": self.last.public() if self.last else None, "last_owner": self.last_owner}
 
 
 __all__ = ["SpeakerCheck", "VoiceprintStore", "SherpaEmbedder", "VerifyResult", "VoiceprintError", "download_model",
-           "model_path", "model_ready", "sherpa_available", "cosine", "mean_vector", "normalize", "SENSITIVITY",
-           "MODEL_URL", "MODEL_SHA256", "MODEL_FILE", "MODEL_BYTES"]
+           "model_path", "model_ready", "sherpa_available", "cosine", "mean_vector", "normalize", "normalize_level",
+           "weighted_profile", "loo_scores", "quantile", "SENSITIVITY", "MODEL_URL", "MODEL_SHA256", "MODEL_FILE", "MODEL_BYTES"]

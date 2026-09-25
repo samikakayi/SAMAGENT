@@ -95,7 +95,7 @@ def states(events):
     return [e.state for e in events if isinstance(e, VoiceState)]
 
 
-def speak_utterance(mic: FakeMic, speech_frames: int = 30, silence_frames: int = 25) -> None:
+def speak_utterance(mic: FakeMic, speech_frames: int = 30, silence_frames: int = 35) -> None:
     mic.push(tone_frame(), speech_frames)
     mic.push(quiet_frame(), silence_frames)
 
@@ -485,7 +485,7 @@ async def test_a_short_sound_over_sams_voice_only_ducks_it(voice):
     eng.cascade.barge_in = lambda: cut.append(1) or True
     mics[0].push(tone_frame(), 6)                 # ~180 ms of voice
     assert await settle(lambda: getattr(speaker, "gain", 1.0) < 1.0)
-    mics[0].push(quiet_frame(), 25)
+    mics[0].push(quiet_frame(), 35)               # > voice.end_silence_ms (900)
     assert await settle(lambda: getattr(speaker, "gain", 1.0) == 1.0)
     await asyncio.sleep(0.1)
     assert not cut and not eng.stt.calls

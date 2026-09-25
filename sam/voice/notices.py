@@ -16,7 +16,7 @@ from ..events import Event
 
 @dataclass(frozen=True, slots=True)
 class VoiceNotice(Event):
-    kind: str                 # closed | ignored | quota | models | enroll
+    kind: str                 # closed | ignored | not_recognized | quota | models | enroll | voiceprint | local | cloud
     text_ckb: str
     detail: str = ""
     until: float = 0.0        # unix time the notice stays true (quota rests); 0 = transient

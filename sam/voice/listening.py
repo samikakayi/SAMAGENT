@@ -39,6 +39,18 @@ the same trust test as the push-to-talk follow-ups, and at most
 ``voice.followup_turns`` times per «سام». It uses the cascade: Live would hand
 the audio to the model before the name could be checked.
 
+Who is the owner (real use 2026-09-25: the user's own voice was rejected four
+times by the voiceprint, voiceprint.py): the FIRST utterance after an explicit
+activation -- a click on the island or the hotkey (``start_listening(
+explicit=True)``; a window opened for a confirmation question or by unmuting
+is not one) -- is the owner by definition and never voiceprint-checked; a
+continuation that starts within ``voice.merge_window_s`` of it is part of it
+(frames.py). The voiceprint gates only follow-ups, barge-ins and
+always-listening. When it rejects one, the island shows «دەنگەکەت نەناسرایەوە
+— کلیک بکە» once per episode (``note_not_recognized``), and a click while that
+hint is fresh re-opens an explicit window instead of closing listening
+(``rearm_on_click``).
+
 ``ListeningPolicy`` is a VoiceEngine mixin; the engine owns ``listening``,
 ``_busy()``, ``_stop_listening()``, ``_publish()``, ``gate``, ``speaker``,
 ``speaker_check``.
@@ -71,6 +83,10 @@ _ENROLL = re.compile(r"(دەنگ(?:ی)?\s*(?:من|م)|دەنگەکەم|دەنگ�
 # A follow-up (no click, no «سام») must be about as loud as the user: at most
 # this much under the user's level (the gate already rejects user - 8 dB).
 FOLLOWUP_LEVEL_DROP_DB = 6.0
+# A click within this long after «دەنگەکەت نەناسرایەوە — کلیک بکە» means "it is me".
+REARM_S = 20.0
+# Still rejected this long after the hint was shown: show it again (never a flood, never silence).
+HINT_REPEAT_S = 15.0
 
 
 def starts_with_name(text: str) -> bool:
@@ -104,11 +120,16 @@ class ListeningPolicy:
         self._conversation_open = False
         self._last_turn_at = 0.0
         self._first_pending = False          # the next accepted utterance follows an explicit click
+        self._explicit_window = False        # this window was opened by a click / the hotkey
+        self._reopen_owner = False           # a re-opened window («دووبارەی بکەرەوە») is the owner's turn again
         self._prev_state = "idle"
         self._confirm_takes: tuple[str, int] = ("", 0)
         self._untrusted_noted = False
         self._reopens_left = 0
         self._reopen_pending = False
+        self._not_recognized_at = 0.0        # monotonic time of the last «دەنگەکەت نەناسرایەوە» episode
+        self._not_recognized_noted = False   # the hint was shown in the current episode
+        self._hint_shown_at = 0.0
 
     # -- settings -------------------------------------------------------------------------------------
     def always_listening(self) -> bool:
@@ -153,8 +174,10 @@ class ListeningPolicy:
         return level is not None and isinstance(p50, (int, float)) and p50 >= level - FOLLOWUP_LEVEL_DROP_DB
 
     # -- window bookkeeping ------------------------------------------------------------------------------------
-    def _open_window(self) -> None:
-        """Listening just opened by the user (click / hotkey / a confirmation question)."""
+    def _open_window(self, *, explicit: bool = True) -> None:
+        """Listening just opened: by the user (click / hotkey: ``explicit``,
+        the next utterance is the owner by definition) or for a confirmation
+        question / after unmuting (not explicit: the voiceprint still gates)."""
         now = time.monotonic()
         self._window_kind = "always" if self.always_listening() else "start"
         self._window_until = now + self._seconds("voice.start_timeout_s", 8.0)
@@ -162,10 +185,34 @@ class ListeningPolicy:
         self._followup_open = False
         self._followups_left = self._followup_budget()
         self._followup_grace_until = 0.0
-        self._first_pending = True
+        self._first_pending = bool(explicit)
+        self._explicit_window = bool(explicit)
+        self._reopen_owner = False
         self._reopens_left = 1
         self._reopen_pending = False
         self._prev_state = "listening"
+        if explicit:
+            self._not_recognized_noted = False
+            self._not_recognized_at = 0.0
+
+    # -- «دەنگەکەت نەناسرایەوە — کلیک بکە» ----------------------------------------------------------------
+    def note_not_recognized(self) -> bool:
+        """The voiceprint rejected a follow-up / barge-in / always-listening
+        utterance. True when the island hint should be published now: once
+        per episode (until a click or an accepted utterance), so repeated
+        tries are neither silent nor a flood of notices."""
+        now = time.monotonic()
+        self._not_recognized_at = now
+        if self._not_recognized_noted and now - self._hint_shown_at < HINT_REPEAT_S:
+            return False
+        self._not_recognized_noted = True
+        self._hint_shown_at = now
+        return True
+
+    def rearm_on_click(self) -> bool:
+        """A click while listening normally closes it; right after «کلیک بکە»
+        it means "this is me": a new explicit window opens instead."""
+        return bool(self._not_recognized_at) and time.monotonic() - self._not_recognized_at <= REARM_S
 
     def may_take_utterance(self, *, verified: bool = False, meta: dict[str, Any] | None = None) -> bool:
         """May this finished utterance go to STT / Live at all? (checked
@@ -198,6 +245,8 @@ class ListeningPolicy:
         self._accepted_in_window += 1
         self._conversation_open = True
         self._last_turn_at = now
+        self._not_recognized_noted = False    # a new rejection is a new episode (hint again)
+        self._not_recognized_at = 0.0
         if self._window_kind == "followup":
             self._followup_open = False   # one utterance per follow-up window; never re-extended
         elif self._window_kind == "start":
@@ -254,12 +303,15 @@ class ListeningPolicy:
         if reopen and self._window_kind != "always" and self._reopens_left > 0:
             self._reopens_left -= 1
             self._reopen_pending = True     # SAM may first say «دووبارەی بکەرەوە»
+            # The owner's turn after a click that produced no words: the repeat is still his turn.
+            self._reopen_owner = self._explicit_window and self._window_kind == "start"
             self._reopen_start()
 
     def _reopen_start(self) -> None:
         self._window_kind = "start"
         self._accepted_in_window = 0
         self._followup_open = False
+        self._first_pending = bool(getattr(self, "_reopen_owner", False))
         self._window_until = time.monotonic() + self._seconds("voice.start_timeout_s", 8.0)
 
     def in_conversation(self) -> bool:
@@ -340,7 +392,9 @@ class ListeningPolicy:
         return {"mode": "always" if self.always_listening() else "turn", "window": self._window_kind,
                 "window_left_s": round(left, 1), "accepted_in_window": self._accepted_in_window,
                 "followup_open": self._followup_open, "followups_left": self._followups_left,
-                "trusted": self.voice_trusted(), "conversation_open": self._conversation_open}
+                "trusted": self.voice_trusted(), "conversation_open": self._conversation_open,
+                "explicit": self._explicit_window, "owner_turn_pending": self._first_pending,
+                "not_recognized": bool(self._not_recognized_at)}
 
 
-__all__ = ["ListeningPolicy", "starts_with_name", "asks_enrollment", "FOLLOWUP_LEVEL_DROP_DB"]
+__all__ = ["ListeningPolicy", "starts_with_name", "asks_enrollment", "FOLLOWUP_LEVEL_DROP_DB", "REARM_S"]

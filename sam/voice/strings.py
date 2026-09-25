@@ -22,6 +22,9 @@ LISTEN_CLOSED = "گوێگرتن داخرا — بۆ قسەکردن کرتە بک
 LISTEN_CLOSED_ENROLL = "گوێگرتن داخرا — بۆ قسەکردن کرتە بکە. بۆ گفتوگۆی بێ کرتە، دەنگی خۆت بناسێنە."
 LISTEN_NO_SPEECH = "هیچ قسەیەکم نەبیست، گوێگرتن داخرا"
 IGNORED_NOT_YOU = "ئەو دەنگە هی تۆ نەبوو، گوێم پێ نەدا"
+# A follow-up / barge-in the voiceprint did not accept (frames.py): shown once
+# per episode; a click then re-opens the owner's turn (listening.py).
+VOICE_NOT_RECOGNIZED = "دەنگەکەت نەناسرایەوە — کلیک بکە"
 IGNORED_NO_NAME = "بۆ فەرمان سەرەتا بڵێ «سام»"
 VOICEPRINT_UNAVAILABLE = "ناسینەوەی دەنگ ئامادە نییە — ئێستا هەموو دەنگێکی نزیک وەردەگیرێت"
 # Quotas (quota.py). {time} is e.g. «کاتژمێر ١٠ی بەیانی».

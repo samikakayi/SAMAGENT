@@ -119,6 +119,39 @@ def test_tool_events_show_sorani_labels(island):
     assert island.caption.text == "ترەیدینگ ڤیو دانەمەزراوە."
 
 
+def test_voice_not_recognized_hint_asks_for_a_click(island):
+    """Real use 2026-09-25: the user's own follow-ups were rejected by the
+    voiceprint four times and the island gave him nothing to do about it."""
+    from sam.voice import strings as voice_strings
+    from sam.voice.notices import VoiceNotice
+    toggled = []
+    island.toggleListeningRequested.connect(lambda: toggled.append(1))
+    island.handle_event(VoiceState(state="listening", engine="cascade"))
+    island.handle_event(VoiceNotice(kind="not_recognized", text_ckb=voice_strings.VOICE_NOT_RECOGNIZED))
+    assert island.caption.text == "دەنگەکەت نەناسرایەوە — کلیک بکە" and island.caption.tone == "alert"
+    assert island.status_text() == "کلیک بکە"                   # stays while he keeps trying
+    island.handle_event(VoiceState(state="speaking", engine="cascade"))
+    assert island.status_text() == "قسە دەکەم"
+    island.handle_event(VoiceState(state="listening", engine="cascade"))
+    assert island.status_text() == "کلیک بکە"
+    island._clicked()                                            # noqa: SLF001 - the single-click timer's slot
+    assert toggled == [1] and island.status_text() == "گوێ دەگرم"
+    island.handle_event(VoiceNotice(kind="not_recognized", text_ckb=voice_strings.VOICE_NOT_RECOGNIZED))
+    island.handle_event(Caption(text="نرخی زێڕ چەندە؟", role="user", final=True))
+    assert island.status_text() == "گوێ دەگرم"                  # SAM took his words: the hint is over
+
+
+def test_island_hints_expire(qapp):
+    from sam.ui.island_hints import CLICK_WORD, HINT_S, IslandHints
+    now = [1000.0]
+    hints = IslandHints(clock=lambda: now[0])
+    shown = hints.on_notice(type("VoiceNotice", (), {"kind": "not_recognized", "text_ckb": "x", "until": 0.0})())
+    assert shown == ("x", "alert") and hints.status_override("idle") == CLICK_WORD
+    assert hints.status_override("thinking") is None
+    now[0] += HINT_S + 1
+    assert hints.status_override("listening") is None
+
+
 def test_worker_progress_line_and_level_meter(island):
     island.handle_event(WorkerProgress(task_id="t", step=2, max_steps=8, text_ckb="هەنگاوی دووەم"))
     assert island._progress == {"step": 2, "max": 8, "done": False, "ok": None, "done_at": None, "task_id": "t"}
